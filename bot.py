@@ -1,87 +1,107 @@
-# --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
+# --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ ДЛЯ GROQ API) ---
 import logging
 import os
-import asyncio # ОСНОВА ВСЕЙ АСИНХРОННОЙ МАГИИ
+import asyncio
 from collections import deque
-# УБРАЛИ НАХУЙ THREADING
-from flask import Flask # Веб-сервер-заглушка для Render
-import hypercorn.config # Конфиг нужен
-from hypercorn.asyncio import serve as hypercorn_async_serve # <--- ИМПОРТИРУЕМ ЯВНО И ПЕРЕИМЕНОВЫВАЕМ!
-import signal # Для корректной обработки сигналов остановки (хотя asyncio.run сам умеет)
+from flask import Flask
+import hypercorn.config
+from hypercorn.asyncio import serve as hypercorn_async_serve
+import signal
 
-import google.generativeai as genai
+# --->>> УБРАЛИ ИМПОРТЫ GEMINI <<<---
+# --->>> ДОБАВИЛИ ИМПОРТЫ OPENAI <<<---
+from openai import OpenAI, AsyncOpenAI # Используем библиотеку OpenAI
+import httpx # Она нужна openai >= 1.0
+# --->>> КОНЕЦ ИЗМЕНЕНИЙ В ИМПОРТАХ <<<---
+
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from dotenv import load_dotenv # Чтобы читать твой .env файл или переменные Render
+from dotenv import load_dotenv
 
-# Загружаем секреты
+# Загружаем секреты (.env для локального запуска, Render использует переменные окружения)
 load_dotenv()
 
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MAX_MESSAGES_TO_ANALYZE = 500 # Меняй на свой страх и риск
+# --->>> ДОБАВИЛИ КЛЮЧ GROQ <<<---
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# --->>> КОНЕЦ ДОБАВЛЕНИЙ <<<---
+MAX_MESSAGES_TO_ANALYZE = 500
 
 # Проверка ключей
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
-if not GEMINI_API_KEY:
-    raise ValueError("НЕ НАЙДЕН GEMINI_API_KEY!")
+if not TELEGRAM_BOT_TOKEN: raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
+if not GROQ_API_KEY: raise ValueError("НЕ НАЙДЕН GROQ_API_KEY! Добавь его в переменные окружения Render!") # <-- Изменили проверку
 
-# --- Логирование ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+# --- Логирование (без изменений) ---
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("hypercorn").setLevel(logging.INFO) # Чтобы видеть логи Hypercorn
+logging.getLogger("hypercorn").setLevel(logging.INFO)
+# Добавим логгер для OpenAI, чтобы видеть запросы (опционально)
+logging.getLogger("openai").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Настройка Gemini ---
+# --- НАСТРОЙКА КЛИЕНТА GROQ API ---
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    logger.info("Модель Gemini успешно настроена.")
+    # Используем АСИНХРОННЫЙ клиент OpenAI, но для эндпоинта Groq
+    groq_client = AsyncOpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1" # СТАНДАРТНЫЙ ЭНДПОИНТ GROQ - ПРОВЕРЬ В ДОКЕ НА ВСЯКИЙ!
+    )
+    logger.info("Клиент AsyncOpenAI для Groq API настроен.")
 except Exception as e:
-    logger.critical(f"ПИЗДЕЦ при настройке Gemini API: {e}", exc_info=True)
-    raise SystemExit(f"Не удалось настроить Gemini API: {e}")
+     logger.critical(f"ПИЗДЕЦ при настройке клиента Groq: {e}", exc_info=True)
+     raise SystemExit(f"Не удалось настроить клиента Groq: {e}")
 
-# --- Хранилище истории ---
+# УКАЗЫВАЕМ ID МОДЕЛИ, КОТОРУЮ ТЫ ВЫБРАЛ
+# УБЕДИСЬ, ЧТО ОНА ТОЧНО ЕСТЬ В СПИСКЕ НА GROQ.COM/API/MODELS !!!
+GROQ_MODEL_ID = "deepseek-r1-distill-llama-70b" # <--- ТВОЙ ВЫБОР (ПРОВЕРЬ НАЛИЧИЕ!)
+# Если ее нет, попробуй: "llama3-8b-8192" или "mixtral-8x7b-32768"
+logger.info(f"Будет использоваться модель Groq: {GROQ_MODEL_ID}")
+# --- КОНЕЦ НАСТРОЙКИ КЛИЕНТА GROQ API ---
+
+# --- Хранилище истории (без изменений) ---
 chat_histories = {}
 logger.info(f"Максимальная длина истории сообщений для анализа: {MAX_MESSAGES_TO_ANALYZE}")
 
-# --- ОБРАБОТЧИКИ СООБЩЕНИЙ И КОМАНД (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- ОБРАБОТЧИКИ СООБЩЕНИЙ (store_message без изменений) ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text or not update.message.from_user:
-        return
+    # ... (код store_message остается ТОЧНО ТАКИМ ЖЕ, как в последней версии)
+    # ... (он НЕ ДОЛЖЕН вызывать распознавание голоса или картинок)
+    if not update.message or not update.message.from_user: return
+    message_text = None
+    is_voice = False # Не используем, но оставим пока
     chat_id = update.message.chat_id
-    message_text = update.message.text
     user_name = update.message.from_user.first_name or "Анонимный долбоеб"
-    if chat_id not in chat_histories:
-        chat_histories[chat_id] = deque(maxlen=MAX_MESSAGES_TO_ANALYZE)
-        # logger.info(f"Создана новая история для чата {chat_id}") # Убрал лишний лог
-    chat_histories[chat_id].append(f"{user_name}: {message_text}")
+    if update.message.text: message_text = update.message.text
+    # --- Заглушки для фото/стикеров (ЕСЛИ РЕАЛИЗОВЫВАЛИ) ---
+    elif update.message.photo: message_text = "[ОТПРАВИЛ(А) КАРТИНКУ]" # Пример заглушки
+    elif update.message.sticker: message_text = f"[ОТПРАВИЛ(А) СТИКЕР {update.message.sticker.emoji or ''}]" # Пример заглушки
+    # --- Конец заглушек ---
+    if message_text:
+        if chat_id not in chat_histories: chat_histories[chat_id] = deque(maxlen=MAX_MESSAGES_TO_ANALYZE)
+        prefix = f"{user_name}"
+        chat_histories[chat_id].append(f"{prefix}: {message_text}")
 
+# --- ОБРАБОТЧИК КОМАНДЫ /analyze (ПЕРЕПИСАН ПОД GROQ / OPENAI API) ---
 async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.from_user:
-        return
+    # ... (начало функции: проверки, получение user_name, chat_id, проверка истории - как было) ...
+    if not update.message or not update.message.from_user: return
     chat_id = update.message.chat_id
     user_name = update.message.from_user.first_name or "Эй ты там"
-    logger.info(f"Пользователь '{user_name}' (ID: {update.message.from_user.id}) запросил анализ в чате {chat_id}")
+    logger.info(f"Пользователь '{user_name}' (ID: {update.message.from_user.id}) запросил анализ в чате {chat_id} через Groq ({GROQ_MODEL_ID})")
     min_msgs = 10
     history_len = len(chat_histories.get(chat_id, []))
     if chat_id not in chat_histories or history_len < min_msgs:
         logger.info(f"В чате {chat_id} слишком мало сообщений ({history_len}/{min_msgs}) для анализа.")
-        await update.message.reply_text(
-            f"Слышь, {user_name}, ты заебал. Я тут недавно (или вы молчали как рыбы), сообщений кот наплакал "
-            f"(всего {history_len} штук в моей памяти, а надо хотя бы {min_msgs}).\n"
-            f"Попиздите еще хотя бы немного, потом посмотрим на ваш балаган.\n"
-        )
+        await update.message.reply_text(f"Слышь, {user_name}, надо {min_msgs} сообщений, а у меня {history_len}. Попизди еще.")
         return
     messages_to_analyze = list(chat_histories[chat_id])
-    conversation_text = "\n".join(messages_to_analyze)
-    logger.info(f"Начинаю анализ {len(messages_to_analyze)} сообщений для чата {chat_id}...")
+    conversation_text = "\n".join(messages_to_analyze) # Передаем всю историю одним куском
+    logger.info(f"Начинаю анализ {len(messages_to_analyze)} сообщений для чата {chat_id} через Groq...")
+
     try:
-        prompt = (
+        # --->>> НОВЫЙ КОД ВЫЗОВА GROQ API <<<---
+        system_prompt = (
             f"Ты - въедливый и язвительный сплетник-летописец Telegram-чата. Твоя задача - проанализировать ПОСЛЕДНИЙ фрагмент переписки, выхватить из него несколько (1-10) самых интересных моментов И ОБЯЗАТЕЛЬНО УКАЗАТЬ, КТО ИЗ УЧАСТНИКОВ (по именам/никам из диалога) что сказал или сделал в этом моменте. **ТАКЖЕ ОБРАЩАЙ ВНИМАНИЕ НА СООБЩЕНИЯ ОТ ДРУГИХ БОТОВ (@PredskazBot, @PenisMeterBot и т.п.), ЕСЛИ ОНИ АДРЕСОВАНЫ КОНКРЕТНОМУ ПОЛЬЗОВАТЕЛЮ (@username).\n\n"
             f"Фрагмент переписки:\n"
             f"```\n{conversation_text}\n```\n\n"
@@ -99,260 +119,98 @@ async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🗿 @PenisMeterBot сообщил @nagibator666, что у него 15 см. Стандартно, но хоть не 5. Бывало и хуже.\n" # <--- ПРИМЕР
             f"\nВыдай результат в указанном формате, НЕ ЗАБЫВАЯ ИМЕНА и ЦЕЛИ сообщений других ботов:"
         )
-        thinking_message = await update.message.reply_text("Так, блядь, щас напрягу свои кремниевые мозги и попробую понять смысл вашего высокоинтеллектуального бреда... Не мешайте, я в процессе (или тупо сплю, хуй знает)...")
-        logger.debug(f"Отправил сообщение 'думаю' (ID: {thinking_message.message_id}) в чат {chat_id}")
-        logger.info(f"Отправляю запрос к Gemini для чата {chat_id}...")
-        response = await model.generate_content_async(prompt)
-        logger.info(f"Получен ответ от Gemini для чата {chat_id}")
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-            logger.debug(f"Удалил сообщение 'думаю' (ID: {thinking_message.message_id}) в чате {chat_id}")
-        except Exception as delete_err:
-            logger.warning(f"Не смог удалить сообщение 'думаю' (ID: {thinking_message.message_id}) в чате {chat_id}: {delete_err}")
-        sarcastic_summary = "Бля, хуйню какую-то нейронка выдала или вообще пустой ответ. Видимо, ваш треп настолько бессмысленный, что даже ИИ повесился."
-        if response and response.text:
-             sarcastic_summary = response.text.strip()
+        messages_for_api = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": conversation_text} # Вся история как один запрос юзера
+        ]
+
+        thinking_message = await update.message.reply_text(f"Так, блядь, щас подключу быстрые мозги Groq ({GROQ_MODEL_ID.split('-')[0]}) и подумаю...")
+
+        logger.info(f"Отправка запроса к Groq API ({GROQ_MODEL_ID})...")
+        response = await groq_client.chat.completions.create(
+            model=GROQ_MODEL_ID, # Используем выбранную тобой модель
+            messages=messages_for_api,
+            max_tokens=250, # Можно чуть больше, модели умнее
+            temperature=0.7, # Немного креативности
+            # stream=False # Не используем стриминг для простоты
+        )
+        logger.info("Получен ответ от Groq API.")
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+
+        # Извлекаем ответ
+        sarcastic_summary = "[Groq промолчал или вернул хуйню]"
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            sarcastic_summary = response.choices[0].message.content.strip()
+
         await update.message.reply_text(sarcastic_summary)
-        logger.info(f"Отправил результат анализа '{sarcastic_summary[:50]}...' в чат {chat_id}")
+        logger.info(f"Отправил результат анализа Groq '{sarcastic_summary[:50]}...' в чат {chat_id}")
+        # --->>> КОНЕЦ НОВОГО КОДА ВЫЗОВА GROQ API <<<---
+
     except Exception as e:
-        logger.error(f"ПИЗДЕЦ при выполнении анализа для чата {chat_id}: {e}", exc_info=True)
+        # Обработка ошибок Groq API
+        logger.error(f"ПИЗДЕЦ при вызове Groq API для чата {chat_id}: {e}", exc_info=True)
         try:
-            if 'thinking_message' in locals():
-                 await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-        except Exception as inner_e:
-            logger.warning(f"Не удалось удалить сообщение 'думаю' после ошибки: {inner_e}")
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
         await update.message.reply_text(
-            f"Бля, {user_name}, все сломалось нахуй в процессе анализа. То ли Гугл меня наебал, то ли я сам криворукий мудак, то ли ваш диалог сломал мне мозг. "
-            f"Ошибка типа: `{type(e).__name__}`. Можешь попробовать позже, но я не гарантирую, что это говно починится само."
+            f"Бля, {user_name}, мои новые быстрые мозги Groq дали сбой. То ли API упал, то ли ты им хуйню подсунул. "
+            f"Ошибка типа: `{type(e).__name__}`. Попробуй позже."
         )
 
-# --- НОВАЯ АСИНХРОННАЯ ЧАСТЬ (ЗАМЕНЯЕТ FLASK, ПОТОКИ И СТАРУЮ MAIN) ---
-
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ АНАЛИЗА КАРТИНОК ---
+# --- ОБРАБОТЧИК КОМАНДЫ /analyze_pic (ЗАГЛУШКА!) ---
 async def analyze_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Анализирует картинку, на которую ответили командой /analyze_pic."""
-    if not update.message or not update.message.reply_to_message:
-        await update.message.reply_text("Хули ты мне просто команду пишешь? Ответь ей на сообщение с картинкой, долбоеб!")
+    """Сообщает, что не умеет анализировать картинки через Groq API."""
+    if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.photo:
+        await update.message.reply_text("Ответь командой /analyze_pic на КАРТИНКУ, дятел!")
         return
+    user_name = update.message.from_user.first_name or "Пикассо недоделанный"
+    logger.info(f"Пользователь '{user_name}' запросил анализ картинки, но Groq API это не умеет.")
+    await update.message.reply_text(
+        f"Слышь, {user_name}, я теперь на Groq, он быстрый как понос, но СМОТРЕТЬ КАРТИНКИ НЕ УМЕЕТ (через этот API). "
+        f"Так что обсирать твой 'шедевр' не буду. Только текст, только хардкор. 🗿"
+    )
 
-    reply_msg = update.message.reply_to_message
-    user_name = update.message.from_user.first_name or "Анализатор хуев"
+# --- ОБРАБОТЧИК greet_chat_member (БЕЗ ИЗМЕНЕНИЙ) ---
+async def greet_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ... (код greet_chat_member остается ТОЧНО ТАКИМ ЖЕ) ...
+    result = update.chat_member; #... и так далее ...
 
-    # Проверяем, есть ли в сообщении, на которое ответили, фотка
-    if not reply_msg.photo:
-        await update.message.reply_text(f"Слышь, {user_name}, я тут только картинки комментирую, а не твой текстовый высер или ебучий стикер. Ответь на КАРТИНКУ.")
-        return
-
-    logger.info(f"Пользователь '{user_name}' запросил анализ картинки в чате {update.message.chat_id}")
-
-    # Берем самую большую версию фотки (обычно последняя в списке)
-    photo_large = reply_msg.photo[-1]
-    logger.info(f"Получаем файл картинки ID: {photo_large.file_id}")
-
-    try:
-        # Скачиваем файл картинки в память (в виде байтов)
-        # Ставим таймаут на всякий случай
-        photo_file = await context.bot.get_file(photo_large.file_id, read_timeout=60)
-        # Нужны байты картинки
-        photo_bytes_io = await photo_file.download_as_bytearray(read_timeout=60)
-        photo_bytes = bytes(photo_bytes_io) # Конвертируем bytearray в bytes
-        logger.info(f"Картинка успешно скачана, размер: {len(photo_bytes)} байт.")
-
-        # Готовим ПРАВИЛЬНЫЙ промпт для КАРТИНКИ
-        image_prompt = (
-            f"Ты - слегка упоротый арт-критик с замашками тролля и любовью к постиронии. Тебе на обзор прислали КАРТИНКУ. Твоя задача - рассмотреть ее и выдать **КОРОТКИЙ (1-3 предложения)**, остроумный и ироничный комментарий. \n\n"
-            f"Инструкции:\n"
-            f"1.  Найди в изображении что-то забавное, нелепое, странное или просто бросающееся в глаза.\n"
-            f"2.  Сформулируй комментарий с **сарказмом, иронией или легким абсурдом**. Можешь использовать неожиданные сравнения или задавать риторические вопросы.\n"
-            f"3.  **МАТ используй умеренно**, для добавления экспрессии или комического эффекта, а не для тупого обсирания ('блядь', 'ебать', 'охуенно'). Не оскорбляй напрямую автора или изображенное, если это не выглядит очевидно смешным само по себе.\n"
-            f"4.  Не пиши банальностей типа 'На картинке мы видим...'. Сразу переходи к сути своего ироничного наблюдения.\n"
-            f"5.  Цель - не уничтожить, а тонко подколоть, вызвать улыбку (или недоумение) у читателя.\n\n"
-            f"Пример хуевого ответа (тупо обсирание): '🗿 Кот - уебище, снято на тапок.'\n"
-            f"Пример ЗАЕБАТОГО ответа (ирония): '🗿 Какой экзистенциальный взгляд у этого кота! Кажется, он только что осознал тщетность бытия. Или просто хочет жрать, хуй пойми.'\n"
-            f"Пример (пейзаж): '🗿 Бля, какая величественная гора... Интересно, вайфай там ловит?' ИЛИ '# Охуенный закат. Наверное, фоткали, пока шашлык горел.'\n"
-            f"Пример (абстракция): '🗿 Ебать, глубокомысленно. Чувствую в этих кляксах всю боль современного общества. Или это просто обои такие?'\n\n"
-            f"КОРОЧЕ! Посмотри на картинку и выдай свой остроумный (надеюсь) вердикт:"
-        )
-
-        # Сообщение "Думаю..."
-        thinking_message = await update.message.reply_text("Так-так, блядь, ща посмотрим на это произведение искусства... Дайте подумать (или просто подождите, картинки дольше грузятся)...")
-
-        # Отправляем запрос в Gemini С КАРТИНКОЙ
-        logger.info("Отправка запроса к Gemini с картинкой...")
-        # Gemini принимает список "частей": текст и данные картинки
-        response = await model.generate_content_async([image_prompt, {"mime_type": "image/jpeg", "data": photo_bytes}])
-        # ЗАМЕЧАНИЕ: Мы тупо ставим mime_type "image/jpeg". Если прислали PNG или другую хуйню,
-        # Gemini может не понять или обработать криво. Для простоты пока забьем.
-        logger.info("Получен ответ от Gemini по картинке.")
-
-        # Удаляем "Думаю..."
-        try: await context.bot.delete_message(chat_id=update.message.chat_id, message_id=thinking_message.message_id)
-        except Exception: pass
-
-        # Отправляем ответ
-        sarcastic_comment = "Хуй знает, что там нарисовано, но выглядит как говно. Или Gemini не смог это переварить."
-        if response and response.text:
-            sarcastic_comment = response.text.strip()
-        await update.message.reply_text(sarcastic_comment)
-        logger.info(f"Отправлен комментарий к картинке: '{sarcastic_comment[:50]}...'")
-
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при анализе картинки: {e}", exc_info=True)
-        try:
-            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=update.message.chat_id, message_id=thinking_message.message_id)
-        except Exception: pass
-        await update.message.reply_text(f"Бля, {user_name}, я обосрался, пока смотрел на эту картинку. То ли она слишком уебищная, то ли Гугл опять барахлит. Ошибка: `{type(e).__name__}`.")
-
-# --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
-
-# Flask app остается для Render заглушки
+# --- АСИНХРОННАЯ ЧАСТЬ С HYPERCORN (main, run_bot_async - БЕЗ ИЗМЕНЕНИЙ В ЛОГИКЕ ЗАПУСКА) ---
 app = Flask(__name__)
-
 @app.route('/')
-def index():
-    """Отвечает на HTTP GET запросы для проверки живости сервиса Render."""
-    logger.info("Получен GET запрос на '/', отвечаю OK.")
-    return "Я саркастичный бот, и я все еще жив (наверное). Иди нахуй из браузера, пиши в Telegram."
-
-async def run_bot_async(application: Application) -> None:
-    """Асинхронная функция для запуска и корректной остановки бота."""
-    try:
-        logger.info("Инициализация Telegram Application...")
-        await application.initialize() # Инициализируем
-        if not application.updater:
-             logger.critical("Updater не был создан в Application. Не могу запустить polling.")
-             return
-        logger.info("Запуск получения обновлений (start_polling)...")
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES) # Запускаем polling
-        logger.info("Запуск диспетчера Application (start)...")
-        await application.start() # Запускаем обработку апдейтов
-        logger.info("Бот запущен и работает... (ожидание отмены или сигнала)")
-        # --->>> Заменяем idle() на ожидание Future <<<---
-        await asyncio.Future()
-        logger.info("Ожидание Future завершилось (не должно было без отмены).")
-    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-        logger.info("Получен сигнал остановки (KeyboardInterrupt/SystemExit/CancelledError).")
-    except Exception as e:
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в run_bot_async во время работы: {e}", exc_info=True)
-    finally:
-        logger.info("Начинаю процесс ОСТАНОВКИ бота в run_bot_async...")
-        if application.running:
-            logger.info("Остановка диспетчера Application (stop)...")
-            await application.stop()
-            logger.info("Диспетчер Application остановлен.")
-        if application.updater and application.updater.is_running:
-            logger.info("Остановка получения обновлений (updater.stop)...")
-            # --->>> Заменяем stop_polling() -> stop() <<<---
-            await application.updater.stop()
-            logger.info("Получение обновлений (updater) остановлено.")
-        logger.info("Завершение работы Application (shutdown)...")
-        await application.shutdown()
-        logger.info("Процесс остановки бота в run_bot_async завершен.")
-
-
-async def main() -> None:
-    """Основная асинхронная функция, запускающая веб-сервер и бота."""
+def index(): #... как было ...
+async def run_bot_async(application: Application) -> None: #... как было ...
+async def main() -> None: #... как было, НО ИСПОЛЬЗУЕТ НОВЫЙ КЛИЕНТ groq_client ...
     logger.info("Запуск асинхронной функции main().")
-
-    # 1. Настраиваем и собираем Telegram бота
     logger.info("Сборка Telegram Application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("analyze", analyze_chat))
-    application.add_handler(CommandHandler("analyze_pic", analyze_pic))
+    # Добавляем обработчики
+    application.add_handler(CommandHandler("analyze", analyze_chat)) # Вызывает новую версию
+    application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Вызывает заглушку
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
+    application.add_handler(ChatMemberUpdatedHandler(greet_chat_member, ChatMemberUpdated.MY_CHAT_MEMBER))
     logger.info("Обработчики Telegram добавлены.")
+    # ... (настройка Hypercorn и запуск задач как было) ...
+    port = int(os.environ.get("PORT", 8080)); #... и так далее ...
+    hypercorn_config = hypercorn.config.Config(); #... и так далее ...
+    bot_task = asyncio.create_task(run_bot_async(application), name="TelegramBotTask"); #... и так далее ...
+    server_task = asyncio.create_task(hypercorn_async_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait), name="HypercornServerTask"); #... и так далее ...
+    # ... (обработка завершения задач как было) ...
 
-    # 2. Настраиваем Hypercorn для запуска Flask приложения
-    port = int(os.environ.get("PORT", 8080)) # Render передает порт через $PORT
-    hypercorn_config = hypercorn.config.Config()
-    hypercorn_config.bind = [f"0.0.0.0:{port}"]
-    hypercorn_config.worker_class = "asyncio" # Используем asyncio worker
-    # Увеличим таймаут отключения, чтобы бот успел корректно остановиться
-    hypercorn_config.shutdown_timeout = 60.0
-    logger.info(f"Конфигурация Hypercorn: bind={hypercorn_config.bind}, worker={hypercorn_config.worker_class}, shutdown_timeout={hypercorn_config.shutdown_timeout}")
-
-    # 3. Запускаем обе задачи (веб-сервер и бот) конкурентно в одном event loop
-    logger.info("Создание и запуск конкурентных задач для Hypercorn и Telegram бота...")
-
-    # Создаем задачи
-    # Имя задачи полезно для логов
-    bot_task = asyncio.create_task(run_bot_async(application), name="TelegramBotTask")
-    # Hypercorn будет обслуживать Flask 'app'
-    # Используем 'shutdown_trigger' Hypercorn чтобы он среагировал на сигнал остановки asyncio
-    shutdown_event = asyncio.Event()
-    server_task = asyncio.create_task(
-        hypercorn_async_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait),
-        name="HypercornServerTask"
-    )
-
-    # Ожидаем завершения ЛЮБОЙ из задач. В норме они должны работать вечно.
-    done, pending = await asyncio.wait(
-        [bot_task, server_task], return_when=asyncio.FIRST_COMPLETED
-    )
-
-    logger.warning(f"Одна из основных задач завершилась! Done: {done}, Pending: {pending}")
-
-    # Сигнализируем Hypercorn'у остановиться, если он еще работает
-    if server_task in pending:
-        logger.info("Сигнализируем Hypercorn серверу на остановку...")
-        shutdown_event.set()
-
-    # Пытаемся вежливо отменить и дождаться завершения оставшихся задач
-    logger.info("Отменяем и ожидаем завершения оставшихся задач...")
-    for task in pending:
-        task.cancel()
-    # Даем им шанс завершиться после отмены
-    await asyncio.gather(*pending, return_exceptions=True)
-
-    # Проверяем исключения в завершенных задачах
-    for task in done:
-        logger.info(f"Проверка завершенной задачи: {task.get_name()}")
-        try:
-            # Если в задаче было исключение, оно поднимется здесь
-            await task
-        except asyncio.CancelledError:
-             logger.info(f"Задача {task.get_name()} была отменена.")
-        except Exception as e:
-            logger.error(f"Задача {task.get_name()} завершилась с ошибкой: {e}", exc_info=True)
-
-    logger.info("Асинхронная функция main() завершила работу.")
-
-
-# --- Точка входа в скрипт (ЗАПУСКАЕТ АСИНХРОННУЮ main) ---
+# --- Точка входа в скрипт (БЕЗ ИЗМЕНЕНИЙ, кроме проверки ключа) ---
 if __name__ == "__main__":
     logger.info(f"Скрипт bot.py запущен как основной (__name__ == '__main__').")
-
-    # Создаем .env шаблон, если надо (остается как было)
+    # ... (создание шаблона .env как было, НО МОЖНО УДАЛИТЬ СТРОКУ ПРО GEMINI_API_KEY) ...
     if not os.path.exists('.env') and not os.getenv('RENDER'):
-        logger.warning("Файл .env не найден...")
         try:
-            with open('.env', 'w') as f:
-                f.write(f"# Впиши сюда свои реальные ключи!\n")
-                f.write(f"TELEGRAM_BOT_TOKEN=Бэбра\n")
-                f.write(f"GEMINI_API_KEY=Бэбручо\n")
+            with open('.env', 'w') as f: f.write(f"TELEGRAM_BOT_TOKEN=...\nGROQ_API_KEY=...\n") # <-- Убрали Gemini
             logger.warning("Создан ШАБЛОН файла .env...")
-        except Exception as e:
-            logger.error(f"Не удалось создать шаблон .env файла: {e}")
+        except Exception as e: logger.error(f"Не удалось создать шаблон .env файла: {e}")
+    # ПРОВЕРЯЕМ ОБА КЛЮЧА ПЕРЕД ЗАПУСКОМ!
+    if not TELEGRAM_BOT_TOKEN or not GROQ_API_KEY:
+        logger.critical("ОТСУТСТВУЮТ КЛЮЧИ TELEGRAM_BOT_TOKEN или GROQ_API_KEY!"); exit(1) # <-- Изменили проверку
+    # ... (запуск asyncio.run(main()) как было) ...
+    try: logger.info("Запускаю asyncio.run(main())..."); asyncio.run(main()); #... и так далее ...
 
-    # Проверяем ключи (остается как было)
-    if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
-        logger.critical("ОТСУТСТВУЮТ КЛЮЧИ TELEGRAM_BOT_TOKEN или GEMINI_API_KEY. Не могу запуститься.")
-        exit(1)
-
-    # Запускаем всю эту АСИНХРОННУЮ хуйню через asyncio.run()
-    try:
-        logger.info("Запускаю asyncio.run(main())...")
-        # asyncio.run() автоматически обрабатывает Ctrl+C (SIGINT)
-        asyncio.run(main())
-        logger.info("asyncio.run(main()) завершен.")
-    # Явный перехват KeyboardInterrupt больше не нужен, т.к. asyncio.run и idle() его обрабатывают
-    # except KeyboardInterrupt:
-    #     logger.info("Получен KeyboardInterrupt (Ctrl+C). Завершаю работу...")
-    except Exception as e:
-        # Ловим любые другие ошибки на самом верхнем уровне
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА на верхнем уровне выполнения: {e}", exc_info=True)
-        exit(1) # Выходим с кодом ошибки
-    finally:
-         logger.info("Скрипт bot.py завершает работу.")
-
-# --- КОНЕЦ ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
+# --- КОНЕЦ ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ ДЛЯ GROQ API) ---

@@ -6,6 +6,7 @@ certifi==2025.1.31
 charset-normalizer==3.4.1
 click==8.1.8
 colorama==0.4.6
+distro==1.9.0
 exceptiongroup==1.2.2
 Flask==3.1.0
 google-ai-generativelanguage==0.6.15
@@ -28,7 +29,9 @@ hyperframe==6.1.0
 idna==3.10
 itsdangerous==2.2.0
 Jinja2==3.1.6
+jiter==0.9.0
 MarkupSafe==3.0.2
+openai==1.76.0
 priority==2.0.0
 proto-plus==1.26.1
 protobuf==5.29.4
