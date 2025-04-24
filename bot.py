@@ -130,6 +130,79 @@ async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # --- НОВАЯ АСИНХРОННАЯ ЧАСТЬ (ЗАМЕНЯЕТ FLASK, ПОТОКИ И СТАРУЮ MAIN) ---
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ АНАЛИЗА КАРТИНОК ---
+async def analyze_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Анализирует картинку, на которую ответили командой /analyze_pic."""
+    if not update.message or not update.message.reply_to_message:
+        await update.message.reply_text("Хули ты мне просто команду пишешь? Ответь ей на сообщение с картинкой, долбоеб!")
+        return
+
+    reply_msg = update.message.reply_to_message
+    user_name = update.message.from_user.first_name or "Анализатор хуев"
+
+    # Проверяем, есть ли в сообщении, на которое ответили, фотка
+    if not reply_msg.photo:
+        await update.message.reply_text(f"Слышь, {user_name}, я тут только картинки комментирую, а не твой текстовый высер или ебучий стикер. Ответь на КАРТИНКУ.")
+        return
+
+    logger.info(f"Пользователь '{user_name}' запросил анализ картинки в чате {update.message.chat_id}")
+
+    # Берем самую большую версию фотки (обычно последняя в списке)
+    photo_large = reply_msg.photo[-1]
+    logger.info(f"Получаем файл картинки ID: {photo_large.file_id}")
+
+    try:
+        # Скачиваем файл картинки в память (в виде байтов)
+        # Ставим таймаут на всякий случай
+        photo_file = await context.bot.get_file(photo_large.file_id, read_timeout=60)
+        # Нужны байты картинки
+        photo_bytes_io = await photo_file.download_as_bytearray(read_timeout=60)
+        photo_bytes = bytes(photo_bytes_io) # Конвертируем bytearray в bytes
+        logger.info(f"Картинка успешно скачана, размер: {len(photo_bytes)} байт.")
+
+        # Готовим ПРАВИЛЬНЫЙ промпт для КАРТИНКИ
+        image_prompt = (
+            f"Ты - крайне саркастичный, циничный и матершинный арт-критик из подворотни. "
+            f"Твоя задача - посмотреть на ПРИКРЕПЛЕННУЮ КАРТИНКУ и выдать на нее максимально уничижительную, едкую и смешную рецензию в 1-3 предложения. "
+            f"Не стесняйся использовать РУССКИЙ МАТ, чтобы подчеркнуть убожество или абсурдность изображения. Опиши, что ты видишь, и обосри это.\n\n"
+            f"Не пиши 'На картинке изображено...'. Сразу начинай с сути.\n"
+            f"Пример охуенного ответа (если на картинке кот): '# Бля, ну и уебище кошачье. Смотрит так, будто щас блеванет. Хозяин, видимо, под стать.'\n"
+            f"Пример (если пейзаж): '# Ебать, горы говна и палки какие-то. Снято на тапок, походу. Автор явно не Рерих, а хуй моржовый.'\n"
+            f"Пример (если абстракция): '# Что это за высер шизофреника? Набор цветных пятен, как будто кто-то наблевал на холст. Искусство, блядь.'\n\n"
+            f"КОРОЧЕ! Посмотри на картинку и выдай свой вердикт:"
+        )
+
+        # Сообщение "Думаю..."
+        thinking_message = await update.message.reply_text("Так-так, блядь, ща посмотрим на это произведение искусства... Дайте подумать (или просто подождите, картинки дольше грузятся)...")
+
+        # Отправляем запрос в Gemini С КАРТИНКОЙ
+        logger.info("Отправка запроса к Gemini с картинкой...")
+        # Gemini принимает список "частей": текст и данные картинки
+        response = await model.generate_content_async([image_prompt, {"mime_type": "image/jpeg", "data": photo_bytes}])
+        # ЗАМЕЧАНИЕ: Мы тупо ставим mime_type "image/jpeg". Если прислали PNG или другую хуйню,
+        # Gemini может не понять или обработать криво. Для простоты пока забьем.
+        logger.info("Получен ответ от Gemini по картинке.")
+
+        # Удаляем "Думаю..."
+        try: await context.bot.delete_message(chat_id=update.message.chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+
+        # Отправляем ответ
+        sarcastic_comment = "Хуй знает, что там нарисовано, но выглядит как говно. Или Gemini не смог это переварить."
+        if response and response.text:
+            sarcastic_comment = response.text.strip()
+        await update.message.reply_text(sarcastic_comment)
+        logger.info(f"Отправлен комментарий к картинке: '{sarcastic_comment[:50]}...'")
+
+    except Exception as e:
+        logger.error(f"ПИЗДЕЦ при анализе картинки: {e}", exc_info=True)
+        try:
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=update.message.chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+        await update.message.reply_text(f"Бля, {user_name}, я обосрался, пока смотрел на эту картинку. То ли она слишком уебищная, то ли Гугл опять барахлит. Ошибка: `{type(e).__name__}`.")
+
+# --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
 # Flask app остается для Render заглушки
 app = Flask(__name__)
 
@@ -183,6 +256,7 @@ async def main() -> None:
     logger.info("Сборка Telegram Application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("analyze", analyze_chat))
+    application.add_handler(CommandHandler("analyze_pic", analyze_pic))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
     logger.info("Обработчики Telegram добавлены.")
 
