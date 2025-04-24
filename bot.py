@@ -176,10 +176,16 @@ def index():
     # Можно вернуть что угодно, главное статус 200 OK
     return "Я саркастичный бот, и я типа работаю (на костылях Render). Отъебись и иди в Telegram, тут смотреть нехуй."
 
-# --- Функция для запуска основного цикла Telegram бота в отдельном потоке ---
+# --- Функция для запуска основного цикла Telegram бота в отдельном потоке (ИСПРАВЛЕННАЯ) ---
 def run_telegram_bot():
     """Эта функция запускает бесконечный цикл опроса Telegram API."""
-    logger.info("Попытка создания и запуска Telegram Bot Application в отдельном потоке...")
+    # --->>> ВОТ ТУТ ГЛАВНЫЙ ФИКС: <<<---
+    # Создаем НОВЫЙ цикл событий asyncio СПЕЦИАЛЬНО ДЛЯ ЭТОГО ПОТОКА
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    # --->>> КОНЕЦ ГЛАВНОГО ФИКСА <<<---
+
+    logger.info(f"Попытка создания и запуска Telegram Bot Application в потоке {Thread.current_thread().name} с новым event loop...")
     try:
         # Собираем приложение бота со всеми обработчиками
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -190,18 +196,22 @@ def run_telegram_bot():
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
 
         logger.info("Запускаю application.run_polling() (это блокирующая операция)...")
-        # Запускаем polling - это БЛОКИРУЮЩАЯ операция,
-        # она будет выполняться в этом потоке, пока ее принудительно не остановят
-        application.run_polling(allowed_updates=Update.ALL_TYPES) # Принимаем все типы апдейтов
+        # Теперь run_polling будет использовать тот event loop, который мы создали и установили выше
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
         # Сюда код дойдет только при штатной остановке бота (Ctrl+C или сигнал)
         logger.info("Telegram бот application.run_polling() штатно завершен.")
 
     except Exception as e:
         # Логируем критическую ошибку, если весь цикл бота упал
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в основном цикле Telegram бота: {e}", exc_info=True)
-        # Тут можно было бы добавить механизм перезапуска, но для тебя, дебил, и так сойдет.
-        # Просто смотри логи на Render, если бот перестанет отвечать.
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в основном цикле Telegram бота в потоке {Thread.current_thread().name}: {e}", exc_info=True)
+    finally:
+        # --- >>> ВАЖНО (хотя и не обязательно с daemon=True): <<< ---
+        # Когда поток завершается (например, из-за ошибки), хорошо бы закрыть созданный цикл
+        if loop and not loop.is_closed():
+             logger.info(f"Закрытие event loop в потоке {Thread.current_thread().name}")
+             loop.close()
+        # --- >>> КОНЕЦ ВАЖНОЙ ЧАСТИ <<< ---
 
 # --- Основная функция main (ЗАПУСКАЕТ ВСЕ НАХУЙ) ---
 def main() -> None:
