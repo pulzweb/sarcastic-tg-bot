@@ -5,8 +5,8 @@ import asyncio # ОСНОВА ВСЕЙ АСИНХРОННОЙ МАГИИ
 from collections import deque
 # УБРАЛИ НАХУЙ THREADING
 from flask import Flask # Веб-сервер-заглушка для Render
-import hypercorn # Асинхронный веб-сервер для запуска Flask под asyncio
-import hypercorn.config # Для настройки Hypercorn
+import hypercorn.config # Конфиг нужен
+from hypercorn.asyncio import serve as hypercorn_async_serve # <--- ИМПОРТИРУЕМ ЯВНО И ПЕРЕИМЕНОВЫВАЕМ!
 import signal # Для корректной обработки сигналов остановки (хотя asyncio.run сам умеет)
 
 import google.generativeai as genai
@@ -200,7 +200,7 @@ async def main() -> None:
     # Используем 'shutdown_trigger' Hypercorn чтобы он среагировал на сигнал остановки asyncio
     shutdown_event = asyncio.Event()
     server_task = asyncio.create_task(
-        hypercorn.serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait),
+        hypercorn_async_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait),
         name="HypercornServerTask"
     )
 
