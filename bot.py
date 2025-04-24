@@ -1,96 +1,75 @@
-# --- НАЧАЛО ПОЛНОГО КОДА ДЛЯ BOT.PY ---
+# --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
 import logging
 import os
-import asyncio
+import asyncio # ОСНОВА ВСЕЙ АСИНХРОННОЙ МАГИИ
 from collections import deque
-from threading import Thread # Для запуска бота в отдельном потоке, чтоб не мешал веб-серверу
-import threading # <--- ДОБАВЬ ЭТУ СТРОКУ
-from flask import Flask # Сам веб-сервер-заглушка для Render
+# УБРАЛИ НАХУЙ THREADING
+from flask import Flask # Веб-сервер-заглушка для Render
+import hypercorn # Асинхронный веб-сервер для запуска Flask под asyncio
+import hypercorn.config # Для настройки Hypercorn
+import signal # Для корректной обработки сигналов остановки (хотя asyncio.run сам умеет)
 
 import google.generativeai as genai
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from dotenv import load_dotenv # Чтобы читать твой сраный .env файл (или переменные Render)
+from dotenv import load_dotenv # Чтобы читать твой .env файл или переменные Render
 
-# Загружаем секреты из файла .env (если он есть в папке) ИЛИ из переменных окружения Render
+# Загружаем секреты
 load_dotenv()
 
-# --- НАСТРОЙКИ (твои ключи и прочая хуета) ---
+# --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# Максимальное количество сообщений для анализа (от 10 до 1000, блядь, как ты и просил)
-# Ставь поменьше (30-100), если не хочешь разорить Google на запросах или долго ждать ответа
-MAX_MESSAGES_TO_ANALYZE = 50 # Можешь поменять, если не ссышь последствий
+MAX_MESSAGES_TO_ANALYZE = 50 # Меняй на свой страх и риск
 
-# Проверка, что ключи ты, сука, указал!
+# Проверка ключей
 if not TELEGRAM_BOT_TOKEN:
-    # Эта ошибка остановит запуск, если токена нет. И ПРАВИЛЬНО СДЕЛАЕТ!
-    raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN, долбоеб! Проверь .env файл или переменные окружения на Render.")
+    raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
 if not GEMINI_API_KEY:
-    raise ValueError("НЕ НАЙДЕН GEMINI_API_KEY, кретин! Проверь .env файл или переменные окружения на Render.")
+    raise ValueError("НЕ НАЙДЕН GEMINI_API_KEY!")
 
-# Настройка логирования, чтобы хоть что-то понимать, когда все пойдет по пизде
+# --- Логирование ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-# Уменьшаем спам от библиотеки HTTP-запросов, которая под капотом у телеги и гугла
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("hypercorn").setLevel(logging.INFO) # Чтобы видеть логи Hypercorn
 logger = logging.getLogger(__name__)
 
-# Настройка Gemini API (гугло-мозга, который будет за тебя язвить)
+# --- Настройка Gemini ---
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    # Используем модель побыстрее и подешевле ('flash'), а то денег у тебя нет
     model = genai.GenerativeModel('gemini-1.5-flash')
     logger.info("Модель Gemini успешно настроена.")
 except Exception as e:
     logger.critical(f"ПИЗДЕЦ при настройке Gemini API: {e}", exc_info=True)
-    # Если даже модель не можем настроить, дальше смысла нет работать
     raise SystemExit(f"Не удалось настроить Gemini API: {e}")
 
-# Глобальный словарь для хранения истории высеров по чатам
-# Ключ - chat_id, значение - deque (очередь) с сообщениями
+# --- Хранилище истории ---
 chat_histories = {}
 logger.info(f"Максимальная длина истории сообщений для анализа: {MAX_MESSAGES_TO_ANALYZE}")
 
-# Функция для обработки обычных сообщений (сохраняем этот бред в память)
+# --- ОБРАБОТЧИКИ СООБЩЕНИЙ И КОМАНД (БЕЗ ИЗМЕНЕНИЙ) ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Проверяем, что сообщение вообще есть и оно текстовое и от пользователя
     if not update.message or not update.message.text or not update.message.from_user:
-        # logger.debug("Игнорируем нетекстовое или системное сообщение")
-        return # Игнорим всякую хуйню без текста или от непонятно кого
-
+        return
     chat_id = update.message.chat_id
     message_text = update.message.text
-    user_name = update.message.from_user.first_name or "Анонимный долбоеб" # На случай, если имени нет
-
-    # Создаем очередь для чата, если ее еще нет
+    user_name = update.message.from_user.first_name or "Анонимный долбоеб"
     if chat_id not in chat_histories:
-        # deque - охуенная штука, сама выкидывает старое говно при добавлении нового
         chat_histories[chat_id] = deque(maxlen=MAX_MESSAGES_TO_ANALYZE)
-        logger.info(f"Создана новая история для чата {chat_id}")
-
-    # Добавляем сообщение в формате "Имя: Текст" в историю чата
+        # logger.info(f"Создана новая история для чата {chat_id}") # Убрал лишний лог
     chat_histories[chat_id].append(f"{user_name}: {message_text}")
-    # Закомментил логирование каждого сообщения, а то засрет все логи нахуй
-    # logger.debug(f"Сохранено сообщение от {user_name} в чате {chat_id}. Размер истории: {len(chat_histories[chat_id])}")
 
-# Функция для команды /analyze (главная функция - обосрать чат)
 async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Проверяем наличие сообщения и пользователя
     if not update.message or not update.message.from_user:
-        logger.warning("Получена команда /analyze без необходимой информации. Игнорируем.")
         return
-
     chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Эй ты там" # Обращение к вызвавшему
-
+    user_name = update.message.from_user.first_name or "Эй ты там"
     logger.info(f"Пользователь '{user_name}' (ID: {update.message.from_user.id}) запросил анализ в чате {chat_id}")
-
-    # Проверяем, накопился ли хоть какой-то пиздеж для анализа
-    if chat_id not in chat_histories or len(chat_histories[chat_id]) < 10: # Минимальный порог сообщений
-        min_msgs = 10 # Можно вынести в константу, если не лень
-        history_len = len(chat_histories.get(chat_id, []))
+    min_msgs = 10
+    history_len = len(chat_histories.get(chat_id, []))
+    if chat_id not in chat_histories or history_len < min_msgs:
         logger.info(f"В чате {chat_id} слишком мало сообщений ({history_len}/{min_msgs}) для анализа.")
         await update.message.reply_text(
             f"Слышь, {user_name}, ты заебал. Я тут недавно (или вы молчали как рыбы), сообщений кот наплакал "
@@ -99,18 +78,11 @@ async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"(Или я просто просыпаюсь после спячки Render, подожди секунд 30 и попробуй еще раз, нетерпеливый уебок)."
         )
         return
-
-    # Получаем последние сообщения из нашей сохраненной истории
-    # Копируем в список, чтобы не менять deque во время итерации (на всякий случай)
     messages_to_analyze = list(chat_histories[chat_id])
     conversation_text = "\n".join(messages_to_analyze)
     logger.info(f"Начинаю анализ {len(messages_to_analyze)} сообщений для чата {chat_id}...")
-
-    # Отправляем запрос к Gemini
     try:
-        # Составляем ПРОМПТ (инструкцию) для нейросети. Тут вся магия сарказма и мата!
-        # МОЖЕШЬ МЕНЯТЬ ЭТОТ ПРОМПТ, ЕСЛИ ХОЧЕШЬ ДРУГОЙ СТИЛЬ ОТВЕТОВ!!!
-        prompt = (
+        prompt = ( # ТВОЙ ДЛИННЫЙ ОХУЕННЫЙ ПРОМПТ ЗДЕСЬ
             f"Ты - саркастичный и циничный ассистент, анализирующий переписки в Telegram-чатах. "
             f"Тебе предоставили фрагмент диалога:\n\n"
             f"--- НАЧАЛО ДИАЛОГА ---\n{conversation_text}\n--- КОНЕЦ ДИАЛОГА ---\n\n"
@@ -123,158 +95,183 @@ async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"Пример ЗАЕБАТОГО ответа: 'Похоже, эти бездари опять пытаются придумать, как просрать очередные выходные. Уровень дискуссии - /dev/null.' ИЛИ 'Охуеть, сборище интеллектуалов решает глобальную проблему выбора пива. Мир точно в безопасности.'\n\n"
             f"КОРОЧЕ, НЕ НУДИ! ДЕЛАЙ СМЕШНО, ЗЛО И ПО СУТИ! Выдай свой вердикт:"
         )
-
-        # Показываем пользователю, что мы типа думаем (это занимает время, особенно после сна на Render)
-        # Сохраняем сообщение, чтобы потом удалить
         thinking_message = await update.message.reply_text("Так, блядь, щас напрягу свои кремниевые мозги и попробую понять смысл вашего высокоинтеллектуального бреда... Не мешайте, я в процессе (или тупо сплю, хуй знает)...")
         logger.debug(f"Отправил сообщение 'думаю' (ID: {thinking_message.message_id}) в чат {chat_id}")
-
-        # Асинхронный запрос к модели, чтобы не блокировать все нахуй пока она там думает
         logger.info(f"Отправляю запрос к Gemini для чата {chat_id}...")
         response = await model.generate_content_async(prompt)
         logger.info(f"Получен ответ от Gemini для чата {chat_id}")
-
-        # Убираем нахуй сообщение "думаю" - оно свою роль сыграло
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
             logger.debug(f"Удалил сообщение 'думаю' (ID: {thinking_message.message_id}) в чате {chat_id}")
         except Exception as delete_err:
-            # Похуй, если не удалилось, не критично
             logger.warning(f"Не смог удалить сообщение 'думаю' (ID: {thinking_message.message_id}) в чате {chat_id}: {delete_err}")
-
-        # Обрабатываем ответ от Gemini
         sarcastic_summary = "Бля, хуйню какую-то нейронка выдала или вообще пустой ответ. Видимо, ваш треп настолько бессмысленный, что даже ИИ повесился."
         if response and response.text:
              sarcastic_summary = response.text.strip()
-
-        # Отправляем результат анализа (или сообщение об ошибке, если нейронка сдохла)
         await update.message.reply_text(sarcastic_summary)
         logger.info(f"Отправил результат анализа '{sarcastic_summary[:50]}...' в чат {chat_id}")
-
     except Exception as e:
         logger.error(f"ПИЗДЕЦ при выполнении анализа для чата {chat_id}: {e}", exc_info=True)
-        # Пытаемся удалить сообщение "думаю" даже если была ошибка
         try:
-            if 'thinking_message' in locals(): # Проверяем, успели ли создать переменную
+            if 'thinking_message' in locals():
                  await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception as inner_e:
             logger.warning(f"Не удалось удалить сообщение 'думаю' после ошибки: {inner_e}")
-
-        # Сообщаем пользователю, что все пошло по пизде
         await update.message.reply_text(
             f"Бля, {user_name}, все сломалось нахуй в процессе анализа. То ли Гугл меня наебал, то ли я сам криворукий мудак, то ли ваш диалог сломал мне мозг. "
             f"Ошибка типа: `{type(e).__name__}`. Можешь попробовать позже, но я не гарантирую, что это говно починится само."
         )
 
-# --- Создаем Flask приложение (веб-сервер-заглушка для Render) ---
-# Это нужно, чтобы Render считал сервис рабочим и не убивал его сразу (хотя он все равно будет засыпать)
+# --- НОВАЯ АСИНХРОННАЯ ЧАСТЬ (ЗАМЕНЯЕТ FLASK, ПОТОКИ И СТАРУЮ MAIN) ---
+
+# Flask app остается для Render заглушки
 app = Flask(__name__)
 
-@app.route('/') # Отвечаем на запросы к корневому URL /
+@app.route('/')
 def index():
-    """Эта функция будет вызываться, когда Render проверяет жив ли сервис."""
+    """Отвечает на HTTP GET запросы для проверки живости сервиса Render."""
     logger.info("Получен GET запрос на '/', отвечаю OK.")
-    # Можно вернуть что угодно, главное статус 200 OK
-    return "Я саркастичный бот, и я типа работаю (на костылях Render). Отъебись и иди в Telegram, тут смотреть нехуй."
+    return "Я саркастичный бот, и я все еще жив (наверное). Иди нахуй из браузера, пиши в Telegram."
 
-# --- Функция для запуска основного цикла Telegram бота в отдельном потоке (ИСПРАВЛЕННАЯ) ---
-def run_telegram_bot():
-    """Эта функция запускает бесконечный цикл опроса Telegram API."""
-    # --->>> ВОТ ТУТ ГЛАВНЫЙ ФИКС: <<<---
-    # Создаем НОВЫЙ цикл событий asyncio СПЕЦИАЛЬНО ДЛЯ ЭТОГО ПОТОКА
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    # --->>> КОНЕЦ ГЛАВНОГО ФИКСА <<<---
-
-    logger.info(f"Попытка создания и запуска Telegram Bot Application в потоке {threading.current_thread().name} с новым event loop...")
+async def run_bot_async(application: Application) -> None:
+    """Асинхронная функция для запуска и корректной остановки бота."""
     try:
-        # Собираем приложение бота со всеми обработчиками
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        logger.info("Инициализация Telegram Application...")
+        await application.initialize() # Инициализируем первыми
+        if application.updater: # Убедимся что апдейтер создан
+            logger.info("Запуск получения обновлений (start_polling)...")
+            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("Запуск диспетчера Application (start)...")
+        await application.start() # Запускаем обработку
+        logger.info("Бот запущен и работает... (ожидание сигнала остановки через idle)")
+        # idle() будет ждать сигналов SIGINT, SIGTERM, SIGABRT
+        if application.updater:
+            await application.updater.idle()
+        else: # Если вдруг апдейтера нет (хотя не должно быть с run_polling), просто висим
+            while True: await asyncio.sleep(3600)
 
-        # Добавляем обработчик команды /analyze
-        application.add_handler(CommandHandler("analyze", analyze_chat))
-        # Добавляем обработчик ВСЕХ текстовых сообщений (КРОМЕ команд), чтобы сохранять их
-        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
-
-        logger.info("Запускаю application.run_polling() (это блокирующая операция)...")
-        # Теперь run_polling будет использовать тот event loop, который мы создали и установили выше
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-        # Сюда код дойдет только при штатной остановке бота (Ctrl+C или сигнал)
-        logger.info("Telegram бот application.run_polling() штатно завершен.")
-
+        logger.info("Получен сигнал остановки (idle завершился).")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Получен KeyboardInterrupt/SystemExit, начинаем остановку.")
     except Exception as e:
-        # Логируем критическую ошибку, если весь цикл бота упал
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в основном цикле Telegram бота в потоке {threading.current_thread().name}: {e}", exc_info=True)
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в run_bot_async: {e}", exc_info=True)
     finally:
-        # --- >>> ВАЖНО (хотя и не обязательно с daemon=True): <<< ---
-        # Когда поток завершается (например, из-за ошибки), хорошо бы закрыть созданный цикл
-        if loop and not loop.is_closed():
-             logger.info(f"Закрытие event loop в потоке {threading.current_thread().name}")
-             loop.close()
-        # --- >>> КОНЕЦ ВАЖНОЙ ЧАСТИ <<< ---
-
-# --- Основная функция main (ЗАПУСКАЕТ ВСЕ НАХУЙ) ---
-def main() -> None:
-    """Запускает Flask веб-сервер (для Render) и Telegram бота (в отдельном потоке)."""
-
-    logger.info("Запуск основной функции main().")
-
-    # 1. Запускаем Telegram бота в ОТДЕЛЬНОМ ПОТОКЕ
-    # Это важно, чтобы он не блокировал основной поток, где будет работать веб-сервер Flask
-    logger.info("Создание и запуск потока для Telegram бота...")
-    # daemon=True означает, что этот поток умрет автоматически, когда умрет основной поток (Flask)
-    telegram_thread = Thread(target=run_telegram_bot, daemon=True)
-    telegram_thread.start()
-    if telegram_thread.is_alive():
-        logger.info(f"Поток Telegram бота успешно запущен (ID потока: {telegram_thread.ident}).")
-    else:
-        logger.error("НЕ УДАЛОСЬ ЗАПУСТИТЬ ПОТОК TELEGRAM БОТА!")
-        # Можно тут выйти, раз бот не запустился, но Flask все равно попробует стартануть
-        # raise SystemExit("Не удалось запустить поток бота.")
+        logger.info("Начинаю процесс остановки бота...")
+        # Проверяем что application было запущено перед остановкой
+        if application.running:
+            logger.info("Остановка диспетчера Application (stop)...")
+            await application.stop()
+        # Проверяем что апдейтер был запущен перед остановкой
+        if application.updater and application.updater.running:
+            logger.info("Остановка получения обновлений (stop_polling)...")
+            await application.updater.stop_polling()
+        logger.info("Завершение работы Application (shutdown)...")
+        await application.shutdown() # Освобождаем ресурсы
+        logger.info("Процесс остановки бота завершен.")
 
 
-    # 2. Запускаем Flask веб-сервер в ЭТОМ (главном) потоке
-    # Он будет слушать HTTP запросы, чтобы Render был доволен
-    # Render сам передаст нужный порт через переменную окружения PORT
-    # Используем 8080 по умолчанию, если запускаем локально и PORT не задан
-    port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Запуск Flask веб-сервера на хосте 0.0.0.0 и порту {port}...")
-    # Важно слушать на 0.0.0.0, чтобы Render мог достучаться до сервера извне контейнера
-    # debug=False ОБЯЗАТЕЛЬНО на продакшене (на Render), чтобы не было уязвимостей и лишнего говна в логах
-    # use_reloader=False тоже важно, чтобы Flask не пытался сам перезапускаться при изменениях кода
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+async def main() -> None:
+    """Основная асинхронная функция, запускающая веб-сервер и бота."""
+    logger.info("Запуск асинхронной функции main().")
 
-    # Сюда код дойдет только если Flask сервер по какой-то причине остановится (что не должно произойти штатно)
-    logger.info("Flask веб-сервер остановлен.")
+    # 1. Настраиваем и собираем Telegram бота
+    logger.info("Сборка Telegram Application...")
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("analyze", analyze_chat))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
+    logger.info("Обработчики Telegram добавлены.")
 
-# --- Точка входа в скрипт (запускается при выполнении python bot.py) ---
+    # 2. Настраиваем Hypercorn для запуска Flask приложения
+    port = int(os.environ.get("PORT", 8080)) # Render передает порт через $PORT
+    hypercorn_config = hypercorn.config.Config()
+    hypercorn_config.bind = [f"0.0.0.0:{port}"]
+    hypercorn_config.worker_class = "asyncio" # Используем asyncio worker
+    # Увеличим таймаут отключения, чтобы бот успел корректно остановиться
+    hypercorn_config.shutdown_timeout = 60.0
+    logger.info(f"Конфигурация Hypercorn: bind={hypercorn_config.bind}, worker={hypercorn_config.worker_class}, shutdown_timeout={hypercorn_config.shutdown_timeout}")
+
+    # 3. Запускаем обе задачи (веб-сервер и бот) конкурентно в одном event loop
+    logger.info("Создание и запуск конкурентных задач для Hypercorn и Telegram бота...")
+
+    # Создаем задачи
+    # Имя задачи полезно для логов
+    bot_task = asyncio.create_task(run_bot_async(application), name="TelegramBotTask")
+    # Hypercorn будет обслуживать Flask 'app'
+    # Используем 'shutdown_trigger' Hypercorn чтобы он среагировал на сигнал остановки asyncio
+    shutdown_event = asyncio.Event()
+    server_task = asyncio.create_task(
+        hypercorn.asyncio.serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait),
+        name="HypercornServerTask"
+    )
+
+    # Ожидаем завершения ЛЮБОЙ из задач. В норме они должны работать вечно.
+    done, pending = await asyncio.wait(
+        [bot_task, server_task], return_when=asyncio.FIRST_COMPLETED
+    )
+
+    logger.warning(f"Одна из основных задач завершилась! Done: {done}, Pending: {pending}")
+
+    # Сигнализируем Hypercorn'у остановиться, если он еще работает
+    if server_task in pending:
+        logger.info("Сигнализируем Hypercorn серверу на остановку...")
+        shutdown_event.set()
+
+    # Пытаемся вежливо отменить и дождаться завершения оставшихся задач
+    logger.info("Отменяем и ожидаем завершения оставшихся задач...")
+    for task in pending:
+        task.cancel()
+    # Даем им шанс завершиться после отмены
+    await asyncio.gather(*pending, return_exceptions=True)
+
+    # Проверяем исключения в завершенных задачах
+    for task in done:
+        logger.info(f"Проверка завершенной задачи: {task.get_name()}")
+        try:
+            # Если в задаче было исключение, оно поднимется здесь
+            await task
+        except asyncio.CancelledError:
+             logger.info(f"Задача {task.get_name()} была отменена.")
+        except Exception as e:
+            logger.error(f"Задача {task.get_name()} завершилась с ошибкой: {e}", exc_info=True)
+
+    logger.info("Асинхронная функция main() завершила работу.")
+
+
+# --- Точка входа в скрипт (ЗАПУСКАЕТ АСИНХРОННУЮ main) ---
 if __name__ == "__main__":
     logger.info(f"Скрипт bot.py запущен как основной (__name__ == '__main__').")
 
-    # Создаем файл .env ШАБЛОН, если его нет И мы НЕ на Render
-    # Это нужно только для удобства локального запуска, чтобы ты, долбоеб, не забыл про ключи
-    # На Render ключи берутся из Environment Variables, которые ты настраивал в интерфейсе Render
-    if not os.path.exists('.env') and not os.getenv('RENDER'): # 'RENDER' - это переменная, которую Render обычно ставит
-        logger.warning("Файл .env не найден и мы не на Render. Создаю ШАБЛОН .env...")
+    # Создаем .env шаблон, если надо (остается как было)
+    if not os.path.exists('.env') and not os.getenv('RENDER'):
+        logger.warning("Файл .env не найден...")
         try:
             with open('.env', 'w') as f:
                 f.write(f"# Впиши сюда свои реальные ключи!\n")
                 f.write(f"TELEGRAM_BOT_TOKEN=7209221587:AAEjoKdYh9uJXkvbvCiTCFdI7rvqkHw135s\n")
                 f.write(f"GEMINI_API_KEY=AIzaSyBd4yq48KHH6vraW9ASrwZXLQlqiZx_yKw\n")
-            logger.warning("Создан ШАБЛОН файла .env. НЕ ЗАБУДЬ ВПИСАТЬ ТУДА СВОИ КЛЮЧИ ПЕРЕД ЛОКАЛЬНЫМ ЗАПУСКОМ!")
-            # Можно раскомментить exit(), чтобы скрипт остановился, пока ты не впишешь ключи локально
-            # logger.info("Останавливаю скрипт, чтобы ты мог заполнить .env")
-            # exit()
+            logger.warning("Создан ШАБЛОН файла .env...")
         except Exception as e:
-            logger.error(f"Пиздец! Не удалось создать шаблон .env файла: {e}")
+            logger.error(f"Не удалось создать шаблон .env файла: {e}")
 
-    # Проверяем наличие ключей еще раз перед запуском main()
+    # Проверяем ключи (остается как было)
     if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
         logger.critical("ОТСУТСТВУЮТ КЛЮЧИ TELEGRAM_BOT_TOKEN или GEMINI_API_KEY. Не могу запуститься.")
-        exit(1) # Выходим с ошибкой
+        exit(1)
 
-    # Запускаем всю эту хуйню через функцию main()
-    main()
+    # Запускаем всю эту АСИНХРОННУЮ хуйню через asyncio.run()
+    try:
+        logger.info("Запускаю asyncio.run(main())...")
+        # asyncio.run() автоматически обрабатывает Ctrl+C (SIGINT)
+        asyncio.run(main())
+        logger.info("asyncio.run(main()) завершен.")
+    # Явный перехват KeyboardInterrupt больше не нужен, т.к. asyncio.run и idle() его обрабатывают
+    # except KeyboardInterrupt:
+    #     logger.info("Получен KeyboardInterrupt (Ctrl+C). Завершаю работу...")
+    except Exception as e:
+        # Ловим любые другие ошибки на самом верхнем уровне
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА на верхнем уровне выполнения: {e}", exc_info=True)
+        exit(1) # Выходим с кодом ошибки
+    finally:
+         logger.info("Скрипт bot.py завершает работу.")
 
-# --- КОНЕЦ ПОЛНОГО КОДА ДЛЯ BOT.PY ---
+# --- КОНЕЦ ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
