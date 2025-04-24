@@ -51,7 +51,7 @@ except Exception as e:
      raise SystemExit(f"Не удалось настроить клиента Groq: {e}")
 
 # ID МОДЕЛИ НА GROQ (УБЕДИСЬ, ЧТО ОНА ДОСТУПНА!)
-GROQ_MODEL_ID = "deepseek-r1-distill-llama-70b" # ТВОЯ МОДЕЛЬ! ПЕРЕПРОВЕРЬ! Если нет, ставь llama3-8b-8192
+GROQ_MODEL_ID = "mistral-saba-24b" # ТВОЯ МОДЕЛЬ! ПЕРЕПРОВЕРЬ! Если нет, ставь llama3-8b-8192
 logger.info(f"Будет использоваться модель Groq: {GROQ_MODEL_ID}")
 
 # --- Хранилище истории ---
