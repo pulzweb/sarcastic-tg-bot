@@ -137,37 +137,36 @@ async def run_bot_async(application: Application) -> None:
     """Асинхронная функция для запуска и корректной остановки бота."""
     try:
         logger.info("Инициализация Telegram Application...")
-        await application.initialize() # Инициализируем первыми
-        if application.updater: # Убедимся что апдейтер создан
-            logger.info("Запуск получения обновлений (start_polling)...")
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await application.initialize() # Инициализируем
+        if not application.updater:
+             logger.critical("Updater не был создан в Application. Не могу запустить polling.")
+             return
+        logger.info("Запуск получения обновлений (start_polling)...")
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES) # Запускаем polling
         logger.info("Запуск диспетчера Application (start)...")
-        await application.start() # Запускаем обработку
-        logger.info("Бот запущен и работает... (ожидание сигнала остановки через idle)")
-        # idle() будет ждать сигналов SIGINT, SIGTERM, SIGABRT
-        if application.updater:
-            await application.updater.idle()
-        else: # Если вдруг апдейтера нет (хотя не должно быть с run_polling), просто висим
-            while True: await asyncio.sleep(3600)
-
-        logger.info("Получен сигнал остановки (idle завершился).")
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Получен KeyboardInterrupt/SystemExit, начинаем остановку.")
+        await application.start() # Запускаем обработку апдейтов
+        logger.info("Бот запущен и работает... (ожидание отмены или сигнала)")
+        # --->>> Заменяем idle() на ожидание Future <<<---
+        await asyncio.Future()
+        logger.info("Ожидание Future завершилось (не должно было без отмены).")
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        logger.info("Получен сигнал остановки (KeyboardInterrupt/SystemExit/CancelledError).")
     except Exception as e:
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в run_bot_async: {e}", exc_info=True)
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в run_bot_async во время работы: {e}", exc_info=True)
     finally:
-        logger.info("Начинаю процесс остановки бота...")
-        # Проверяем что application было запущено перед остановкой
+        logger.info("Начинаю процесс ОСТАНОВКИ бота в run_bot_async...")
         if application.running:
             logger.info("Остановка диспетчера Application (stop)...")
             await application.stop()
-        # Проверяем что апдейтер был запущен перед остановкой
-        if application.updater and application.updater.running:
-            logger.info("Остановка получения обновлений (stop_polling)...")
-            await application.updater.stop_polling()
+            logger.info("Диспетчер Application остановлен.")
+        if application.updater and application.updater.is_running:
+            logger.info("Остановка получения обновлений (updater.stop)...")
+            # --->>> Заменяем stop_polling() -> stop() <<<---
+            await application.updater.stop()
+            logger.info("Получение обновлений (updater) остановлено.")
         logger.info("Завершение работы Application (shutdown)...")
-        await application.shutdown() # Освобождаем ресурсы
-        logger.info("Процесс остановки бота завершен.")
+        await application.shutdown()
+        logger.info("Процесс остановки бота в run_bot_async завершен.")
 
 
 async def main() -> None:
