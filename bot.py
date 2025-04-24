@@ -20,7 +20,7 @@ load_dotenv()
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MAX_MESSAGES_TO_ANALYZE = 50 # Меняй на свой страх и риск
+MAX_MESSAGES_TO_ANALYZE = 500 # Меняй на свой страх и риск
 
 # Проверка ключей
 if not TELEGRAM_BOT_TOKEN:
@@ -327,8 +327,8 @@ if __name__ == "__main__":
         try:
             with open('.env', 'w') as f:
                 f.write(f"# Впиши сюда свои реальные ключи!\n")
-                f.write(f"TELEGRAM_BOT_TOKEN=7209221587:AAEjoKdYh9uJXkvbvCiTCFdI7rvqkHw135s\n")
-                f.write(f"GEMINI_API_KEY=AIzaSyBd4yq48KHH6vraW9ASrwZXLQlqiZx_yKw\n")
+                f.write(f"TELEGRAM_BOT_TOKEN=Бэбра\n")
+                f.write(f"GEMINI_API_KEY=Бэбручо\n")
             logger.warning("Создан ШАБЛОН файла .env...")
         except Exception as e:
             logger.error(f"Не удалось создать шаблон .env файла: {e}")
