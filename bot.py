@@ -4,6 +4,7 @@ import os
 import asyncio
 from collections import deque
 from threading import Thread # Для запуска бота в отдельном потоке, чтоб не мешал веб-серверу
+import threading # <--- ДОБАВЬ ЭТУ СТРОКУ
 from flask import Flask # Сам веб-сервер-заглушка для Render
 
 import google.generativeai as genai
@@ -185,7 +186,7 @@ def run_telegram_bot():
     asyncio.set_event_loop(loop)
     # --->>> КОНЕЦ ГЛАВНОГО ФИКСА <<<---
 
-    logger.info(f"Попытка создания и запуска Telegram Bot Application в потоке {Thread.current_thread().name} с новым event loop...")
+    logger.info(f"Попытка создания и запуска Telegram Bot Application в потоке {threading.current_thread().name} с новым event loop...")
     try:
         # Собираем приложение бота со всеми обработчиками
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -204,12 +205,12 @@ def run_telegram_bot():
 
     except Exception as e:
         # Логируем критическую ошибку, если весь цикл бота упал
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в основном цикле Telegram бота в потоке {Thread.current_thread().name}: {e}", exc_info=True)
+        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в основном цикле Telegram бота в потоке {threading.current_thread().name}: {e}", exc_info=True)
     finally:
         # --- >>> ВАЖНО (хотя и не обязательно с daemon=True): <<< ---
         # Когда поток завершается (например, из-за ошибки), хорошо бы закрыть созданный цикл
         if loop and not loop.is_closed():
-             logger.info(f"Закрытие event loop в потоке {Thread.current_thread().name}")
+             logger.info(f"Закрытие event loop в потоке {threading.current_thread().name}")
              loop.close()
         # --- >>> КОНЕЦ ВАЖНОЙ ЧАСТИ <<< ---
 
