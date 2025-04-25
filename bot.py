@@ -1009,10 +1009,21 @@ async def roast_previous(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         # Не будем писать "Думаю...", чтобы было внезапно
         logger.info(f"Отправка запроса к Gemini для рандомного обсирания...")
-        generation_config = genai.types.GenerationConfig(max_output_tokens=80, temperature=0.8)
-        safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HATE_SPEECH': 'block_none', 'SEXUALLY_EXPLICIT': 'block_none', 'DANGEROUS_CONTENT': 'block_none'}
+        generation_config = genai.types.GenerationConfig(max_output_tokens=150, temperature=0.85)
+        # --->>> ВОТ ОНИ, РОДИМЫЕ safety_settings <<<---
+        safety_settings={
+            'HARM_CATEGORY_HARASSMENT': 'block_none',
+            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
+        }
+        # --->>> КОНЕЦ <<<---
 
-        response = await model.generate_content_async(roast_prompt, generation_config=generation_config, safety_settings=safety_settings)
+        response = await model.generate_content_async(
+            roast_prompt,
+            generation_config=generation_config,
+            safety_settings=safety_settings # Передаем их!
+        )
         logger.info(f"Получен ответ от Gemini для рандомного обсирания.")
 
         # Обработка ответа
