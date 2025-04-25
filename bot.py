@@ -14,7 +14,7 @@ from hypercorn.asyncio import serve as hypercorn_async_serve # <--- ИМПОРТ
 import signal # Для корректной обработки сигналов остановки (хотя asyncio.run сам умеет)
 
 import google.generativeai as genai
-from telegram import Update, Bot
+from telegram import Update, Bot, User
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv # Чтобы читать твой .env файл или переменные Render
 
@@ -145,10 +145,27 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # --- КОНЕЦ ПЕРЕПИСАННОЙ store_message ---
 
 # --- ПЕРЕПИСАННАЯ analyze_chat С ЧТЕНИЕМ ИЗ MONGODB И ЗАПИСЬЮ ДЛЯ RETRY ---
-async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.from_user: return
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Эй ты там"
+async def analyze_chat(
+    update: Update | None, # Теперь Update может быть None (для вызова из retry)
+    context: ContextTypes.DEFAULT_TYPE,
+    # Добавляем аргументы, которые будем передавать из retry
+    direct_chat_id: int | None = None,
+    direct_user: User | None = None
+    ) -> None:
+
+    # Получаем chat_id и user либо из Update, либо из прямых аргументов
+    if update and update.message:
+        chat_id = update.message.chat_id
+        user = update.message.from_user
+        user_name = user.first_name if user else "Хуй Пойми Кто"
+    elif direct_chat_id and direct_user:
+        chat_id = direct_chat_id
+        user = direct_user
+        user_name = user.first_name or "Переделкин" # Имя для retry
+    else:
+        logger.error("analyze_chat вызвана без Update и без прямых аргументов!")
+        return # Не можем работать
+
     logger.info(f"Пользователь '{user_name}' запросил анализ текста в чате {chat_id}")
 
     # --- ЧТЕНИЕ ИСТОРИИ ИЗ MONGODB ---
@@ -288,41 +305,45 @@ async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- НОВАЯ АСИНХРОННАЯ ЧАСТЬ (ЗАМЕНЯЕТ FLASK, ПОТОКИ И СТАРУЮ MAIN) ---
 
 # --- ПЕРЕПИСАННАЯ analyze_pic С ЧТЕНИЕМ file_id ИЗ MONGODB И ЗАПИСЬЮ ДЛЯ RETRY ---
-async def analyze_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Анализирует картинку (умеет брать file_id из context для /retry)."""
+async def analyze_pic(
+    update: Update | None, # Теперь Update может быть None
+    context: ContextTypes.DEFAULT_TYPE,
+    # Добавляем аргументы
+    direct_chat_id: int | None = None,
+    direct_user: User | None = None,
+    direct_file_id: str | None = None # Добавляем ID файла для retry
+    ) -> None:
 
-    # Проверяем, есть ли сообщение в update (нужно для chat_id и user)
-    if not update.message:
-        logger.error(" analyze_pic вызвана без update.message")
-        return # Не можем работать без сообщения
-
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Анализатор хуев" # Имя юзера, КТО ВЫЗВАЛ /retry или /analyze_pic
+    # Получаем chat_id, user и image_file_id
     image_file_id = None
-
-    # ПРОВЕРЯЕМ СНАЧАЛА BOT_DATA НА НАЛИЧИЕ RETRY
-    retry_key = f'retry_pic_{chat_id}'
-    if retry_key in context.bot_data:
-        image_file_id = context.bot_data[retry_key]
-        logger.info(f"Получен file_id {image_file_id} из context.bot_data для /retry.")
-        # НЕ удаляем ключ здесь, удалим его в retry_analysis после вызова
-    # ИНАЧЕ БЕРЕМ ИЗ REPLY_TO_MESSAGE (стандартный вызов /analyze_pic)
-    elif update.message.reply_to_message and update.message.reply_to_message.photo:
+    if update and update.message and update.message.reply_to_message and update.message.reply_to_message.photo:
+        # Обычный вызов через reply
+        chat_id = update.message.chat_id
+        user = update.message.from_user
+        user_name = user.first_name if user else "Хуй Пойми Кто"
         reply_msg = update.message.reply_to_message
         photo_large = reply_msg.photo[-1]
         image_file_id = photo_large.file_id
         logger.info(f"Получен file_id {image_file_id} из reply_to_message.")
+    elif direct_chat_id and direct_user and direct_file_id:
+        # Вызов из retry
+        chat_id = direct_chat_id
+        user = direct_user
+        user_name = user.first_name or "Переделкин Пикч"
+        image_file_id = direct_file_id
+        logger.info(f"Получен file_id {image_file_id} напрямую для /retry.")
     else:
-        # Если вызвали /analyze_pic не как ответ на фото и не в режиме /retry
-        await context.bot.send_message(chat_id=chat_id, text="Ответь этой командой на сообщение с КАРТИНКОЙ, дебил!")
+        logger.error("analyze_pic вызвана некорректно!")
+        # Попробуем отправить сообщение об ошибке, если есть chat_id
+        error_chat_id = chat_id if 'chat_id' in locals() else (update.message.chat_id if update and update.message else None)
+        if error_chat_id:
+            await context.bot.send_message(chat_id=error_chat_id, text="Внутренняя ошибка вызова анализа картинки.")
         return
 
-    if not image_file_id: # Если по какой-то причине ID не получен
-        logger.error("Не удалось получить file_id для анализа картинки.")
-        await context.bot.send_message(chat_id=chat_id, text="Не смог найти ID картинки для анализа.")
-        # Очистим ключ на всякий случай, если он там остался и был None
-        context.bot_data.pop(retry_key, None)
-        return
+    if not image_file_id:
+         logger.error("Не удалось получить file_id для анализа картинки.")
+         await context.bot.send_message(chat_id=chat_id, text="Не смог найти ID картинки для анализа.")
+         return
 
     logger.info(f"Пользователь '{user_name}' запросил анализ картинки (ID: {image_file_id}) в чате {chat_id}")
 
@@ -508,26 +529,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # --- КОНЕЦ ФУНКЦИИ /help ---
 
-# --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /retry (С ЧТЕНИЕМ ИЗ MONGODB И ИСПРАВЛЕННЫМ FAKE UPDATE) ---
+# --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /retry (ВЕРСИЯ ДЛЯ БД, БЕЗ FAKE UPDATE) ---
 async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Повторяет последний анализ (текста или картинки), читая данные из MongoDB."""
+    """Повторяет последний анализ (текста или картинки), читая данные из MongoDB и вызывая нужную функцию напрямую."""
+
     # Проверяем, что это ответ на сообщение
     if not update.message or not update.message.reply_to_message:
         await context.bot.send_message(chat_id=update.message.chat_id, text="Надо ответить этой командой на тот МОЙ высер, который ты хочешь переделать.")
         return
 
+    # Собираем нужные ID
     chat_id = update.message.chat_id
     user_command_message_id = update.message.message_id # ID сообщения с /retry
     replied_message_id = update.message.reply_to_message.message_id # ID сообщения, на которое ответили
     replied_message_user_id = update.message.reply_to_message.from_user.id # ID автора сообщения, на которое ответили
     bot_id = context.bot.id # ID нашего бота
+    user_who_requested_retry = update.message.from_user # Объект User того, кто вызвал /retry
 
-    logger.info(f"Пользователь {update.message.from_user.first_name} запросил /retry в чате {chat_id}, отвечая на сообщение {replied_message_id}")
+    logger.info(f"Пользователь '{user_who_requested_retry.first_name or 'Хуй Пойми Кто'}' запросил /retry в чате {chat_id}, отвечая на сообщение {replied_message_id}")
 
-    # 1. Проверяем, что ответили на сообщение НАШЕГО бота
+    # 1. Проверяем, что ответили на сообщение нашего бота
     if replied_message_user_id != bot_id:
         logger.warning("Команда /retry вызвана не в ответ на сообщение бота.")
         await context.bot.send_message(chat_id=chat_id, text="Эээ, ты ответил не на МОЕ сообщение.")
+        # Тихо удаляем команду пользователя
         try: await context.bot.delete_message(chat_id=chat_id, message_id=user_command_message_id)
         except Exception: pass
         return
@@ -535,11 +560,11 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # 2. Ищем информацию о последнем анализе для этого чата в MongoDB
     last_reply_data = None
     try:
-        # Выполняем блокирующий вызов БД в executor'е
         loop = asyncio.get_running_loop()
+        # Ищем ОДИН документ для данного chat_id в коллекции last_replies
         last_reply_data = await loop.run_in_executor(
-            None, # Используем стандартный ThreadPoolExecutor
-            lambda: last_reply_collection.find_one({"chat_id": chat_id}) # Ищем запись для этого чата
+            None, # Стандартный executor
+            lambda: last_reply_collection.find_one({"chat_id": chat_id})
         )
     except Exception as e:
         logger.error(f"Ошибка чтения данных для /retry из MongoDB для чата {chat_id}: {e}", exc_info=True)
@@ -550,7 +575,8 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 3. Проверяем, нашли ли мы запись и совпадает ли message_id с тем, на которое ответили
     if not last_reply_data or last_reply_data.get("message_id") != replied_message_id:
-        logger.warning(f"Не найдена запись /retry для чата {chat_id} или ID ({replied_message_id}) не совпадает с сохраненным ({last_reply_data.get('message_id') if last_reply_data else 'None'}).")
+        saved_id = last_reply_data.get("message_id") if last_reply_data else 'None'
+        logger.warning(f"Не найдена запись /retry для чата {chat_id} или ID ({replied_message_id}) не совпадает с сохраненным ({saved_id}).")
         await context.bot.send_message(chat_id=chat_id, text="Либо я не помню свой последний высер (БД пуста или ID не тот), либо ты ответил не на тот ответ. Не могу переделать.")
         try: await context.bot.delete_message(chat_id=chat_id, message_id=user_command_message_id)
         except Exception: pass
@@ -573,60 +599,28 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Не фатально, просто предупреждаем и продолжаем
         await context.bot.send_message(chat_id=chat_id, text="Бля, не смог удалить старое, но все равно попробую переделать.")
 
-    # 6. Создаем фейковый объект Update с минимально необходимыми полями
-    # Это нужно, чтобы передать chat_id и from_user в функции analyze_*,
-    # т.к. они ожидают объект Update.
-    try:
-        fake_update_data = {
-            'update_id': 1,
-            'message': {
-                'message_id': replied_message_id + 1,
-                'date': int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
-                'chat': {'id': chat_id, 'type': update.message.chat.type},
-                # --->>> Явно создаем словарь для from_user <<<---
-                'from_user': {
-                    'id': update.message.from_user.id,
-                    'is_bot': update.message.from_user.is_bot,
-                    'first_name': update.message.from_user.first_name or '', # Берем имя
-                    'username': update.message.from_user.username or None, # Берем юзернейм (если есть)
-                    'language_code': update.message.from_user.language_code or None # Берем код языка (если есть)
-                },
-                # --->>> КОНЕЦ ИСПРАВЛЕНИЯ from_user <<<---
-                'reply_to_message': None,
-                'text': f'/internal_retry_{analysis_type_to_retry}'
-            }
-        }
-        # Преобразуем словарь в объект Update
-        fake_update_obj = Update.de_json(fake_update_data, context.bot)
-    except Exception as e:
-        logger.error(f"Ошибка создания фейкового Update для /retry: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text="Пиздец, не смог даже подготовиться к повторному анализу.")
-        return
-
-    # 7. Запускаем нужный анализ
+    # 6. Запускаем нужную функцию анализа НАПРЯМУЮ, передавая аргументы
     try:
         if analysis_type_to_retry == 'text':
-            logger.info("Вызов analyze_chat для /retry...")
-            await analyze_chat(fake_update_obj, context) # Передаем фейковый апдейт
+            logger.info("Вызов analyze_chat для /retry напрямую...")
+            # Передаем None вместо Update, но передаем chat_id и user
+            await analyze_chat(update=None, context=context,
+                               direct_chat_id=chat_id,
+                               direct_user=user_who_requested_retry)
         elif analysis_type_to_retry == 'pic' and source_file_id_to_retry:
-            logger.info("Вызов analyze_pic для /retry...")
-            # Используем context.bot_data для передачи file_id (костыль, но рабочий)
-            retry_key = f'retry_pic_{chat_id}'
-            context.bot_data[retry_key] = source_file_id_to_retry
-            logger.debug(f"Передан file_id {source_file_id_to_retry} для /retry pic через context.bot_data")
-            await analyze_pic(fake_update_obj, context) # Передаем фейковый апдейт
-            # Очищаем после использования
-            context.bot_data.pop(retry_key, None)
+            logger.info(f"Вызов analyze_pic для /retry напрямую с file_id {source_file_id_to_retry}...")
+            # Передаем None вместо Update, но передаем chat_id, user и file_id
+            await analyze_pic(update=None, context=context,
+                              direct_chat_id=chat_id,
+                              direct_user=user_who_requested_retry,
+                              direct_file_id=source_file_id_to_retry)
         else:
             logger.error(f"Неизвестный/неполный тип анализа для /retry: {analysis_type_to_retry}, file_id: {source_file_id_to_retry}")
             await context.bot.send_message(chat_id=chat_id, text="Хуй пойми, что я там анализировал или не хватает данных. Не могу повторить.")
     except Exception as e:
+         # Ловим ошибки, которые могли произойти ВНУТРИ analyze_chat или analyze_pic
          logger.error(f"Ошибка ВО ВРЕМЯ ПОВТОРНОГО анализа ({analysis_type_to_retry}) для чата {chat_id}: {e}", exc_info=True)
          await context.bot.send_message(chat_id=chat_id, text=f"Бля, я снова обосрался при попытке переделать. Ошибка: `{type(e).__name__}`.")
-         # Очищаем ключ, если он остался после ошибки в analyze_pic
-         if analysis_type_to_retry == 'pic':
-             context.bot_data.pop(f'retry_pic_{chat_id}', None)
-
 
 # --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ /retry ---
 
