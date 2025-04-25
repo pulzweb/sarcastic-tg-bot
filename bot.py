@@ -798,13 +798,20 @@ async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info(f"Отправка запроса к Gemini для генерации предсказания для {user_name}...")
 
         # Настройки генерации (можно сделать покороче ответ)
-        generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=0.9) # Больше креативности
-        safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HATE_SPEECH': 'block_none', 'SEXUALLY_EXPLICIT': 'block_none', 'DANGEROUS_CONTENT': 'block_none'}
+        generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=0.9)
+        # --->>> ПРАВИЛЬНЫЕ safety_settings ЗДЕСЬ <<<---
+        safety_settings={
+            'HARM_CATEGORY_HARASSMENT': 'block_none',
+            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # ПРАВИЛЬНЫЙ КЛЮЧ!
+        }
+        # --->>> КОНЕЦ ПРАВИЛЬНЫХ safety_settings <<<---
 
         response = await model.generate_content_async(
-            prediction_prompt,
+            prediction_prompt, # Используем промпт для предсказаний
             generation_config=generation_config,
-            safety_settings=safety_settings
+            safety_settings=safety_settings # Передаем ИСПРАВЛЕННЫЙ словарь
         )
         logger.info(f"Получен ответ от Gemini с предсказанием для {user_name}.")
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
