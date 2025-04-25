@@ -145,16 +145,15 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- КОНЕЦ ПЕРЕПИСАННОЙ store_message ---
 
-# --- ПЕРЕПИСАННАЯ analyze_chat С ЧТЕНИЕМ ИЗ MONGODB И ЗАПИСЬЮ ДЛЯ RETRY ---
+# --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С ЛИМИТОМ ТОКЕНОВ И ОБРЕЗКОЙ) ---
 async def analyze_chat(
-    update: Update | None, # Теперь Update может быть None (для вызова из retry)
+    update: Update | None,
     context: ContextTypes.DEFAULT_TYPE,
-    # Добавляем аргументы, которые будем передавать из retry
     direct_chat_id: int | None = None,
     direct_user: User | None = None
     ) -> None:
 
-    # Получаем chat_id и user либо из Update, либо из прямых аргументов
+    # Получаем chat_id и user
     if update and update.message:
         chat_id = update.message.chat_id
         user = update.message.from_user
@@ -162,60 +161,49 @@ async def analyze_chat(
     elif direct_chat_id and direct_user:
         chat_id = direct_chat_id
         user = direct_user
-        user_name = user.first_name or "Переделкин" # Имя для retry
+        user_name = user.first_name or "Переделкин"
     else:
         logger.error("analyze_chat вызвана без Update и без прямых аргументов!")
-        return # Не можем работать
+        return
 
     logger.info(f"Пользователь '{user_name}' запросил анализ текста в чате {chat_id}")
 
     # --- ЧТЕНИЕ ИСТОРИИ ИЗ MONGODB ---
+    messages_from_db = []
     try:
         logger.debug(f"Запрос истории для чата {chat_id} из MongoDB...")
-        # Определяем, сколько сообщений читать (не больше MAX_MESSAGES_TO_ANALYZE)
-        limit = MAX_MESSAGES_TO_ANALYZE
-        # Формируем запрос к MongoDB: найти документы для этого chat_id,
-        # отсортировать по timestamp ПО УБЫВАНИЮ (сначала новые), взять N штук
+        limit = MAX_MESSAGES_TO_ANALYZE # Используем глобальную настройку
         query = {"chat_id": chat_id}
         sort_order = [("timestamp", pymongo.DESCENDING)]
-
-        # Выполняем запрос в executor'е
         loop = asyncio.get_running_loop()
         history_cursor = await loop.run_in_executor(
-            None,
-            lambda: history_collection.find(query).sort(sort_order).limit(limit)
+            None, lambda: history_collection.find(query).sort(sort_order).limit(limit)
         )
-        # history_cursor - это "ленивый" курсор, надо его преобразовать в список
-        # и ПЕРЕВЕРНУТЬ, чтобы сообщения были в хронологическом порядке (старые -> новые)
-        messages_from_db = list(history_cursor)[::-1]
-
+        messages_from_db = list(history_cursor)[::-1] # Переворачиваем для хронологии
         history_len = len(messages_from_db)
         logger.info(f"Из MongoDB для чата {chat_id} загружено {history_len} сообщений.")
-
-        # Проверяем, достаточно ли сообщений
-        min_msgs = 10
-        if history_len < min_msgs:
-            logger.info(f"В чате {chat_id} слишком мало сообщений в БД ({history_len}/{min_msgs}).")
-            await context.bot.send_message(chat_id=chat_id, text=f"Слышь, {user_name}, надо {min_msgs} сообщений в истории, а я нашел только {history_len}. Попизди еще.")
-            return
-
-        # Формируем текст для Gemini (как и раньше, но из данных БД)
-        # Собираем строки "Имя: Текст"
-        conversation_lines = [f"{msg.get('user_name', 'Хуй пойми кто')}: {msg.get('text', '')}" for msg in messages_from_db]
-        conversation_text = "\n".join(conversation_lines)
-
     except Exception as e:
         logger.error(f"Ошибка чтения истории из MongoDB для чата {chat_id}: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался, пока лез в базу данных за историей. Попробуй позже.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался, пока лез в базу данных за историей.")
         return
-    # --- КОНЕЦ ЧТЕНИЯ ИСТОРИИ ---
 
+    # Проверяем, достаточно ли сообщений
+    min_msgs = 10
+    if history_len < min_msgs:
+        logger.info(f"В чате {chat_id} слишком мало сообщений в БД ({history_len}/{min_msgs}).")
+        await context.bot.send_message(chat_id=chat_id, text=f"Слышь, {user_name}, надо {min_msgs} сообщений в истории, а я нашел только {history_len}. Попизди еще.")
+        return
+
+    # Формируем текст для Gemini
+    conversation_lines = [f"{msg.get('user_name', '?')}: {msg.get('text', '')}" for msg in messages_from_db]
+    conversation_text = "\n".join(conversation_lines)
     logger.info(f"Начинаю анализ {len(messages_from_db)} сообщений для чата {chat_id} через Gemini...")
 
+    # Вызов Gemini с промптом, лимитом токенов и safety settings
     try:
         # Промпт для Gemini (текстовый, с 🗿 и попыткой имен)
-        prompt = (
-            f"Ты - МАКСИМАЛЬНО ТОКСИЧНЫЙ, язвительный и циничный тролль, комментирующий Telegram-чат. Твоя задача - проанализировать ПОСЛЕДНИЙ фрагмент переписки, выхватить из него несколько (1-10) самых тупых, нелепых, жалких или просто показательных моментов И ОБЯЗАТЕЛЬНО УКАЗАТЬ, КТО ИЗ УЧАСТНИКОВ (по именам/никам из диалога) особенно отличился в своем скудоумии или нытье. Также обращай внимание на сообщения от других ботов (@PredskazBot и т.п.), если они адресованы юзеру (@username), и тоже обстебывай их.\n\n"
+        system_prompt = (
+             f"Ты - МАКСИМАЛЬНО ТОКСИЧНЫЙ, язвительный и циничный тролль, комментирующий Telegram-чат. Твоя задача - проанализировать ПОСЛЕДНИЙ фрагмент переписки, выхватить из него несколько (1-5) самых тупых, нелепых, жалких или просто показательных моментов И ОБЯЗАТЕЛЬНО УКАЗАТЬ, КТО ИЗ УЧАСТНИКОВ (по именам/никам из диалога) особенно отличился в своем скудоумии или нытье. Также обращай внимание на сообщения от других ботов (@PredskazBot и т.п.), если они адресованы юзеру (@username), и тоже обстебывай их.\n\n"
             f"Фрагмент переписки:\n"
             f"```\n{conversation_text}\n```\n\n"
             f"Инструкции для твоего ответа:\n"
@@ -233,75 +221,77 @@ async def analyze_chat(
             f"Выдай результат в указанном формате, будь МАКСИМАЛЬНО ТОКСИЧНЫМ УЕБКОМ:"
         )
 
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так, блядь, щас подключу мозжечок и подумаю...")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так, блядь, щас подключу старые проверенные мозги Gemini и подумаю...")
 
         logger.info(f"Отправка запроса к Gemini API...")
-        response = await model.generate_content_async(prompt) # <-- Убедись, что 'model' - это Gemini модель!
+
+        # --->>> ЗАПРОС С ЛИМИТОМ ТОКЕНОВ <<<---
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=1000, # Лимит токенов (примерно до 3000 символов)
+            temperature=0.7
+        )
+        safety_settings={ # Снижаем цензуру
+            'HARM_CATEGORY_HARASSMENT': 'block_none',
+            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none',
+        }
+
+        # ВАЖНО: Для Gemini контент передается как строка в списке или просто строка
+        response = await model.generate_content_async(
+            system_prompt, # Просто передаем весь промпт как строку
+            generation_config=generation_config,
+            safety_settings=safety_settings
+         )
+        # --->>> КОНЕЦ ЗАПРОСА <<<---
+
         logger.info("Получен ответ от Gemini API.")
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
+        # Обработка ответа с проверкой блока и обрезкой
         sarcastic_summary = "🗿 Бля, хуй его знает. То ли ваш диалог говно, то ли Gemini его зацензурил."
-        # СНАЧАЛА проверяем на блокировку
         if response.prompt_feedback.block_reason:
             block_reason = response.prompt_feedback.block_reason
-            logger.warning(f"Ответ Gemini для текста заблокирован по причине: {block_reason}")
-            sarcastic_summary = f"🗿 Ваш пиздеж настолько токсичен, что Gemini его заблокировал (Причина: {block_reason}). Поздравляю, вы уебки."
-        # ЕСЛИ НЕ ЗАБЛОКИРОВАНО, ПЫТАЕМСЯ получить текст
-        # Проверяем, что кандидаты вообще есть, перед доступом к .text
+            logger.warning(f"Ответ Gemini для текста заблокирован: {block_reason}")
+            sarcastic_summary = f"🗿 Ваш пиздеж настолько токсичен, что Gemini его заблокировал (Причина: {block_reason})."
         elif response.candidates:
-            try:
-                text_response = response.text # Теперь этот вызов должен быть безопаснее
-                sarcastic_summary = text_response.strip()
-                if not sarcastic_summary.startswith("🗿"):
-                    sarcastic_summary = "🗿 " + sarcastic_summary
-            except ValueError as e:
-                # Ловим ту самую ошибку ValueError, если вдруг кандидаты есть, а .text все равно не работает
-                logger.error(f"Странная ошибка при доступе к response.text, хотя кандидаты есть: {e}")
-                sarcastic_summary = "🗿 Gemini что-то родил, но я не смог это прочитать. Ебучий глюк."
+             try:
+                 text_response = response.text
+                 sarcastic_summary = text_response.strip()
+                 if not sarcastic_summary.startswith("🗿"):
+                     sarcastic_summary = "🗿 " + sarcastic_summary
+             except ValueError as e:
+                 logger.error(f"Ошибка при доступе к response.text для чата: {e}")
+                 sarcastic_summary = "🗿 Gemini что-то родил, но прочитать не могу."
         else:
-            # Если не заблокировано, но кандидатов нет (странный случай)
-            logger.warning("Ответ Gemini не заблокирован, но кандидатов нет.")
-            sarcastic_summary = "🗿 Gemini вернул пустоту. Видимо, ваш диалог вызвал у него экзистенциальный кринж."
+             logger.warning("Ответ Gemini пуст (нет кандидатов).")
 
-        # --- ОТПРАВКА ОТВЕТА И ЗАПИСЬ В БД ДЛЯ RETRY ---
+        # --->>> СТРАХОВОЧНАЯ ОБРЕЗКА ПЕРЕД ОТПРАВКОЙ <<<---
+        MAX_MESSAGE_LENGTH = 4096
+        if len(sarcastic_summary) > MAX_MESSAGE_LENGTH:
+            logger.warning(f"Ответ Gemini все равно длинный ({len(sarcastic_summary)}), обрезаем!")
+            sarcastic_summary = sarcastic_summary[:MAX_MESSAGE_LENGTH - 3] + "..."
+        # --->>> КОНЕЦ ОБРЕЗКИ <<<---
+
+        # Отправка и запись для /retry
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_summary)
         logger.info(f"Отправил результат анализа Gemini '{sarcastic_summary[:50]}...' в чат {chat_id}")
-
         if sent_message:
-            # Сохраняем инфу о последнем ответе для /retry
-            reply_doc = {
-                "chat_id": chat_id,
-                "message_id": sent_message.message_id, # ID сообщения БОТА с ответом
-                "analysis_type": "text", # Тип анализа
-                "timestamp": datetime.datetime.now(datetime.timezone.utc) # Время ответа
-                # file_id для текстового анализа не нужен
-            }
+            reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "text", "timestamp": datetime.datetime.now(datetime.timezone.utc) }
             try:
-                # Используем update_one с upsert=True:
-                # Если документ для chat_id есть - обновить его, если нет - создать.
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: last_reply_collection.update_one(
-                        {"chat_id": chat_id}, # Фильтр для поиска
-                        {"$set": reply_doc},  # Данные для обновления/вставки
-                        upsert=True          # Создать, если не найден
-                    )
-                )
+                loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
                 logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, text) для /retry чата {chat_id}.")
-            except Exception as e:
-                 logger.error(f"Ошибка записи данных для /retry (text) в MongoDB для чата {chat_id}: {e}", exc_info=True)
-        # --- КОНЕЦ ЗАПИСИ В БД ДЛЯ RETRY ---
+            except Exception as e: logger.error(f"Ошибка записи /retry (text) в MongoDB: {e}", exc_info=True)
 
     except Exception as e:
         logger.error(f"ПИЗДЕЦ при вызове Gemini API для чата {chat_id}: {e}", exc_info=True)
         try:
             if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мои мозги дали сбой. Ошибка: `{type(e).__name__}`. Попробуй позже.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мои мозги Gemini дали сбой. Ошибка: `{type(e).__name__}`.")
 
-# --- КОНЕЦ ПЕРЕПИСАННОЙ analyze_chat ---
+# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ analyze_chat ---
 
 # --- НОВАЯ АСИНХРОННАЯ ЧАСТЬ (ЗАМЕНЯЕТ FLASK, ПОТОКИ И СТАРУЮ MAIN) ---
 
@@ -669,44 +659,36 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 
-# --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ СТИХОВ (С safety_settings) ---
+# --- ПОЛНАЯ ФУНКЦИЯ generate_poem (С ЛИМИТОМ ТОКЕНОВ И ОБРЕЗКОЙ) ---
 async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Генерирует саркастичный стишок про указанное имя."""
-    target_name = None
-    # Определяем, пришла команда со слешем или текстовый запрос
-    if update.message.text.startswith('/'):
-        # Если команда /poem Имя
-        command_parts = update.message.text.split(maxsplit=1) # Делим команду и аргументы
-        if len(command_parts) < 2 or not command_parts[1].strip():
-            await context.bot.send_message(chat_id=update.message.chat_id, text="Ты забыл имя указать после команды, баклан! `/poem Имя`")
-            return
-        target_name = command_parts[1].strip()
-    else:
-        # Если текстовый запрос "Бот стих про Имя"
-        # Пытаемся извлечь имя после "про" или других ключевых слов
-        match = re.search(r'(?i).*(?:стих|стишок|поэма)\s+(?:про|для|об)\s+([А-Яа-яЁё\s\-]+)', update.message.text) # Добавил дефис для имен типа Анна-Мария
-        if not match:
-             await context.bot.send_message(chat_id=update.message.chat_id, text="Не понял, про кого стих писать. Скажи типа 'Бот стих про Стаса'.")
-             return
-        target_name = match.group(1).strip()
+    chat_id = None; user = None; target_name = None; user_name = "Поэт хуев"
 
-    if not target_name:
-         await context.bot.send_message(chat_id=update.message.chat_id, text="Имя-то какое, блядь?")
-         return
+    # Определение имени и пользователя (из команды или текста)
+    retry_key_poem = f'retry_poem_{update.effective_chat.id if update else None}'
+    if retry_key_poem in context.bot_data:
+        target_name = context.bot_data[retry_key_poem]
+        if update and update.message: chat_id = update.message.chat_id; user = update.message.from_user
+        logger.info(f"Получено имя '{target_name}' из context.bot_data для /retry.")
+    elif update and update.message:
+        chat_id = update.message.chat_id; user = update.message.from_user
+        if update.message.text.startswith('/'):
+            command_parts = update.message.text.split(maxsplit=1)
+            if len(command_parts) >= 2 and command_parts[1].strip(): target_name = command_parts[1].strip()
+        else:
+            match = re.search(r'(?i).*(?:стих|стишок|поэма)\s+(?:про|для|об)\s+([А-Яа-яЁё\s\-]+)', update.message.text)
+            if match: target_name = match.group(1).strip()
 
-    # Проверка на слишком длинное имя (защита от дурака)
-    if len(target_name) > 50:
-         await context.bot.send_message(chat_id=update.message.chat_id, text="Ты охуел такое длинное имя писать? Покороче давай.")
-         return
+    if not chat_id or not user: logger.error("Не удалось определить chat_id/user в generate_poem."); return
+    if not target_name: await context.bot.send_message(chat_id=chat_id, text="Не понял, про кого стих. `/poem Имя` или 'Бот стих про Имя'."); return
+    if len(target_name) > 50: await context.bot.send_message(chat_id=chat_id, text="Слишком длинное имя."); return
+    user_name = user.first_name or user_name # Обновляем имя запросившего
 
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Поэт хуев"
     logger.info(f"Пользователь '{user_name}' запросил стих про '{target_name}' в чате {chat_id}")
 
-    # --- ПРОМПТ ДЛЯ ГЕНЕРАЦИИ СТИШКА ---
+    # Промпт для генерации стишка
     poem_prompt = (
         f"Ты - пиздец какой циничный и злой поэт-матершинник. Твоя задача - НАПИСАТЬ КОРОТКИЙ (4-8 строк), смешной, саркастичный и ОБИДНЫЙ стишок про человека по имени **{target_name}**. "
-        f"Используй черный юмор, мат, неожиданные рифмы, высмеивай стереотипы или просто придумывай нелепые ситуации с этим именем. Сделай так, чтобы было одновременно смешно и пиздец как токсично. Не бойся жести.\n\n"
+        f"Используй черный юмор, мат, высмеивай стереотипы или просто придумывай нелепые ситуации с этим именем. Сделай так, чтобы было одновременно смешно и пиздец как токсично. Не бойся жести.\n\n"
         f"ВАЖНО: Стишок должен быть именно про имя '{target_name}'. НЕ пиши никаких вступлений или заключений. Только сам стих.\n\n"
         f"Пример (для Стаса):\n"
         f"Наш Стасик - парень неплохой,\n"
@@ -720,55 +702,69 @@ async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Пока сосет хуй в перерывах.\n\n"
         f"Напиши ПОДОБНЫЙ стишок про **{target_name}**:"
     )
-    # --- КОНЕЦ ПРОМПТА ---
 
     try:
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"Так, блядь, ща рифму подберу для этого вашего '{target_name}'...")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"Так, блядь, ща рифму подберу для '{target_name}'...")
         logger.info(f"Отправка запроса к Gemini для генерации стиха про {target_name}...")
 
-        # --->>> ВОТ ТУТ ПРАВИЛЬНЫЙ ВЫЗОВ С safety_settings <<<---
+        # --->>> ЗАПРОС С ЛИМИТОМ ТОКЕНОВ <<<---
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=300, # Лимит для стиха
+            temperature=0.8
+        )
+        safety_settings={ # Снижаем цензуру
+            'HARM_CATEGORY_HARASSMENT': 'block_none',
+            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none',
+        }
         response = await model.generate_content_async(
             poem_prompt,
-            safety_settings={
-                'HARM_CATEGORY_HARASSMENT': 'block_none',
-                'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-                'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none',
-            }
+            generation_config=generation_config,
+            safety_settings=safety_settings
         )
-        # --->>> КОНЕЦ ПРАВИЛЬНОГО ВЫЗОВА <<<---
+        # --->>> КОНЕЦ ЗАПРОСА <<<---
 
         logger.info(f"Получен ответ от Gemini со стихом про {target_name}.")
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        poem_text = f"🗿 Простите, рифма не нашлась для '{target_name}'. Видимо, имя слишком уебанское, или Gemini забанил мой полет фантазии."
-        # Проверка на блок
+        # Обработка ответа с проверкой блока и обрезкой
+        poem_text = f"🗿 Простите, рифма не нашлась для '{target_name}'. Видимо, имя слишком уебанское."
         if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason
-            logger.warning(f"Ответ Gemini для стиха заблокирован: {block_reason}")
-            poem_text = f"🗿 Gemini заблокировал стих про '{target_name}' (Причина: {block_reason}). Видимо, даже он охуел."
-        elif response.candidates: # Проверяем кандидатов перед .text
+            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Ответ Gemini для стиха заблокирован: {block_reason}")
+            poem_text = f"🗿 Gemini заблокировал стих про '{target_name}' (Причина: {block_reason})."
+        elif response.candidates:
              try:
-                 generated_text = response.text
-                 poem_text = "🗿 " + generated_text.strip() # Добавляем Моаи
-             except ValueError as e:
-                 logger.error(f"Ошибка при доступе к response.text для стиха: {e}")
-                 poem_text = f"🗿 Gemini что-то высрал про '{target_name}', но прочитать не могу. Наверное, хуйня."
-        else:
-             logger.warning("Ответ Gemini пуст (нет кандидатов).")
+                 generated_text = response.text; poem_text = "🗿 " + generated_text.strip()
+             except ValueError as e: logger.error(f"Ошибка доступа к response.text для стиха: {e}"); poem_text = f"🗿 Gemini что-то высрал про '{target_name}', но прочитать не могу."
+        else: logger.warning("Ответ Gemini пуст (нет кандидатов).")
 
-        await context.bot.send_message(chat_id=chat_id, text=poem_text)
+        # --->>> СТРАХОВОЧНАЯ ОБРЕЗКА ПЕРЕД ОТПРАВКОЙ <<<---
+        MAX_MESSAGE_LENGTH = 4096
+        if len(poem_text) > MAX_MESSAGE_LENGTH:
+            logger.warning(f"Стих Gemini все равно длинный ({len(poem_text)}), обрезаем!")
+            poem_text = poem_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        # --->>> КОНЕЦ ОБРЕЗКИ <<<---
+
+        # Отправка и запись для /retry
+        sent_message = await context.bot.send_message(chat_id=chat_id, text=poem_text)
         logger.info(f"Отправлен стих про {target_name}.")
+        if sent_message:
+            reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "poem", "target_name": target_name, "timestamp": datetime.datetime.now(datetime.timezone.utc) }
+            try:
+                loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+                logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, poem, {target_name}) для /retry чата {chat_id}.")
+            except Exception as e: logger.error(f"Ошибка записи /retry (poem) в MongoDB: {e}", exc_info=True)
 
     except Exception as e:
         logger.error(f"ПИЗДЕЦ при генерации стиха про {target_name}: {e}", exc_info=True)
         try:
             if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу сочинить про '{target_name}'. То ли вдохновения нет, то ли Gemini сдох. Ошибка: `{type(e).__name__}`.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу сочинить про '{target_name}'. Ошибка: `{type(e).__name__}`.")
 
-# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ ДЛЯ СТИХОВ ---
+# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ generate_poem ---
 
 async def main() -> None:
     """Основная асинхронная функция, запускающая веб-сервер и бота."""
