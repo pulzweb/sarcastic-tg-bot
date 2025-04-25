@@ -144,26 +144,58 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- КОНЕЦ ПЕРЕПИСАННОЙ store_message ---
 
+# --- ПЕРЕПИСАННАЯ analyze_chat С ЧТЕНИЕМ ИЗ MONGODB И ЗАПИСЬЮ ДЛЯ RETRY ---
 async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.from_user:
-        return
+    if not update.message or not update.message.from_user: return
     chat_id = update.message.chat_id
     user_name = update.message.from_user.first_name or "Эй ты там"
-    logger.info(f"Пользователь '{user_name}' (ID: {update.message.from_user.id}) запросил анализ в чате {chat_id}")
-    min_msgs = 10
-    history_len = len(chat_histories.get(chat_id, []))
-    if chat_id not in chat_histories or history_len < min_msgs:
-        logger.info(f"В чате {chat_id} слишком мало сообщений ({history_len}/{min_msgs}) для анализа.")
-        await update.message.reply_text(
-            f"Слышь, {user_name}, ты заебал. Я тут недавно (или вы молчали как рыбы), сообщений кот наплакал "
-            f"(всего {history_len} штук в моей памяти, а надо хотя бы {min_msgs}).\n"
-            f"Попиздите еще хотя бы немного, потом посмотрим на ваш балаган.\n"
-        )
-        return
-    messages_to_analyze = list(chat_histories[chat_id])
-    conversation_text = "\n".join(messages_to_analyze)
-    logger.info(f"Начинаю анализ {len(messages_to_analyze)} сообщений для чата {chat_id}...")
+    logger.info(f"Пользователь '{user_name}' запросил анализ текста в чате {chat_id}")
+
+    # --- ЧТЕНИЕ ИСТОРИИ ИЗ MONGODB ---
     try:
+        logger.debug(f"Запрос истории для чата {chat_id} из MongoDB...")
+        # Определяем, сколько сообщений читать (не больше MAX_MESSAGES_TO_ANALYZE)
+        limit = MAX_MESSAGES_TO_ANALYZE
+        # Формируем запрос к MongoDB: найти документы для этого chat_id,
+        # отсортировать по timestamp ПО УБЫВАНИЮ (сначала новые), взять N штук
+        query = {"chat_id": chat_id}
+        sort_order = [("timestamp", pymongo.DESCENDING)]
+
+        # Выполняем запрос в executor'е
+        loop = asyncio.get_running_loop()
+        history_cursor = await loop.run_in_executor(
+            None,
+            lambda: history_collection.find(query).sort(sort_order).limit(limit)
+        )
+        # history_cursor - это "ленивый" курсор, надо его преобразовать в список
+        # и ПЕРЕВЕРНУТЬ, чтобы сообщения были в хронологическом порядке (старые -> новые)
+        messages_from_db = list(history_cursor)[::-1]
+
+        history_len = len(messages_from_db)
+        logger.info(f"Из MongoDB для чата {chat_id} загружено {history_len} сообщений.")
+
+        # Проверяем, достаточно ли сообщений
+        min_msgs = 10
+        if history_len < min_msgs:
+            logger.info(f"В чате {chat_id} слишком мало сообщений в БД ({history_len}/{min_msgs}).")
+            await context.bot.send_message(chat_id=chat_id, text=f"Слышь, {user_name}, надо {min_msgs} сообщений в истории, а я нашел только {history_len}. Попизди еще.")
+            return
+
+        # Формируем текст для Gemini (как и раньше, но из данных БД)
+        # Собираем строки "Имя: Текст"
+        conversation_lines = [f"{msg.get('user_name', 'Хуй пойми кто')}: {msg.get('text', '')}" for msg in messages_from_db]
+        conversation_text = "\n".join(conversation_lines)
+
+    except Exception as e:
+        logger.error(f"Ошибка чтения истории из MongoDB для чата {chat_id}: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался, пока лез в базу данных за историей. Попробуй позже.")
+        return
+    # --- КОНЕЦ ЧТЕНИЯ ИСТОРИИ ---
+
+    logger.info(f"Начинаю анализ {len(messages_from_db)} сообщений для чата {chat_id} через Gemini...")
+
+    try:
+        # Промпт для Gemini (текстовый, с 🗿 и попыткой имен)
         prompt = (
             f"Ты - МАКСИМАЛЬНО ТОКСИЧНЫЙ, язвительный и циничный тролль, комментирующий Telegram-чат. Твоя задача - проанализировать ПОСЛЕДНИЙ фрагмент переписки, выхватить из него несколько (1-10) самых тупых, нелепых, жалких или просто показательных моментов И ОБЯЗАТЕЛЬНО УКАЗАТЬ, КТО ИЗ УЧАСТНИКОВ (по именам/никам из диалога) особенно отличился в своем скудоумии или нытье. Также обращай внимание на сообщения от других ботов (@PredskazBot и т.п.), если они адресованы юзеру (@username), и тоже обстебывай их.\n\n"
             f"Фрагмент переписки:\n"
@@ -182,66 +214,116 @@ async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🗿 @PredskazBot посоветовал @lucky_loser 'верить в себя'. Пиздец оригинальный совет для конченого неудачника. Может, ему еще подорожник приложить?\n\n"
             f"Выдай результат в указанном формате, будь МАКСИМАЛЬНО ТОКСИЧНЫМ УЕБКОМ:"
         )
-        thinking_message = await update.message.reply_text("Так, блядь, щас напрягу свои кремниевые мозги и попробую понять смысл вашего высокоинтеллектуального бреда... Не мешайте, я в процессе (или тупо сплю, хуй знает)...")
-        logger.debug(f"Отправил сообщение 'думаю' (ID: {thinking_message.message_id}) в чат {chat_id}")
-        logger.info(f"Отправляю запрос к Gemini для чата {chat_id}...")
-        response = await model.generate_content_async(prompt)
-        logger.info(f"Получен ответ от Gemini для чата {chat_id}")
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-            logger.debug(f"Удалил сообщение 'думаю' (ID: {thinking_message.message_id}) в чате {chat_id}")
-        except Exception as delete_err:
-            logger.warning(f"Не смог удалить сообщение 'думаю' (ID: {thinking_message.message_id}) в чате {chat_id}: {delete_err}")
-        sarcastic_summary = "Бля, хуйню какую-то нейронка выдала или вообще пустой ответ. Видимо, ваш треп настолько бессмысленный, что даже ИИ повесился."
+
+        thinking_message = await update.message.reply_text("Так, блядь, щас подключу мозги и подумаю...")
+
+        logger.info(f"Отправка запроса к Gemini API...")
+        response = await model.generate_content_async(prompt) # <-- Убедись, что 'model' - это Gemini модель!
+        logger.info("Получен ответ от Gemini API.")
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+
+        sarcastic_summary = "[Gemini промолчал или спизданул хуйню]"
         if response and response.text:
-             sarcastic_summary = response.text.strip()
-        await update.message.reply_text(sarcastic_summary)
-        logger.info(f"Отправил результат анализа '{sarcastic_summary[:50]}...' в чат {chat_id}")
+            sarcastic_summary = response.text.strip()
+            # Добавим Моаи, если забыл
+            if not sarcastic_summary.startswith("🗿"): sarcastic_summary = "🗿 " + sarcastic_summary
+
+        # --- ОТПРАВКА ОТВЕТА И ЗАПИСЬ В БД ДЛЯ RETRY ---
+        sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_summary)
+        logger.info(f"Отправил результат анализа Gemini '{sarcastic_summary[:50]}...' в чат {chat_id}")
+
+        if sent_message:
+            # Сохраняем инфу о последнем ответе для /retry
+            reply_doc = {
+                "chat_id": chat_id,
+                "message_id": sent_message.message_id, # ID сообщения БОТА с ответом
+                "analysis_type": "text", # Тип анализа
+                "timestamp": datetime.datetime.now(datetime.timezone.utc) # Время ответа
+                # file_id для текстового анализа не нужен
+            }
+            try:
+                # Используем update_one с upsert=True:
+                # Если документ для chat_id есть - обновить его, если нет - создать.
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: last_reply_collection.update_one(
+                        {"chat_id": chat_id}, # Фильтр для поиска
+                        {"$set": reply_doc},  # Данные для обновления/вставки
+                        upsert=True          # Создать, если не найден
+                    )
+                )
+                logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, text) для /retry чата {chat_id}.")
+            except Exception as e:
+                 logger.error(f"Ошибка записи данных для /retry (text) в MongoDB для чата {chat_id}: {e}", exc_info=True)
+        # --- КОНЕЦ ЗАПИСИ В БД ДЛЯ RETRY ---
+
     except Exception as e:
-        logger.error(f"ПИЗДЕЦ при выполнении анализа для чата {chat_id}: {e}", exc_info=True)
+        logger.error(f"ПИЗДЕЦ при вызове Gemini API для чата {chat_id}: {e}", exc_info=True)
         try:
-            if 'thinking_message' in locals():
-                 await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-        except Exception as inner_e:
-            logger.warning(f"Не удалось удалить сообщение 'думаю' после ошибки: {inner_e}")
-        await update.message.reply_text(
-            f"Бля, {user_name}, все сломалось нахуй в процессе анализа. То ли Гугл меня наебал, то ли я сам криворукий мудак, то ли ваш диалог сломал мне мозг. "
-            f"Ошибка типа: `{type(e).__name__}`. Можешь попробовать позже, но я не гарантирую, что это говно починится само."
-        )
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мои мозги дали сбой. Ошибка: `{type(e).__name__}`. Попробуй позже.")
+
+# --- КОНЕЦ ПЕРЕПИСАННОЙ analyze_chat ---
 
 # --- НОВАЯ АСИНХРОННАЯ ЧАСТЬ (ЗАМЕНЯЕТ FLASK, ПОТОКИ И СТАРУЮ MAIN) ---
 
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ АНАЛИЗА КАРТИНОК ---
+# --- ПЕРЕПИСАННАЯ analyze_pic С ЧТЕНИЕМ file_id ИЗ MONGODB И ЗАПИСЬЮ ДЛЯ RETRY ---
 async def analyze_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Анализирует картинку, на которую ответили командой /analyze_pic."""
     if not update.message or not update.message.reply_to_message:
-        await update.message.reply_text("Хули ты мне просто команду пишешь? Ответь ей на сообщение с картинкой, долбоеб!")
+        await context.bot.send_message(chat_id=update.message.chat_id, text="Ответь этой командой на сообщение с КАРТИНКОЙ, умнек!")
         return
 
     reply_msg = update.message.reply_to_message
+    # Проверяем, что ответили именно на сообщение с картинкой (хотя наш store_message теперь пишет заглушку)
+    # Лучше найдем последнее сообщение с картинкой в истории БД
+    chat_id = update.message.chat_id
     user_name = update.message.from_user.first_name or "Анализатор хуев"
+    logger.info(f"Пользователь '{user_name}' запросил анализ картинки в чате {chat_id}")
 
-    # Проверяем, есть ли в сообщении, на которое ответили, фотка
-    if not reply_msg.photo:
-        await update.message.reply_text(f"Слышь, {user_name}, я тут только картинки комментирую, а не твой текстовый высер или ебучий стикер. Ответь на КАРТИНКУ.")
+    # --- ИЩЕМ ПОСЛЕДНЮЮ КАРТИНКУ В ИСТОРИИ БД ---
+    image_file_id = None
+    try:
+        logger.debug(f"Поиск последней картинки для чата {chat_id} в MongoDB...")
+        # Ищем документы для этого chat_id, где текст начинается с '[КАРТИНКА:'
+        query = {"chat_id": chat_id, "text": {"$regex": r"^\[КАРТИНКА:.*\]"}}
+        sort_order = [("timestamp", pymongo.DESCENDING)] # Ищем самую новую
+
+        loop = asyncio.get_running_loop()
+        latest_pic_doc = await loop.run_in_executor(
+            None,
+            lambda: history_collection.find_one(query, sort=sort_order)
+        )
+
+        if latest_pic_doc and isinstance(latest_pic_doc.get("text"), str):
+            # Пытаемся извлечь file_id из заглушки "[КАРТИНКА:file_id]"
+            match = re.search(r"\[КАРТИНКА:(.*?)\]", latest_pic_doc["text"])
+            if match:
+                image_file_id = match.group(1)
+                logger.info(f"Найден file_id последней картинки: {image_file_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка поиска картинки в MongoDB для чата {chat_id}: {e}", exc_info=True)
+        # Продолжаем, но без file_id
+
+    if not image_file_id:
+        logger.warning(f"Не найдена недавняя картинка в истории БД для чата {chat_id}.")
+        await context.bot.send_message(chat_id=chat_id, text="Не нашел недавней картинки в своей памяти для этого чата. Ответь командой на сообщение С картинкой.")
         return
+    # --- КОНЕЦ ПОИСКА КАРТИНКИ ---
 
-    logger.info(f"Пользователь '{user_name}' запросил анализ картинки в чате {update.message.chat_id}")
-
-    # Берем самую большую версию фотки (обычно последняя в списке)
-    photo_large = reply_msg.photo[-1]
-    logger.info(f"Получаем файл картинки ID: {photo_large.file_id}")
+    logger.info(f"Анализирую картинку с file_id: {image_file_id} через Gemini...")
 
     try:
-        # Скачиваем файл картинки в память (в виде байтов)
-        # Ставим таймаут на всякий случай
-        photo_file = await context.bot.get_file(photo_large.file_id, read_timeout=60)
-        # Нужны байты картинки
+        # Скачиваем файл по найденному file_id
+        photo_file = await context.bot.get_file(image_file_id, read_timeout=60)
         photo_bytes_io = await photo_file.download_as_bytearray(read_timeout=60)
-        photo_bytes = bytes(photo_bytes_io) # Конвертируем bytearray в bytes
-        logger.info(f"Картинка успешно скачана, размер: {len(photo_bytes)} байт.")
+        photo_bytes = bytes(photo_bytes_io)
+        logger.info(f"Картинка для анализа скачана, размер: {len(photo_bytes)} байт.")
 
-        # Готовим ПРАВИЛЬНЫЙ промпт для КАРТИНКИ
+        # Промпт для обсирания сюжета картинки (с 🗿)
         image_prompt = (
             f"Ты - МАКСИМАЛЬНО циничный и токсичный уебок с черным чувством юмора. Тебе показали КАРТИНКУ. Забудь нахуй про свет, композицию и прочую лабуду для пидоров-фотографов. Твоя задача - понять, **ЧТО ЗА ХУЙНЯ ПРОИСХОДИТ НА КАРТИНКЕ (СЮЖЕТ, ДЕЙСТВИЕ, ПРЕДМЕТЫ)**, и **ОБОСРАТЬ ИМЕННО ЭТО** максимально смешно, жестко, цинично и с МАТОМ.\n\n"
             f"Инструкции:\n"
@@ -257,36 +339,58 @@ async def analyze_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"КОРОЧЕ! ПОЙМИ, ЧТО ЗА ХУЙНЯ НА КАРТИНКЕ, И ОБОСРИ ЭТО СМЕШНО И ЖЕСТКО, НАЧИНАЯ С 🗿:"
         )
 
-        # Сообщение "Думаю..."
-        thinking_message = await update.message.reply_text("Так-так, блядь, ща посмотрим на это произведение искусства... Дайте подумать (или просто подождите, картинки дольше грузятся)...")
+        thinking_message = await update.message.reply_text("Так-так, блядь, ща посмотрим на это ...")
 
-        # Отправляем запрос в Gemini С КАРТИНКОЙ
         logger.info("Отправка запроса к Gemini с картинкой...")
-        # Gemini принимает список "частей": текст и данные картинки
-        response = await model.generate_content_async([image_prompt, {"mime_type": "image/jpeg", "data": photo_bytes}])
-        # ЗАМЕЧАНИЕ: Мы тупо ставим mime_type "image/jpeg". Если прислали PNG или другую хуйню,
-        # Gemini может не понять или обработать криво. Для простоты пока забьем.
+        picture_data = {"mime_type": "image/jpeg", "data": photo_bytes}
+        response = await model.generate_content_async([image_prompt, picture_data], safety_settings={...}) # safety_settings как были
         logger.info("Получен ответ от Gemini по картинке.")
 
-        # Удаляем "Думаю..."
-        try: await context.bot.delete_message(chat_id=update.message.chat_id, message_id=thinking_message.message_id)
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        # Отправляем ответ
-        sarcastic_comment = "Хуй знает, что там нарисовано, но выглядит как говно. Или Gemini не смог это переварить."
-        if response and response.text:
-            sarcastic_comment = response.text.strip()
-        await update.message.reply_text(sarcastic_comment)
+        sarcastic_comment = "🗿 Хуй знает, что там нарисовано..."
+        if response.prompt_feedback.block_reason:
+             logger.warning(f"Ответ Gemini заблокирован: {response.prompt_feedback.block_reason}")
+             sarcastic_comment = f"🗿 Ебало на картинке настолько стремное (блок: {response.prompt_feedback.block_reason}), что Gemini ослеп."
+        elif response.text:
+             sarcastic_comment = response.text.strip()
+             if not sarcastic_comment.startswith("🗿"): sarcastic_comment = "🗿 " + sarcastic_comment
+
+        # --- ОТПРАВКА ОТВЕТА И ЗАПИСЬ В БД ДЛЯ RETRY ---
+        sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_comment)
         logger.info(f"Отправлен комментарий к картинке: '{sarcastic_comment[:50]}...'")
 
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при анализе картинки: {e}", exc_info=True)
-        try:
-            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=update.message.chat_id, message_id=thinking_message.message_id)
-        except Exception: pass
-        await update.message.reply_text(f"Бля, {user_name}, я обосрался, пока смотрел на эту картинку. То ли она слишком уебищная, то ли Гугл опять барахлит. Ошибка: `{type(e).__name__}`.")
+        if sent_message:
+            # Сохраняем инфу о последнем ответе для /retry
+            reply_doc = {
+                "chat_id": chat_id,
+                "message_id": sent_message.message_id,
+                "analysis_type": "pic", # Тип анализа
+                "source_file_id": image_file_id, # Сохраняем ID исходной картинки!
+                "timestamp": datetime.datetime.now(datetime.timezone.utc)
+            }
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: last_reply_collection.update_one(
+                        {"chat_id": chat_id}, {"$set": reply_doc}, upsert=True
+                    )
+                )
+                logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, pic, {image_file_id}) для /retry чата {chat_id}.")
+            except Exception as e:
+                 logger.error(f"Ошибка записи данных для /retry (pic) в MongoDB для чата {chat_id}: {e}", exc_info=True)
+        # --- КОНЕЦ ЗАПИСИ В БД ДЛЯ RETRY ---
 
-# --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+    except Exception as e:
+        logger.error(f"ПИЗДЕЦ при анализе картинки через Gemini: {e}", exc_info=True)
+        try:
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался, пока смотрел на эту картинку через Gemini. Ошибка: `{type(e).__name__}`.")
+
+# --- КОНЕЦ ПЕРЕПИСАННОЙ analyze_pic ---
 
 # Flask app остается для Render заглушки
 app = Flask(__name__)
@@ -393,23 +497,23 @@ async def main() -> None:
     # 1. Настраиваем и собираем Telegram бота
     logger.info("Сборка Telegram Application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    #application.add_handler(CommandHandler("analyze", analyze_chat))
-    #application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Оставим рабочую версию с Gemini
+    application.add_handler(CommandHandler("analyze", analyze_chat))
+    application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Оставим рабочую версию с Gemini
 
     # --->>> ДОБАВЛЯЕМ HELP <<<---
-    #application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("help", help_command))
 
     # Regex для русских команд "/analyze"
     analyze_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(анализируй|проанализируй|комментируй|обосри|скажи|мнение).*'
-    #application.add_handler(MessageHandler(filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND, handle_text_analyze_command))
+    application.add_handler(MessageHandler(filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND, handle_text_analyze_command))
 
     # Regex для русских команд "/analyze_pic"
     analyze_pic_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(зацени|опиши|обосри|скажи про).*(пикч|картинк|фот|изображен|это).*'
-    #application.add_handler(MessageHandler(filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_text_analyze_pic_command))
+    application.add_handler(MessageHandler(filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_text_analyze_pic_command))
 
     # --->>> ДОБАВЛЯЕМ Regex ДЛЯ РУССКИХ КОМАНД "/help" <<<---
     help_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(ты кто|кто ты|что умеешь|хелп|помощь|справка|команды).*'
-    #application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Вызываем ту же функцию help_command
+    application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Вызываем ту же функцию help_command
 
     # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ HELP <<<---
 
