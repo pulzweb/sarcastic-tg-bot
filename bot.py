@@ -578,14 +578,22 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # т.к. они ожидают объект Update.
     try:
         fake_update_data = {
-            'update_id': 1, # Просто любое число
+            'update_id': 1,
             'message': {
-                'message_id': replied_message_id + 1, # Фейковый ID, не должен совпадать с реальными
-                'date': int(datetime.datetime.now(datetime.timezone.utc).timestamp()), # Текущее время
-                'chat': {'id': chat_id, 'type': update.message.chat.type}, # Нужен chat_id и тип чата
-                'from_user': update.message.from_user.to_dict(), # Инфа о юзере, который вызвал /retry
-                'reply_to_message': None, # Важно! Мы НЕ отвечаем на сообщение в режиме retry
-                'text': f'/internal_retry_{analysis_type_to_retry}' # Плейсхолдер текста
+                'message_id': replied_message_id + 1,
+                'date': int(datetime.datetime.now(datetime.timezone.utc).timestamp()),
+                'chat': {'id': chat_id, 'type': update.message.chat.type},
+                # --->>> Явно создаем словарь для from_user <<<---
+                'from_user': {
+                    'id': update.message.from_user.id,
+                    'is_bot': update.message.from_user.is_bot,
+                    'first_name': update.message.from_user.first_name or '', # Берем имя
+                    'username': update.message.from_user.username or None, # Берем юзернейм (если есть)
+                    'language_code': update.message.from_user.language_code or None # Берем код языка (если есть)
+                },
+                # --->>> КОНЕЦ ИСПРАВЛЕНИЯ from_user <<<---
+                'reply_to_message': None,
+                'text': f'/internal_retry_{analysis_type_to_retry}'
             }
         }
         # Преобразуем словарь в объект Update
