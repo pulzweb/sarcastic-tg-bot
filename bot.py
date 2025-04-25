@@ -223,11 +223,28 @@ async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        sarcastic_summary = "[Gemini промолчал или спизданул хуйню]"
-        if response and response.text:
-            sarcastic_summary = response.text.strip()
-            # Добавим Моаи, если забыл
-            if not sarcastic_summary.startswith("🗿"): sarcastic_summary = "🗿 " + sarcastic_summary
+        sarcastic_summary = "🗿 Бля, хуй его знает. То ли ваш диалог говно, то ли Gemini его зацензурил."
+        # СНАЧАЛА проверяем на блокировку
+        if response.prompt_feedback.block_reason:
+            block_reason = response.prompt_feedback.block_reason
+            logger.warning(f"Ответ Gemini для текста заблокирован по причине: {block_reason}")
+            sarcastic_summary = f"🗿 Ваш пиздеж настолько токсичен, что Gemini его заблокировал (Причина: {block_reason}). Поздравляю, вы уебки."
+        # ЕСЛИ НЕ ЗАБЛОКИРОВАНО, ПЫТАЕМСЯ получить текст
+        # Проверяем, что кандидаты вообще есть, перед доступом к .text
+        elif response.candidates:
+            try:
+                text_response = response.text # Теперь этот вызов должен быть безопаснее
+                sarcastic_summary = text_response.strip()
+                if not sarcastic_summary.startswith("🗿"):
+                    sarcastic_summary = "🗿 " + sarcastic_summary
+            except ValueError as e:
+                # Ловим ту самую ошибку ValueError, если вдруг кандидаты есть, а .text все равно не работает
+                logger.error(f"Странная ошибка при доступе к response.text, хотя кандидаты есть: {e}")
+                sarcastic_summary = "🗿 Gemini что-то родил, но я не смог это прочитать. Ебучий глюк."
+        else:
+            # Если не заблокировано, но кандидатов нет (странный случай)
+            logger.warning("Ответ Gemini не заблокирован, но кандидатов нет.")
+            sarcastic_summary = "🗿 Gemini вернул пустоту. Видимо, ваш диалог вызвал у него экзистенциальный кринж."
 
         # --- ОТПРАВКА ОТВЕТА И ЗАПИСЬ В БД ДЛЯ RETRY ---
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_summary)
@@ -343,7 +360,15 @@ async def analyze_pic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         logger.info("Отправка запроса к Gemini с картинкой...")
         picture_data = {"mime_type": "image/jpeg", "data": photo_bytes}
-        response = await model.generate_content_async([image_prompt, picture_data], safety_settings={...}) # safety_settings как были
+        response = await model.generate_content_async(
+            [image_prompt, picture_data],
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'block_none',
+                'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none',
+            }
+        )
         logger.info("Получен ответ от Gemini по картинке.")
 
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
