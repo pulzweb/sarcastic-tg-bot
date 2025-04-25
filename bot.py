@@ -232,7 +232,7 @@ async def analyze_chat(
             f"Выдай результат в указанном формате, будь МАКСИМАЛЬНО ТОКСИЧНЫМ УЕБКОМ:"
         )
 
-        thinking_message = await update.message.reply_text("Так, блядь, щас подключу мозги и подумаю...")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так, блядь, щас подключу мозжечок и подумаю...")
 
         logger.info(f"Отправка запроса к Gemini API...")
         response = await model.generate_content_async(prompt) # <-- Убедись, что 'model' - это Gemini модель!
