@@ -32,6 +32,15 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise ValueError("НЕ НАЙДЕН GEMINI_API_KEY!")
 
+
+# --- Логирование ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("hypercorn").setLevel(logging.INFO) # Чтобы видеть логи Hypercorn
+logger = logging.getLogger(__name__)
+
 # --- ПОДКЛЮЧЕНИЕ К MONGODB ATLAS ---
 MONGO_DB_URL = os.getenv("MONGO_DB_URL")
 if not MONGO_DB_URL:
@@ -71,14 +80,6 @@ except Exception as e:
     logger.critical(f"Неизвестная ошибка при настройке MongoDB: {e}", exc_info=True)
     raise SystemExit(f"Ошибка настройки MongoDB: {e}")
 # --- КОНЕЦ ПОДКЛЮЧЕНИЯ К MONGODB ---
-
-# --- Логирование ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("hypercorn").setLevel(logging.INFO) # Чтобы видеть логи Hypercorn
-logger = logging.getLogger(__name__)
 
 # --- Настройка Gemini ---
 try:
