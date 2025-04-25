@@ -370,7 +370,7 @@ async def analyze_pic(
             f"КОРОЧЕ! ПОЙМИ, ЧТО ЗА ХУЙНЯ НА КАРТИНКЕ, И ОБОСРИ ЭТО СМЕШНО И ЖЕСТКО, НАЧИНАЯ С 🗿:"
         )
 
-        thinking_message = await update.message.reply_text("Так-так, блядь, ща посмотрим на это ...")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так-так, блядь, ща посмотрим на это...")
 
         logger.info("Отправка запроса к Gemini с картинкой...")
         picture_data = {"mime_type": "image/jpeg", "data": photo_bytes}
