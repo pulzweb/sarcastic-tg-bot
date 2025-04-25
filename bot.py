@@ -933,7 +933,14 @@ async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.info(f"Отправка запроса к Gemini для генерации подката...")
 
         generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=1.0) # Максимум креатива!
-        safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HATE_SPEECH': 'block_none', 'SEXUALLY_EXPLICIT': 'block_none', 'DANGEROUS_CONTENT': 'block_none'}
+        # --->>> ИСПРАВЛЕННЫЕ safety_settings <<<---
+        safety_settings={
+            'HARM_CATEGORY_HARASSMENT': 'block_none',
+            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # ПРАВИЛЬНЫЙ КЛЮЧ!
+        }
+        # --->>> КОНЕЦ ИСПРАВЛЕНИЯ <<<---
 
         response = await model.generate_content_async(
             pickup_prompt,
