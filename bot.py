@@ -221,7 +221,7 @@ async def analyze_chat(
             f"Выдай результат в указанном формате, будь МАКСИМАЛЬНО ТОКСИЧНЫМ УЕБКОМ:"
         )
 
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так, блядь, щас подключу старые проверенные мозги Gemini и подумаю...")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так, блядь, щас подключу мозжечок и подумаю...")
 
         logger.info(f"Отправка запроса к Gemini API...")
 
@@ -250,11 +250,11 @@ async def analyze_chat(
         except Exception: pass
 
         # Обработка ответа с проверкой блока и обрезкой
-        sarcastic_summary = "🗿 Бля, хуй его знает. То ли ваш диалог говно, то ли Gemini его зацензурил."
+        sarcastic_summary = "🗿 Бля, хуй его знает. То ли ваш диалог говно, то ли бот его зацензурил."
         if response.prompt_feedback.block_reason:
             block_reason = response.prompt_feedback.block_reason
             logger.warning(f"Ответ Gemini для текста заблокирован: {block_reason}")
-            sarcastic_summary = f"🗿 Ваш пиздеж настолько токсичен, что Gemini его заблокировал (Причина: {block_reason})."
+            sarcastic_summary = f"🗿 Ваш пиздеж настолько токсичен, что бот его заблокировал (Причина: {block_reason})."
         elif response.candidates:
              try:
                  text_response = response.text
@@ -263,7 +263,7 @@ async def analyze_chat(
                      sarcastic_summary = "🗿 " + sarcastic_summary
              except ValueError as e:
                  logger.error(f"Ошибка при доступе к response.text для чата: {e}")
-                 sarcastic_summary = "🗿 Gemini что-то родил, но прочитать не могу."
+                 sarcastic_summary = "🗿 Бот что-то родил, но прочитать не могу."
         else:
              logger.warning("Ответ Gemini пуст (нет кандидатов).")
 
@@ -289,7 +289,7 @@ async def analyze_chat(
         try:
             if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мои мозги Gemini дали сбой. Ошибка: `{type(e).__name__}`.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мои мозги дали сбой. Ошибка: `{type(e).__name__}`.")
 
 # --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ analyze_chat ---
 
