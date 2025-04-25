@@ -1,4 +1,7 @@
 # --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
+import datetime
+import pymongo # Для работы с MongoDB
+from pymongo.errors import ConnectionFailure # Для обработки ошибок подключения
 import re # Для регулярных выражений
 import logging
 import os
@@ -29,6 +32,46 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise ValueError("НЕ НАЙДЕН GEMINI_API_KEY!")
 
+# --- ПОДКЛЮЧЕНИЕ К MONGODB ATLAS ---
+MONGO_DB_URL = os.getenv("MONGO_DB_URL")
+if not MONGO_DB_URL:
+    raise ValueError("НЕ НАЙДЕНА MONGO_DB_URL! Добавь строку подключения к MongoDB Atlas в переменные окружения Render!")
+
+try:
+    # Создаем асинхронный клиент MongoClient? Нет, pymongo стандартный синхронный,
+    # будем использовать run_in_executor для блокирующих операций с БД.
+    # Для асинхронности есть Motor, но пока обойдемся pymongo + executor.
+    mongo_client = pymongo.MongoClient(MONGO_DB_URL, serverSelectionTimeoutMS=5000) # Таймаут подключения 5 сек
+
+    # Проверка соединения (пинг)
+    mongo_client.admin.command('ping')
+    logger.info("Успешное подключение к MongoDB Atlas!")
+
+    # Выбираем базу данных (назовем ее 'popizdyaka_db')
+    # Если ее нет, MongoDB создаст ее при первой записи
+    db = mongo_client['popizdyaka_db']
+
+    # Получаем доступ к коллекциям (аналоги таблиц)
+    # Коллекция для истории сообщений
+    history_collection = db['message_history']
+    # Коллекция для хранения инфы о последнем анализе (для /retry)
+    last_reply_collection = db['last_replies']
+
+    # Можно создать индексы для ускорения поиска (не обязательно сразу, но полезно)
+    # Индекс для сортировки истории по времени (если будем хранить timestamp)
+    # history_collection.create_index([("chat_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)])
+    # Индекс для поиска последнего ответа по chat_id
+    # last_reply_collection.create_index("chat_id", unique=True)
+    logger.info("Коллекции MongoDB готовы к использованию.")
+
+except ConnectionFailure as e:
+    logger.critical(f"ПИЗДЕЦ! Не удалось подключиться к MongoDB: {e}", exc_info=True)
+    raise SystemExit(f"Ошибка подключения к MongoDB: {e}")
+except Exception as e:
+    logger.critical(f"Неизвестная ошибка при настройке MongoDB: {e}", exc_info=True)
+    raise SystemExit(f"Ошибка настройки MongoDB: {e}")
+# --- КОНЕЦ ПОДКЛЮЧЕНИЯ К MONGODB ---
+
 # --- Логирование ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -47,20 +90,58 @@ except Exception as e:
     raise SystemExit(f"Не удалось настроить Gemini API: {e}")
 
 # --- Хранилище истории ---
-chat_histories = {}
+#chat_histories = {}
 logger.info(f"Максимальная длина истории сообщений для анализа: {MAX_MESSAGES_TO_ANALYZE}")
 
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ И КОМАНД (БЕЗ ИЗМЕНЕНИЙ) ---
+# --- ПЕРЕПИСАННАЯ store_message С ЗАПИСЬЮ В MONGODB ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text or not update.message.from_user:
-        return
+    if not update.message or not update.message.from_user:
+        return # Игнорим системные сообщения
+
+    message_text = None
     chat_id = update.message.chat_id
-    message_text = update.message.text
     user_name = update.message.from_user.first_name or "Анонимный долбоеб"
-    if chat_id not in chat_histories:
-        chat_histories[chat_id] = deque(maxlen=MAX_MESSAGES_TO_ANALYZE)
-        # logger.info(f"Создана новая история для чата {chat_id}") # Убрал лишний лог
-    chat_histories[chat_id].append(f"{user_name}: {message_text}")
+    timestamp = update.message.date or datetime.datetime.now(datetime.timezone.utc) # Время сообщения
+
+    # Определяем тип сообщения и текст/заглушку
+    if update.message.text:
+        message_text = update.message.text
+    elif update.message.photo:
+        # Для фото сохраним еще и file_id самой большой версии, вдруг пригодится для /retry analyze_pic
+        file_id = update.message.photo[-1].file_id
+        message_text = f"[КАРТИНКА:{file_id}]" # Заглушка с file_id
+    elif update.message.sticker:
+        emoji = update.message.sticker.emoji or ''
+        # file_id стикера тоже можно сохранить, если надо
+        # file_id = update.message.sticker.file_id
+        message_text = f"[СТИКЕР {emoji}]" # Заглушка
+
+    # Если есть текст (или заглушка), сохраняем в MongoDB
+    if message_text:
+        # Создаем документ для MongoDB
+        message_doc = {
+            "chat_id": chat_id,
+            "user_name": user_name,
+            "text": message_text, # Текст или заглушка
+            "timestamp": timestamp, # Время сообщения
+            "message_id": update.message.message_id # ID сообщения в Telegram
+        }
+
+        try:
+            # --- ЗАПИСЬ В БД (Блокирующая операция!) ---
+            # Запускаем синхронную операцию pymongo в executor'е asyncio
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, # Стандартный ThreadPoolExecutor
+                lambda: history_collection.insert_one(message_doc)
+            )
+            # logger.debug(f"Сообщение от {user_name} сохранено в MongoDB для чата {chat_id}.")
+        except Exception as e:
+            logger.error(f"Ошибка записи сообщения в MongoDB для чата {chat_id}: {e}", exc_info=True)
+            # Что делать в случае ошибки? Пока просто логируем.
+
+# --- КОНЕЦ ПЕРЕПИСАННОЙ store_message ---
 
 async def analyze_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.from_user:
@@ -311,23 +392,23 @@ async def main() -> None:
     # 1. Настраиваем и собираем Telegram бота
     logger.info("Сборка Telegram Application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("analyze", analyze_chat))
-    application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Оставим рабочую версию с Gemini
+    #application.add_handler(CommandHandler("analyze", analyze_chat))
+    #application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Оставим рабочую версию с Gemini
 
     # --->>> ДОБАВЛЯЕМ HELP <<<---
-    application.add_handler(CommandHandler("help", help_command))
+    #application.add_handler(CommandHandler("help", help_command))
 
     # Regex для русских команд "/analyze"
     analyze_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(анализируй|проанализируй|комментируй|обосри|скажи|мнение).*'
-    application.add_handler(MessageHandler(filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND, handle_text_analyze_command))
+    #application.add_handler(MessageHandler(filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND, handle_text_analyze_command))
 
     # Regex для русских команд "/analyze_pic"
     analyze_pic_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(зацени|опиши|обосри|скажи про).*(пикч|картинк|фот|изображен|это).*'
-    application.add_handler(MessageHandler(filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_text_analyze_pic_command))
+    #application.add_handler(MessageHandler(filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_text_analyze_pic_command))
 
     # --->>> ДОБАВЛЯЕМ Regex ДЛЯ РУССКИХ КОМАНД "/help" <<<---
     help_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(ты кто|кто ты|что умеешь|хелп|помощь|справка|команды).*'
-    application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Вызываем ту же функцию help_command
+    #application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Вызываем ту же функцию help_command
 
     # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ HELP <<<---
 
