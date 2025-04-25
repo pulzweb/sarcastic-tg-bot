@@ -1,4 +1,5 @@
 # --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
+import re # Для регулярных выражений
 import logging
 import os
 import asyncio # ОСНОВА ВСЕЙ АСИНХРОННОЙ МАГИИ
@@ -249,6 +250,26 @@ async def run_bot_async(application: Application) -> None:
         await application.shutdown()
         logger.info("Процесс остановки бота в run_bot_async завершен.")
 
+# --- Новая функция-обработчик для текстовых команд анализа ---
+async def handle_text_analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Эта функция будет вызываться по регулярному выражению
+    # Просто вызываем нашу основную функцию анализа чата
+    logger.info(f"Получена текстовая команда на анализ от {update.message.from_user.first_name}")
+    await analyze_chat(update, context)
+
+# --- Новая функция-обработчик для текстовых команд анализа картинки ---
+async def handle_text_analyze_pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Эта функция будет вызываться по регулярному выражению в ответе на картинку
+    # Просто вызываем нашу основную функцию анализа картинки
+    # Важно: эта функция должна быть вызвана В ОТВЕТ на сообщение с картинкой!
+    if not update.message.reply_to_message or not update.message.reply_to_message.photo:
+         # Мы не будем спамить в чат, если вызвали не так, основная функция сама разберется
+         logger.warning("handle_text_analyze_pic_command вызвана не как ответ на фото.")
+         # Можно добавить ответ юзеру, что он долбоеб, если очень хочется
+         # await update.message.reply_text("Ответь этой фразой на картинку, баклан!")
+         # return
+    logger.info(f"Получена текстовая команда на анализ картинки от {update.message.from_user.first_name}")
+    await analyze_pic(update, context) # Вызываем заглушку для Groq или рабочую для Gemini
 
 async def main() -> None:
     """Основная асинхронная функция, запускающая веб-сервер и бота."""
@@ -257,9 +278,35 @@ async def main() -> None:
     # 1. Настраиваем и собираем Telegram бота
     logger.info("Сборка Telegram Application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("analyze", analyze_chat))
-    application.add_handler(CommandHandler("analyze_pic", analyze_pic))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
+    application.add_handler(CommandHandler("analyze", analyze_chat)) # Оставляем старую команду
+    application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Оставляем старую команду (заглушку для Groq)
+
+    # --->>> ДОБАВЛЯЕМ ОБРАБОТЧИКИ ДЛЯ РУССКИХ ФРАЗ <<<---
+
+    # Реагируем на "Попиздяка/Попиздоний/Бот анализируй/проанализируй/комментируй/обосри [чат]" (регистронезависимо)
+    # Regex: (?i) - регистронезависимость, .* - любой текст до и после
+    analyze_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(анализируй|проанализируй|комментируй|обосри|скажи|мнение).*'
+    application.add_handler(MessageHandler(
+        filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND,
+        handle_text_analyze_command
+    ))
+
+    # Реагируем на "Попиздяка/Попиздоний/Бот зацени/опиши/обосри пикчу/картинку/фото/изображение" В ОТВЕТЕ НА СООБЩЕНИЕ
+    # Важно: filters.REPLY обязателен!
+    analyze_pic_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(зацени|опиши|обосри|скажи про).*(пикч|картинк|фот|изображен|это).*'
+    application.add_handler(MessageHandler(
+        filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND,
+        handle_text_analyze_pic_command
+    ))
+
+    # --->>> КОНЕЦ ДОБАВЛЕННЫХ ОБРАБОТЧИКОВ <<<---
+
+
+    # Обработчики для store_message (ТРИ ОТДЕЛЬНЫХ)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message)) # Этот теперь будет ловить текст, НЕ совпадающий с regex выше
+    application.add_handler(MessageHandler(filters.PHOTO, store_message))
+    application.add_handler(MessageHandler(filters.Sticker, store_message))
+
     logger.info("Обработчики Telegram добавлены.")
 
     # 2. Настраиваем Hypercorn для запуска Flask приложения
