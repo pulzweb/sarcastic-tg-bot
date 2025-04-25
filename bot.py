@@ -543,11 +543,14 @@ async def main() -> None:
     # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ HELP <<<---
 
 
-    # Обработчики для store_message (ТРИ ОТДЕЛЬНЫХ)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message)) # Этот ловит текст, не попавший под Regex и команды
+    # --->>> ПРАВИЛЬНЫЕ ОТДЕЛЬНЫЕ ОБРАБОТЧИКИ ДЛЯ store_message <<<---
+    # 1. Только для ТЕКСТА (без команд)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
+    # 2. Только для ФОТО (используем объект filters.PHOTO)
     application.add_handler(MessageHandler(filters.PHOTO, store_message))
-    application.add_handler(MessageHandler(filters.Sticker, store_message))
-
+    # 3. Только для СТИКЕРОВ (используем объект filters.Sticker.ALL или просто filters.Sticker)
+    application.add_handler(MessageHandler(filters.Sticker.ALL, store_message)) # Можно и filters.Sticker
+    # --->>> КОНЕЦ ПРАВИЛЬНЫХ ОБРАБОТЧИКОВ <<<---
     logger.info("Обработчики Telegram добавлены.")
 
     # 2. Настраиваем Hypercorn для запуска Flask приложения
