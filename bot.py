@@ -562,6 +562,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             Напиши <code>/pickup</code> или "<code>Бот подкати</code>".
             Я сгенерирую максимально уебищную фразу для знакомства. Используй на свой страх и риск.
 
+            *Прожарка друга (Roast):*
+            Ответь на сообщение бедолаги командой <code>/roast</code> или фразой типа "<code>Бот прожарь его</code>".
+            Я сочиню короткий уничижительный стендап про этого человека (на основе его имени).
+
+
             *Эта справка:*
             Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
 
@@ -1032,6 +1037,102 @@ async def roast_previous(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 # --- КОНЕЦ ФУНКЦИИ РАНДОМНОГО ОБСИРАНИЯ ---
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ ПРОЖАРКИ (/roast) ---
+async def roast_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Генерирует саркастичный 'роаст' пользователя, на сообщение которого ответили."""
+    # Проверяем, что это ответ на чье-то сообщение
+    if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.from_user:
+        await context.bot.send_message(chat_id=update.message.chat_id, text="Ты должен ответить этой командой на сообщение того бедолаги, которого хочешь прожарить, кретин!")
+        return
+
+    # Получаем инфу о цели "прожарки"
+    target_user = update.message.reply_to_message.from_user
+    target_name = target_user.first_name or target_user.username or "это безымянное хуйло" # Берем имя или юзернейм
+
+    # Не прожариваем самого себя (бота)
+    if target_user.id == context.bot.id:
+        await context.bot.send_message(chat_id=update.message.chat_id, text="🗿 Самоирония - это хорошо, но себя жарить я не буду. Ищи другую жертву.")
+        return
+
+    chat_id = update.message.chat_id
+    user_name = update.message.from_user.first_name or "Главный Завистник" # Имя того, кто заказал прожарку
+    logger.info(f"Пользователь '{user_name}' запросил прожарку для '{target_name}' (ID: {target_user.id}) в чате {chat_id}")
+
+    # --- ПРОМПТ ДЛЯ ГЕНЕРАЦИИ РОАСТА ---
+    roast_prompt = (
+        f"Ты - мастер злого стендапа и прожарки (roast). Твоя задача - сочинить **КОРОТКИЙ (2-4 предложения)**, максимально **УНИЧИЖИТЕЛЬНЫЙ, САРКАСТИЧНЫЙ, но СМЕШНОЙ** роаст для человека по имени **{target_name}**. НЕ используй информацию из чата, опирайся только на имя и общие стереотипы или просто свой черный юмор. Придумай обидные, но остроумные шутки. Используй мат для остроты. НЕ переходи на прямые примитивные оскорбления типа 'ты пидор'. Цель - 'прожарить', а не тупо обосрать.\n\n"
+        f"Пример (для Васи): 'Наш Васян... Звучит как надежный парень. Надежно проебет все полимеры. Говорят, его IQ ниже, чем температура за окном зимой в Якутске, но зато он очень громко об этом молчит.'\n"
+        f"Пример (для Лены): 'Ах, Лена... Наверное, в прошлой жизни была сиренью - такая же бледная и быстро увядающая. Зато умеет красиво страдать на публику. Талант, хули.'\n\n"
+        f"Сочини подобный РОАСТ для **{target_name}**:"
+    )
+    # --- КОНЕЦ ПРОМПТА ---
+
+    try:
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Окей, щас подберем пару ласковых для этого вашего '{target_name}'...")
+        logger.info(f"Отправка запроса к Gemini для генерации роаста для {target_name}...")
+
+        generation_config = genai.types.GenerationConfig(max_output_tokens=150, temperature=0.85)
+        # --->>> ВОТ ОНИ, РОДИМЫЕ safety_settings <<<---
+        safety_settings={
+            'HARM_CATEGORY_HARASSMENT': 'block_none',
+            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
+        }
+        # --->>> КОНЕЦ <<<---
+
+        response = await model.generate_content_async(
+            roast_prompt,
+            generation_config=generation_config,
+            safety_settings=safety_settings # Передаем их!
+        )
+        logger.info(f"Получен ответ от Gemini с роастом для {target_name}.")
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+
+        roast_text = f"🗿 Не смог придумать ничего смешного про '{target_name}'. Видимо, он настолько уныл, что даже моя фантазия пасует."
+        if response.prompt_feedback.block_reason:
+            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Роаст Gemini заблокирован: {block_reason}")
+            roast_text = f"🗿 Gemini считает, что '{target_name}' слишком свят для моих шуток (Причина блока: {block_reason}). Лицемер ебаный."
+        elif response.candidates:
+             try:
+                 generated_text = response.text; roast_text = "🗿 " + generated_text.strip()
+             except ValueError as e: logger.error(f"Ошибка доступа к response.text для роаста: {e}"); roast_text = f"🗿 Мой мозг сломался, пока я думал про '{target_name}'."
+        else: logger.warning("Ответ Gemini для роаста пуст.")
+
+        # Отправляем НЕ как ответ, а просто в чат, но упоминаем цель
+        # Можно использовать mention_html для кликабельности, если target_user.username есть
+        target_mention = target_user.mention_html() if target_user.username else f"<b>{target_name}</b>" # Жирным, если нет юзернейма
+        final_text = f"Прожарка для {target_mention}:\n\n{roast_text}"
+
+        # Обрезаем на всякий случай
+        MAX_MESSAGE_LENGTH = 4096
+        if len(final_text) > MAX_MESSAGE_LENGTH:
+            logger.warning(f"Роаст длинный ({len(final_text)}), обрезаем!")
+            # Обрезаем сам текст роаста, оставляя вступление
+            max_roast_len = MAX_MESSAGE_LENGTH - len(f"Прожарка для {target_mention}:\n\n") - 3
+            if max_roast_len > 0:
+                 roast_text = roast_text[:max_roast_len] + "..."
+            else: # Если даже вступление не влезает
+                 roast_text = "Слишком длинный роаст, пиздец."
+            final_text = f"Прожарка для {target_mention}:\n\n{roast_text}"
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=final_text,
+            parse_mode='HTML' # Используем HTML для mention_html или <b>
+        )
+        logger.info(f"Отправлен роаст для {target_name}.")
+
+    except Exception as e:
+        logger.error(f"ПИЗДЕЦ при генерации роаста для {target_name}: {e}", exc_info=True)
+        try:
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не смог прожарить '{target_name}'. То ли он несмешной, то ли я тупой. Ошибка: `{type(e).__name__}`.")
+
+# --- КОНЕЦ ФУНКЦИИ ДЛЯ ПРОЖАРКИ ---
+
 async def main() -> None:
     """Основная асинхронная функция, запускающая веб-сервер и бота."""
     logger.info("Запуск асинхронной функции main().")
@@ -1071,6 +1172,12 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(pickup_pattern) & filters.TEXT & ~filters.COMMAND, get_pickup_line))
     # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПОДКАТОВ <<<---
 
+# --->>> ДОБАВЛЯЕМ ПРОЖАРКУ <<<---
+    application.add_handler(CommandHandler("roast", roast_user)) # Команда /roast (в ответе на сообщение)
+    roast_pattern = r'(?i).*(?:бот|попиздяка).*(?:прожарь|зажарь|обосри|унизь)\s+(?:его|ее|этого|эту).*'
+    # Ловим ТОЛЬКО как ответ на сообщение!
+    application.add_handler(MessageHandler(filters.Regex(roast_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, roast_user))
+    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПРОЖАРКИ <<<---
 
     # Regex для русских команд "/analyze"
     analyze_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(анализируй|проанализируй|комментируй|обосри|скажи|мнение).*'
