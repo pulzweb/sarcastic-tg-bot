@@ -1180,11 +1180,11 @@ async def main() -> None:
     # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПРОЖАРКИ <<<---
 
     # Regex для русских команд "/analyze"
-    analyze_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(анализируй|проанализируй|комментируй|обосри|скажи|мнение).*'
+    analyze_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(анализируй|проанализируй|комментируй|мнение).*'
     application.add_handler(MessageHandler(filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND, handle_text_analyze_command))
 
     # Regex для русских команд "/analyze_pic"
-    analyze_pic_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(зацени|опиши|обосри|скажи про).*(пикч|картинк|фот|изображен|это).*'
+    analyze_pic_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(зацени|опиши).*(пикч|картинк|фот|изображен|это).*'
     application.add_handler(MessageHandler(filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_text_analyze_pic_command))
 
     # --->>> ДОБАВЛЯЕМ Regex ДЛЯ РУССКИХ КОМАНД "/help" <<<---
