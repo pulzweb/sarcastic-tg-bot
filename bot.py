@@ -16,7 +16,7 @@ import signal # Для корректной обработки сигналов 
 
 import google.generativeai as genai
 from telegram import Update, Bot, User
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
 from dotenv import load_dotenv # Чтобы читать твой .env файл или переменные Render
 
 # Загружаем секреты
@@ -67,6 +67,9 @@ try:
     # Коллекция для хранения инфы о последнем анализе (для /retry)
     last_reply_collection = db['last_replies']
 
+    chat_activity_collection = db['chat_activity']
+    chat_activity_collection.create_index("chat_id", unique=True)
+
     # Можно создать индексы для ускорения поиска (не обязательно сразу, но полезно)
     # Индекс для сортировки истории по времени (если будем хранить timestamp)
     # history_collection.create_index([("chat_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)])
@@ -96,7 +99,7 @@ except Exception as e:
 logger.info(f"Максимальная длина истории сообщений для анализа: {MAX_MESSAGES_TO_ANALYZE}")
 
 # --- ОБРАБОТЧИКИ СООБЩЕНИЙ И КОМАНД (БЕЗ ИЗМЕНЕНИЙ) ---
-# --- ПЕРЕПИСАННАЯ store_message С ЗАПИСЬЮ В MONGODB ---
+# --- ЗАМЕНИ СТАРУЮ store_message НА ЭТУ ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.from_user:
         return # Игнорим системные сообщения
@@ -110,54 +113,61 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if update.message.text:
         message_text = update.message.text
     elif update.message.photo:
-        # Для фото сохраним еще и file_id самой большой версии, вдруг пригодится для /retry analyze_pic
         file_id = update.message.photo[-1].file_id
         message_text = f"[КАРТИНКА:{file_id}]" # Заглушка с file_id
     elif update.message.sticker:
         emoji = update.message.sticker.emoji or ''
-        # file_id стикера тоже можно сохранить, если надо
-        # file_id = update.message.sticker.file_id
         message_text = f"[СТИКЕР {emoji}]" # Заглушка
 
-    # Если есть текст (или заглушка), сохраняем в MongoDB
+    # Если есть текст (или заглушка), сохраняем в MongoDB историю И обновляем активность
     if message_text:
-        # Создаем документ для MongoDB
+        # 1. Сохраняем в историю (history_collection)
         message_doc = {
-            "chat_id": chat_id,
-            "user_name": user_name,
-            "text": message_text, # Текст или заглушка
-            "timestamp": timestamp, # Время сообщения
-            "message_id": update.message.message_id # ID сообщения в Telegram
+            "chat_id": chat_id, "user_name": user_name, "text": message_text,
+            "timestamp": timestamp, "message_id": update.message.message_id
         }
-
         try:
-            # --- ЗАПИСЬ В БД (Блокирующая операция!) ---
-            # Запускаем синхронную операцию pymongo в executor'е asyncio
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None, # Стандартный ThreadPoolExecutor
-                lambda: history_collection.insert_one(message_doc)
-            )
+            await loop.run_in_executor(None, lambda: history_collection.insert_one(message_doc))
             # logger.debug(f"Сообщение от {user_name} сохранено в MongoDB для чата {chat_id}.")
         except Exception as e:
-            logger.error(f"Ошибка записи сообщения в MongoDB для чата {chat_id}: {e}", exc_info=True)
-            # Что делать в случае ошибки? Пока просто логируем.
+            logger.error(f"Ошибка записи сообщения в MongoDB history_collection: {e}", exc_info=True)
 
-# --->>> ВЫЗОВ РАНДОМНОГО ОБСИРАНИЯ (ВСТАВИТЬ СЮДА!) <<<---
-            # Вызываем только для ТЕКСТОВЫХ сообщений, чтобы не реагировать на заглушки
-            # И только если текст НЕ команда (хотя команды и так фильтруются выше)
-    if update.message.text and not update.message.text.startswith('/'):
+        # 2. Обновляем активность чата (chat_activity_collection)
         try:
-            # Запускаем асинхронную задачу в фоне, чтобы не тормозить основную функцию
-            # Она сама проверит шанс 2% внутри себя
-            asyncio.create_task(roast_previous(update, context))
-            logger.debug(f"Запущена фоновая задача roast_previous для сообщения в чате {chat_id}")
+            activity_update_doc = {
+                "$set": { # Обновляем только время последнего сообщения
+                    "last_message_time": timestamp
+                },
+                "$setOnInsert": { # Устанавливаем начальное время для высера бота ПРИ СОЗДАНИИ документа
+                    "last_bot_shitpost_time": datetime.datetime.fromtimestamp(0, datetime.timezone.utc),
+                    "chat_id": chat_id # Добавляем chat_id при создании
+                }
+            }
+            loop = asyncio.get_running_loop() # Получаем loop снова, если нужно
+            await loop.run_in_executor(
+                None,
+                lambda: chat_activity_collection.update_one(
+                    {"chat_id": chat_id}, # Ищем по chat_id
+                    activity_update_doc,   # Применяем обновление
+                    upsert=True           # Создаем, если чата еще нет в этой коллекции
+                )
+            )
+            # logger.debug(f"Обновлена активность для чата {chat_id}")
         except Exception as e:
-                    # Логируем ошибку запуска задачи, если она возникнет
-            logger.error(f"Ошибка запуска фоновой задачи roast_previous: {e}")
-            # --->>> КОНЕЦ ВЫЗОВА <<<---
+             logger.error(f"Ошибка обновления активности чата {chat_id} в MongoDB: {e}", exc_info=True)
 
-# ТЕПЕРЬ ВОТ ЗДЕСЬ КОНЧАЕТСЯ ФУНКЦИЯ store_message           
+    if update.message.text and not update.message.text.startswith('/'):
+            try:
+                # Запускаем roast_previous в фоне, чтобы не ждать ее выполнения
+                asyncio.create_task(roast_previous(update, context))
+                # Логгируем только запуск задачи, сама roast_previous залогирует свой результат или ошибку
+                logger.debug(f"Запущена фоновая задача roast_previous для сообщения от {user_name} в чате {chat_id}")
+            except Exception as e:
+                # Логируем, если даже запустить задачу не удалось
+                logger.error(f"Ошибка запуска фоновой задачи roast_previous: {e}")     
+
+# Конец функции store_message (УБЕДИСЬ, ЧТО ТУТ НЕТ ВЫЗОВА roast_previous!)
 
 # --- КОНЕЦ ПЕРЕПИСАННОЙ store_message ---
 
@@ -1144,6 +1154,92 @@ async def roast_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # --- КОНЕЦ ФУНКЦИИ ДЛЯ ПРОЖАРКИ ---
 
+# --- ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ (С ГЕНЕРАЦИЕЙ ФАКТОВ GEMINI) ---
+async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Проверяет неактивные чаты и постит рандомный ебанутый факт от Gemini."""
+    logger.info("Запуск фоновой проверки неактивности чатов для постинга факта...")
+    # Пороги времени в секундах
+    INACTIVITY_THRESHOLD = 60 * 60 * 2 # 2 часа тишины для срабатывания
+    MIN_TIME_BETWEEN_SHITPOSTS = 60 * 60 * 4 # Не чаще раза в 4 часа бот высирает в ОДНОМ чате
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    inactive_threshold_time = now - datetime.timedelta(seconds=INACTIVITY_THRESHOLD)
+    shitpost_threshold_time = now - datetime.timedelta(seconds=MIN_TIME_BETWEEN_SHITPOSTS)
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Ищем чаты, где последнее сообщение было давно И последний высер бота был еще давнее
+        query = { "last_message_time": {"$lt": inactive_threshold_time}, "last_bot_shitpost_time": {"$lt": shitpost_threshold_time} }
+        inactive_chat_docs = await loop.run_in_executor( None, lambda: list(chat_activity_collection.find(query, {"chat_id": 1, "_id": 0})) )
+        inactive_chat_ids = [doc["chat_id"] for doc in inactive_chat_docs]
+
+        if not inactive_chat_ids: logger.info("Не найдено подходящих неактивных чатов для факта."); return
+
+        logger.info(f"Найдены неактивные чаты ({len(inactive_chat_ids)}). Выбираем один для постинга факта...")
+        target_chat_id = random.choice(inactive_chat_ids) # Берем один случайный чат
+
+        # --->>> ГЕНЕРАЦИЯ ФАКТА ЧЕРЕЗ GEMINI <<<---
+        fact_prompt = (
+            "Придумай ОДИН короткий (1-2 предложения) совершенно ЕБАНУТЫЙ, АБСУРДНЫЙ, ЛЖИВЫЙ, но НАУКООБРАЗНЫЙ 'факт'. "
+            "Он должен звучать максимально бредово, но подаваться с серьезным ебалом. Можно с матом. "
+            "НЕ ПИШИ никаких вступлений типа 'Знаете ли вы...'. СРАЗУ выдавай сам 'факт'."
+            "\nПример: Квантовые флуктуации в жопе у хомяка могут спонтанно генерировать миниатюрные черные дыры."
+            "\nПример: Пингвины тайно управляют мировым рынком анчоусов."
+            "\nПридумай ПОДОБНЫЙ бред:"
+        )
+
+        logger.info(f"Отправка запроса к Gemini для генерации ебанутого факта для чата {target_chat_id}...")
+        fact_text = "🗿 Бля, сегодня без фактов. Мой генератор бреда сломался." # Заглушка
+        try:
+            generation_config = genai.types.GenerationConfig(max_output_tokens=150, temperature=1.1)
+                # --->>> ВОТ ОНИ, БЛЯДЬ! <<<---
+            safety_settings={
+                'HARM_CATEGORY_HARASSMENT': 'block_none',
+                'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+                'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
+            }
+            # --->>> КОНЕЦ <<<---
+
+            response = await model.generate_content_async(
+                fact_prompt,
+                generation_config=generation_config,
+                safety_settings=safety_settings # Передаем их!
+            )
+            logger.info(f"Получен ответ от Gemini с ебанутым фактом.")
+
+            if response.prompt_feedback.block_reason:
+                block_reason = response.prompt_feedback.block_reason; logger.warning(f"Факт Gemini заблокирован: {block_reason}")
+                fact_text = f"🗿 Gemini считает, что даже мои ебанутые факты слишком опасны (Блок: {block_reason})."
+            elif response.candidates:
+                 try:
+                     generated_text = response.text; fact_text = "🗿 " + generated_text.strip()
+                 except ValueError as e: logger.error(f"Ошибка доступа к response.text для факта: {e}"); fact_text = "🗿 Gemini что-то высрал, но я не понял."
+            else: logger.warning("Ответ Gemini для факта пуст.")
+
+        except Exception as gen_e:
+             logger.error(f"Ошибка при генерации факта через Gemini: {gen_e}", exc_info=True)
+             # Оставляем заглушку fact_text
+        # --->>> КОНЕЦ ГЕНЕРАЦИИ ФАКТА <<<---
+
+        # Обрезаем, если надо
+        MAX_MESSAGE_LENGTH = 4096
+        if len(fact_text) > MAX_MESSAGE_LENGTH:
+            fact_text = fact_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+
+        # Отправляем факт
+        await context.bot.send_message(chat_id=target_chat_id, text=fact_text)
+        logger.info(f"Отправлен рандомный факт в НЕАКТИВНЫЙ чат {target_chat_id}")
+
+        # ОБНОВЛЯЕМ ВРЕМЯ ПОСЛЕДНЕГО ВЫСЕРА БОТА в БД
+        await loop.run_in_executor( None, lambda: chat_activity_collection.update_one( {"chat_id": target_chat_id}, {"$set": {"last_bot_shitpost_time": now}} ) )
+        logger.info(f"Обновлено время последнего высера для чата {target_chat_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка в фоновой задаче check_inactivity_and_shitpost (Gemini): {e}", exc_info=True)
+
+# --- КОНЕЦ ФУНКЦИИ ДЛЯ ФОНОВОЙ ЗАДАЧИ ---
+
 async def main() -> None:
     """Основная асинхронная функция, запускающая веб-сервер и бота."""
     logger.info("Запуск асинхронной функции main().")
@@ -1151,6 +1247,14 @@ async def main() -> None:
     # 1. Настраиваем и собираем Telegram бота
     logger.info("Сборка Telegram Application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # --->>> ЗАПУСК ФОНОВОЙ ЗАДАЧИ <<<---
+    if application.job_queue:
+        # Запускаем задачу каждые 15 минут (900 сек), первый раз через 1 минуту
+        application.job_queue.run_repeating(check_inactivity_and_shitpost, interval=900, first=60)
+        logger.info("Фоновая задача проверки неактивности запущена (каждые 15 мин).")
+    else:
+        logger.warning("Не удалось получить job_queue, фоновая задача не запущена!")
+    # --->>> КОНЕЦ ЗАПУСКА ФОНОВОЙ ЗАДАЧИ <<<---
     application.add_handler(CommandHandler("analyze", analyze_chat))
     application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Оставим рабочую версию с Gemini
 
