@@ -230,12 +230,17 @@ async def analyze_chat(
             max_output_tokens=1000, # Лимит токенов (примерно до 3000 символов)
             temperature=0.7
         )
-        safety_settings={ # Снижаем цензуру
+        safety_settings={
             'HARM_CATEGORY_HARASSMENT': 'block_none',
             'HARM_CATEGORY_HATE_SPEECH': 'block_none',
             'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # <-- ПРАВИЛЬНЫЙ КЛЮЧ
         }
+        response = await model.generate_content_async(
+            system_prompt,
+            generation_config=generation_config,
+            safety_settings=safety_settings # Передаем исправленный словарь
+        )
 
         # ВАЖНО: Для Gemini контент передается как строка в списке или просто строка
         response = await model.generate_content_async(
@@ -339,7 +344,8 @@ async def analyze_pic(
     logger.info(f"Пользователь '{user_name}' запросил анализ картинки (ID: {image_file_id}) в чате {chat_id}")
 
     try:
-        # Скачиваем файл по найденному file_id
+        # Скачиваем файл по image_file_id
+        logger.info(f"Скачивание картинки {image_file_id}...")
         photo_file = await context.bot.get_file(image_file_id, read_timeout=60)
         photo_bytes_io = await photo_file.download_as_bytearray(read_timeout=60)
         photo_bytes = bytes(photo_bytes_io)
@@ -347,71 +353,66 @@ async def analyze_pic(
 
         # Промпт для обсирания сюжета картинки (с 🗿)
         image_prompt = (
-            f"Ты - МАКСИМАЛЬНО циничный и токсичный уебок с черным чувством юмора. Тебе показали КАРТИНКУ. Забудь нахуй про свет, композицию и прочую лабуду для пидоров-фотографов. Твоя задача - понять, **ЧТО ЗА ХУЙНЯ ПРОИСХОДИТ НА КАРТИНКЕ (СЮЖЕТ, ДЕЙСТВИЕ, ПРЕДМЕТЫ)**, и **ОБОСРАТЬ ИМЕННО ЭТО** максимально смешно, жестко, цинично и с МАТОМ.\n\n"
-            f"Инструкции:\n"
-            f"1.  Опиши в 1-3 предложениях **СУТЬ ПРОИСХОДЯЩЕГО** на картинке, но сразу через призму своего черного юмора и сарказма.\n"
-            f"2.  Стебись над **СМЫСЛОМ** (или его отсутствием), над **ПЕРСОНАЖАМИ/ОБЪЕКТАМИ**, над **СИТУАЦИЕЙ**. Придумай самую нелепую или уничижительную интерпретацию увиденного.\n"
-            f"3.  **МАТ и ЖЕСТЬ используй по полной**, чтобы было смешно и зло. Не бойся абсурда и чернухи.\n"
-            f"4.  Избегай только прямых бессмысленных оскорблений. Нужен **СТЕБ над СОДЕРЖАНИЕМ**.\n"
-            f"5.  Начинай свой высер с эмодзи `🗿 `.\n\n"
-            f"Пример (на картинке кот сидит в коробке): '🗿 О, блядь, очередной кошачий долбоеб нашел себе ВИП-ложе в картонке. Интеллект так и прет. Наверное, считает себя царем горы... горы мусора.'\n"
-            f"Пример (люди на пикнике): '🗿 Смотри-ка, биомасса выбралась на природу бухнуть и пожрать шашлыка из говна. Лица счастливые, как будто им ипотеку простили. Скоро все засрут и съебутся, классика.'\n"
-            f"Пример (смешная собака): '🗿 Ебать, что это за мутант? Помесь таксы с крокодилом? Выглядит так, будто просит пристрелить его, чтоб не мучился. Хозяевам явно похуй.'\n"
-            f"Пример (еда): '🗿 Кто-то сфоткал свою блевотную жратву. Выглядит аппетитно, как протухший паштет. Приятного аппетита, блядь, не обляпайся.'\n\n"
-            f"КОРОЧЕ! ПОЙМИ, ЧТО ЗА ХУЙНЯ НА КАРТИНКЕ, И ОБОСРИ ЭТО СМЕШНО И ЖЕСТКО, НАЧИНАЯ С 🗿:"
-        )
+             f"Ты - МАКСИМАЛЬНО циничный и токсичный уебок... (ВЕСЬ ТВОЙ ПРОМПТ СЮЖЕТА)... НАЧИНАЯ С 🗿:"
+         )
 
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так-так, блядь, ща посмотрим на это...")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так-так, блядь, ща посмотрим на эту картинку (через Gemini)...")
 
         logger.info("Отправка запроса к Gemini с картинкой...")
-        picture_data = {"mime_type": "image/jpeg", "data": photo_bytes}
-        response = await model.generate_content_async(
-            [image_prompt, picture_data],
-            safety_settings={
-                'HARM_CATEGORY_HARASSMENT': 'block_none',
-                'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-                'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none',
-            }
-        )
-        logger.info("Получен ответ от Gemini по картинке.")
 
+        # --->>> НАСТРОЙКИ ГЕНЕРАЦИИ И БЕЗОПАСНОСТИ <<<---
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=400, # Лимит токенов для ответа на картинку
+            temperature=0.8 # Чуть больше креативности для картинок
+        )
+        safety_settings={
+            'HARM_CATEGORY_HARASSMENT': 'block_none',
+            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
+            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # ПРАВИЛЬНЫЙ КЛЮЧ
+        }
+        # --->>> КОНЕЦ НАСТРОЕК <<<---
+
+        # --->>> ПРАВИЛЬНЫЙ ВЫЗОВ GEMINI С КАРТИНКОЙ И ПАРАМЕТРАМИ <<<---
+        picture_data = {"mime_type": "image/jpeg", "data": photo_bytes} # Предполагаем JPEG
+        response = await model.generate_content_async(
+            [image_prompt, picture_data], # Передаем список: текст и картинка
+            generation_config=generation_config,
+            safety_settings=safety_settings
+        )
+        # --->>> КОНЕЦ ПРАВИЛЬНОГО ВЫЗОВА <<<---
+
+        logger.info("Получен ответ от Gemini по картинке.")
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        sarcastic_comment = "🗿 Хуй знает, что там нарисовано..."
+        # Обработка ответа с проверкой блока и обрезкой
+        sarcastic_comment = "🗿 Хуй знает, что там за хуйня. Gemini ослеп или зацензурил."
         if response.prompt_feedback.block_reason:
-             logger.warning(f"Ответ Gemini заблокирован: {response.prompt_feedback.block_reason}")
-             sarcastic_comment = f"🗿 Ебало на картинке настолько стремное (блок: {response.prompt_feedback.block_reason}), что Gemini ослеп."
-        elif response.text:
-             sarcastic_comment = response.text.strip()
-             if not sarcastic_comment.startswith("🗿"): sarcastic_comment = "🗿 " + sarcastic_comment
+            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Ответ Gemini для картинки заблокирован: {block_reason}")
+            sarcastic_comment = f"🗿 Картинка настолько уебищна/запрещена, что Gemini ее заблокировал (Причина: {block_reason})."
+        elif response.candidates:
+             try:
+                 text_response = response.text; sarcastic_comment = text_response.strip()
+                 if not sarcastic_comment.startswith("🗿"): sarcastic_comment = "🗿 " + sarcastic_comment
+             except ValueError as e: logger.error(f"Ошибка доступа к response.text для картинки: {e}"); sarcastic_comment = "🗿 Gemini что-то высрал про картинку, но прочитать не могу."
+        else: logger.warning("Ответ Gemini по картинке пуст (нет кандидатов).")
 
-        # --- ОТПРАВКА ОТВЕТА И ЗАПИСЬ В БД ДЛЯ RETRY ---
+        # Страховочная обрезка
+        MAX_MESSAGE_LENGTH = 4096
+        if len(sarcastic_comment) > MAX_MESSAGE_LENGTH:
+            logger.warning(f"Ответ Gemini по картинке длинный ({len(sarcastic_comment)}), обрезаем!")
+            sarcastic_comment = sarcastic_comment[:MAX_MESSAGE_LENGTH - 3] + "..."
+
+        # Отправка и запись для /retry
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_comment)
         logger.info(f"Отправлен комментарий к картинке: '{sarcastic_comment[:50]}...'")
-
         if sent_message:
-            # Сохраняем инфу о последнем ответе для /retry
-            reply_doc = {
-                "chat_id": chat_id,
-                "message_id": sent_message.message_id,
-                "analysis_type": "pic", # Тип анализа
-                "source_file_id": image_file_id, # Сохраняем ID исходной картинки!
-                "timestamp": datetime.datetime.now(datetime.timezone.utc)
-            }
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: last_reply_collection.update_one(
-                        {"chat_id": chat_id}, {"$set": reply_doc}, upsert=True
-                    )
-                )
-                logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, pic, {image_file_id}) для /retry чата {chat_id}.")
-            except Exception as e:
-                 logger.error(f"Ошибка записи данных для /retry (pic) в MongoDB для чата {chat_id}: {e}", exc_info=True)
-        # --- КОНЕЦ ЗАПИСИ В БД ДЛЯ RETRY ---
+             reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "pic", "source_file_id": image_file_id, "timestamp": datetime.datetime.now(datetime.timezone.utc) }
+             try:
+                 loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+                 logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, pic, {image_file_id}) для /retry чата {chat_id}.")
+             except Exception as e: logger.error(f"Ошибка записи /retry (pic) в MongoDB: {e}", exc_info=True)
 
     except Exception as e:
         logger.error(f"ПИЗДЕЦ при анализе картинки через Gemini: {e}", exc_info=True)
@@ -716,16 +717,16 @@ async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             max_output_tokens=300, # Лимит для стиха
             temperature=0.8
         )
-        safety_settings={ # Снижаем цензуру
+        safety_settings={
             'HARM_CATEGORY_HARASSMENT': 'block_none',
             'HARM_CATEGORY_HATE_SPEECH': 'block_none',
             'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none',
+            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # <-- ПРАВИЛЬНЫЙ КЛЮЧ
         }
         response = await model.generate_content_async(
             poem_prompt,
             generation_config=generation_config,
-            safety_settings=safety_settings
+            safety_settings=safety_settings # Передаем исправленный словарь
         )
         # --->>> КОНЕЦ ЗАПРОСА <<<---
 
