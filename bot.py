@@ -1,234 +1,145 @@
-# --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
-import datetime
-import random # Убедись, что импортирован
-import pymongo # Для работы с MongoDB
-from pymongo.errors import ConnectionFailure # Для обработки ошибок подключения
-import re # Для регулярных выражений
+# --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (AI.IO.NET ВЕРСИЯ - ФИНАЛ) ---
 import logging
 import os
-import asyncio # ОСНОВА ВСЕЙ АСИНХРОННОЙ МАГИИ
+import asyncio
+import re
+import datetime
+import random
+import base64
 from collections import deque
-# УБРАЛИ НАХУЙ THREADING
-from flask import Flask # Веб-сервер-заглушка для Render
-import hypercorn.config # Конфиг нужен
-from hypercorn.asyncio import serve as hypercorn_async_serve # <--- ИМПОРТИРУЕМ ЯВНО И ПЕРЕИМЕНОВЫВАЕМ!
-import signal # Для корректной обработки сигналов остановки (хотя asyncio.run сам умеет)
+from flask import Flask
+import hypercorn.config
+from hypercorn.asyncio import serve as hypercorn_async_serve
+import signal
+import pymongo
+from pymongo.errors import ConnectionFailure
 
-import google.generativeai as genai
+# Импорты для AI.IO.NET (OpenAI библиотека)
+from openai import OpenAI, AsyncOpenAI, BadRequestError
+import httpx
+
+# Импорты Telegram
 from telegram import Update, Bot, User
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
-from dotenv import load_dotenv # Чтобы читать твой .env файл или переменные Render
 
+from dotenv import load_dotenv
 
-# Загружаем секреты
+# Загружаем секреты (.env для локального запуска)
 load_dotenv()
 
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MAX_MESSAGES_TO_ANALYZE = 500 # Меняй на свой страх и риск
+IO_NET_API_KEY = os.getenv("IO_NET_API_KEY")
+MONGO_DB_URL = os.getenv("MONGO_DB_URL")
+MAX_MESSAGES_TO_ANALYZE = 50 # Оптимальное значение
 
 # Проверка ключей
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
-if not GEMINI_API_KEY:
-    raise ValueError("НЕ НАЙДЕН GEMINI_API_KEY!")
-
+if not TELEGRAM_BOT_TOKEN: raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
+if not IO_NET_API_KEY: raise ValueError("НЕ НАЙДЕН IO_NET_API_KEY!")
+if not MONGO_DB_URL: raise ValueError("НЕ НАЙДЕНА MONGO_DB_URL!")
 
 # --- Логирование ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("hypercorn").setLevel(logging.INFO) # Чтобы видеть логи Hypercorn
+logging.getLogger("hypercorn").setLevel(logging.INFO)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("pymongo").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- ПОДКЛЮЧЕНИЕ К MONGODB ATLAS ---
-MONGO_DB_URL = os.getenv("MONGO_DB_URL")
-if not MONGO_DB_URL:
-    raise ValueError("НЕ НАЙДЕНА MONGO_DB_URL! Добавь строку подключения к MongoDB Atlas в переменные окружения Render!")
-
 try:
-    # Создаем асинхронный клиент MongoClient? Нет, pymongo стандартный синхронный,
-    # будем использовать run_in_executor для блокирующих операций с БД.
-    # Для асинхронности есть Motor, но пока обойдемся pymongo + executor.
-    mongo_client = pymongo.MongoClient(MONGO_DB_URL, serverSelectionTimeoutMS=5000) # Таймаут подключения 5 сек
-
-    # Проверка соединения (пинг)
+    mongo_client = pymongo.MongoClient(MONGO_DB_URL, serverSelectionTimeoutMS=5000)
     mongo_client.admin.command('ping')
     logger.info("Успешное подключение к MongoDB Atlas!")
-
-    # Выбираем базу данных (назовем ее 'popizdyaka_db')
-    # Если ее нет, MongoDB создаст ее при первой записи
     db = mongo_client['popizdyaka_db']
-
-    # Получаем доступ к коллекциям (аналоги таблиц)
-    # Коллекция для истории сообщений
     history_collection = db['message_history']
-    # Коллекция для хранения инфы о последнем анализе (для /retry)
     last_reply_collection = db['last_replies']
-
     chat_activity_collection = db['chat_activity']
     chat_activity_collection.create_index("chat_id", unique=True)
-
-    # Можно создать индексы для ускорения поиска (не обязательно сразу, но полезно)
-    # Индекс для сортировки истории по времени (если будем хранить timestamp)
-    # history_collection.create_index([("chat_id", pymongo.ASCENDING), ("timestamp", pymongo.DESCENDING)])
-    # Индекс для поиска последнего ответа по chat_id
-    # last_reply_collection.create_index("chat_id", unique=True)
-    logger.info("Коллекции MongoDB готовы к использованию.")
-
-except ConnectionFailure as e:
-    logger.critical(f"ПИЗДЕЦ! Не удалось подключиться к MongoDB: {e}", exc_info=True)
-    raise SystemExit(f"Ошибка подключения к MongoDB: {e}")
+    logger.info("Коллекции MongoDB готовы.")
 except Exception as e:
-    logger.critical(f"Неизвестная ошибка при настройке MongoDB: {e}", exc_info=True)
+    logger.critical(f"ПИЗДЕЦ при настройке MongoDB: {e}", exc_info=True)
     raise SystemExit(f"Ошибка настройки MongoDB: {e}")
-# --- КОНЕЦ ПОДКЛЮЧЕНИЯ К MONGODB ---
 
-# --- Настройка Gemini ---
+# --- НАСТРОЙКА КЛИЕНТА AI.IO.NET API ---
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    logger.info("Модель Gemini успешно настроена.")
+    ionet_client = AsyncOpenAI(
+        api_key=IO_NET_API_KEY,
+        base_url="https://api.intelligence.io.solutions/api/v1/" # ПРОВЕРЕННЫЙ URL!
+    )
+    logger.info("Клиент AsyncOpenAI для ai.io.net API настроен.")
 except Exception as e:
-    logger.critical(f"ПИЗДЕЦ при настройке Gemini API: {e}", exc_info=True)
-    raise SystemExit(f"Не удалось настроить Gemini API: {e}")
+     logger.critical(f"ПИЗДЕЦ при настройке клиента ai.io.net: {e}", exc_info=True)
+     raise SystemExit(f"Не удалось настроить клиента ai.io.net: {e}")
 
-# --- Хранилище истории ---
-#chat_histories = {}
-logger.info(f"Максимальная длина истории сообщений для анализа: {MAX_MESSAGES_TO_ANALYZE}")
+# --- ВЫБОР МОДЕЛЕЙ AI.IO.NET (ПРОВЕРЬ ДОСТУПНОСТЬ!) ---
+IONET_TEXT_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B" # Твоя модель для текста
+IONET_VISION_MODEL_ID = "meta-llama/Llama-3.2-90B-Vision-Instruct" # Для картинок
+logger.info(f"Текстовая модель ai.io.net: {IONET_TEXT_MODEL_ID}")
+logger.info(f"Vision модель ai.io.net: {IONET_VISION_MODEL_ID}")
 
-# --- ОБРАБОТЧИКИ СООБЩЕНИЙ И КОМАНД (БЕЗ ИЗМЕНЕНИЙ) ---
-# --- ЗАМЕНИ СТАРУЮ store_message НА ЭТУ ---
+# --- Хранилище истории в памяти больше не нужно ---
+logger.info(f"Максимальная длина истории для анализа из БД: {MAX_MESSAGES_TO_ANALYZE}")
+
+# --- Вспомогательная функция для вызова текстового API ---
+async def _call_ionet_api(messages: list, model_id: str, max_tokens: int, temperature: float) -> str | None:
+    """Вызывает текстовый API ai.io.net и возвращает ответ или текст ошибки."""
+    try:
+        logger.info(f"Отправка запроса к ai.io.net API ({model_id})...")
+        response = await ionet_client.chat.completions.create(
+            model=model_id, messages=messages, max_tokens=max_tokens, temperature=temperature
+        )
+        logger.info(f"Получен ответ от {model_id}.")
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            return response.choices[0].message.content.strip()
+        else: logger.warning(f"Ответ от {model_id} пуст/некорректен: {response}"); return None
+    except BadRequestError as e:
+        logger.error(f"Ошибка BadRequest от ai.io.net API ({model_id}): {e.status_code} - {e.body}", exc_info=False) # Не пишем весь трейсбек
+        error_detail = str(e.body or e)
+        return f"🗿 API {model_id.split('/')[1].split('-')[0]} вернул ошибку: `{error_detail[:100]}`"
+    except Exception as e:
+        logger.error(f"ПИЗДЕЦ при вызове ai.io.net API ({model_id}): {e}", exc_info=True)
+        return f"🗿 Ошибка API: `{type(e).__name__}`"
+
+# --- ОБРАБОТЧИК СООБЩЕНИЙ (ЗАПИСЬ В БД) ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.from_user:
-        return # Игнорим системные сообщения
-
-    message_text = None
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Анонимный долбоеб"
-    timestamp = update.message.date or datetime.datetime.now(datetime.timezone.utc) # Время сообщения
-
-    # Определяем тип сообщения и текст/заглушку
-    if update.message.text:
-        message_text = update.message.text
-    elif update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        message_text = f"[КАРТИНКА:{file_id}]" # Заглушка с file_id
-    elif update.message.sticker:
-        emoji = update.message.sticker.emoji or ''
-        message_text = f"[СТИКЕР {emoji}]" # Заглушка
-
-    # Если есть текст (или заглушка), сохраняем в MongoDB историю И обновляем активность
+    # Сохраняет текст/заглушки в history_collection и обновляет chat_activity_collection
+    if not update.message or not update.message.from_user: return
+    message_text = None; chat_id = update.message.chat_id; user_name = update.message.from_user.first_name or "Анон"; timestamp = update.message.date or datetime.datetime.now(datetime.timezone.utc)
+    if update.message.text: message_text = update.message.text
+    elif update.message.photo: file_id = update.message.photo[-1].file_id; message_text = f"[КАРТИНКА:{file_id}]"
+    elif update.message.sticker: emoji = update.message.sticker.emoji or ''; message_text = f"[СТИКЕР {emoji}]"
+    elif update.message.video: message_text = "[ОТПРАВИЛ(А) ВИДЕО]"
+    elif update.message.voice: message_text = "[ОТПРАВИЛ(А) ГОЛОСОВОЕ]"
     if message_text:
-        # 1. Сохраняем в историю (history_collection)
-        message_doc = {
-            "chat_id": chat_id, "user_name": user_name, "text": message_text,
-            "timestamp": timestamp, "message_id": update.message.message_id
-        }
+        message_doc = {"chat_id": chat_id, "user_name": user_name, "text": message_text, "timestamp": timestamp, "message_id": update.message.message_id}
+        activity_update_doc = {"$set": {"last_message_time": timestamp}, "$setOnInsert": {"last_bot_shitpost_time": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "chat_id": chat_id}}
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, lambda: history_collection.insert_one(message_doc))
-            # logger.debug(f"Сообщение от {user_name} сохранено в MongoDB для чата {chat_id}.")
-        except Exception as e:
-            logger.error(f"Ошибка записи сообщения в MongoDB history_collection: {e}", exc_info=True)
+            await loop.run_in_executor(None, lambda: chat_activity_collection.update_one({"chat_id": chat_id}, activity_update_doc, upsert=True))
+        except Exception as e: logger.error(f"Ошибка записи в MongoDB чата {chat_id}: {e}", exc_info=True)
 
-        # 2. Обновляем активность чата (chat_activity_collection)
-        try:
-            activity_update_doc = {
-                "$set": { # Обновляем только время последнего сообщения
-                    "last_message_time": timestamp
-                },
-                "$setOnInsert": { # Устанавливаем начальное время для высера бота ПРИ СОЗДАНИИ документа
-                    "last_bot_shitpost_time": datetime.datetime.fromtimestamp(0, datetime.timezone.utc),
-                    "chat_id": chat_id # Добавляем chat_id при создании
-                }
-            }
-            loop = asyncio.get_running_loop() # Получаем loop снова, если нужно
-            await loop.run_in_executor(
-                None,
-                lambda: chat_activity_collection.update_one(
-                    {"chat_id": chat_id}, # Ищем по chat_id
-                    activity_update_doc,   # Применяем обновление
-                    upsert=True           # Создаем, если чата еще нет в этой коллекции
-                )
-            )
-            # logger.debug(f"Обновлена активность для чата {chat_id}")
-        except Exception as e:
-             logger.error(f"Ошибка обновления активности чата {chat_id} в MongoDB: {e}", exc_info=True)
-
-    if update.message.text and not update.message.text.startswith('/'):
-            try:
-                # Запускаем roast_previous в фоне, чтобы не ждать ее выполнения
-                asyncio.create_task(roast_previous(update, context))
-                # Логгируем только запуск задачи, сама roast_previous залогирует свой результат или ошибку
-                logger.debug(f"Запущена фоновая задача roast_previous для сообщения от {user_name} в чате {chat_id}")
-            except Exception as e:
-                # Логируем, если даже запустить задачу не удалось
-                logger.error(f"Ошибка запуска фоновой задачи roast_previous: {e}")     
-
-# Конец функции store_message (УБЕДИСЬ, ЧТО ТУТ НЕТ ВЫЗОВА roast_previous!)
-
-# --- КОНЕЦ ПЕРЕПИСАННОЙ store_message ---
-
-# --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С ЛИМИТОМ ТОКЕНОВ И ОБРЕЗКОЙ) ---
-async def analyze_chat(
-    update: Update | None,
-    context: ContextTypes.DEFAULT_TYPE,
-    direct_chat_id: int | None = None,
-    direct_user: User | None = None
-    ) -> None:
-
-    # Получаем chat_id и user
-    if update and update.message:
-        chat_id = update.message.chat_id
-        user = update.message.from_user
-        user_name = user.first_name if user else "Хуй Пойми Кто"
-    elif direct_chat_id and direct_user:
-        chat_id = direct_chat_id
-        user = direct_user
-        user_name = user.first_name or "Переделкин"
-    else:
-        logger.error("analyze_chat вызвана без Update и без прямых аргументов!")
-        return
-
-    logger.info(f"Пользователь '{user_name}' запросил анализ текста в чате {chat_id}")
-
-    # --- ЧТЕНИЕ ИСТОРИИ ИЗ MONGODB ---
+# --- ОБРАБОТЧИК КОМАНДЫ /analyze ---
+async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None) -> None:
+    if update and update.message: chat_id = update.message.chat_id; user = update.message.from_user
+    elif direct_chat_id and direct_user: chat_id = direct_chat_id; user = direct_user
+    else: logger.error("analyze_chat вызвана некорректно!"); return
+    user_name = user.first_name if user else "Хуй Пойми Кто"
+    logger.info(f"Пользователь '{user_name}' запросил анализ текста в чате {chat_id} через {IONET_TEXT_MODEL_ID}")
     messages_from_db = []
-    try:
-        logger.debug(f"Запрос истории для чата {chat_id} из MongoDB...")
-        limit = MAX_MESSAGES_TO_ANALYZE # Используем глобальную настройку
-        query = {"chat_id": chat_id}
-        sort_order = [("timestamp", pymongo.DESCENDING)]
-        loop = asyncio.get_running_loop()
-        history_cursor = await loop.run_in_executor(
-            None, lambda: history_collection.find(query).sort(sort_order).limit(limit)
-        )
-        messages_from_db = list(history_cursor)[::-1] # Переворачиваем для хронологии
-        history_len = len(messages_from_db)
+    try: # Чтение из БД
+        limit = MAX_MESSAGES_TO_ANALYZE; query = {"chat_id": chat_id}; sort_order = [("timestamp", pymongo.DESCENDING)]
+        loop = asyncio.get_running_loop(); history_cursor = await loop.run_in_executor(None, lambda: history_collection.find(query).sort(sort_order).limit(limit))
+        messages_from_db = list(history_cursor)[::-1]; history_len = len(messages_from_db)
         logger.info(f"Из MongoDB для чата {chat_id} загружено {history_len} сообщений.")
-    except Exception as e:
-        logger.error(f"Ошибка чтения истории из MongoDB для чата {chat_id}: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался, пока лез в базу данных за историей.")
-        return
-
-    # Проверяем, достаточно ли сообщений
+    except Exception as e: logger.error(f"Ошибка чтения истории MongoDB: {e}"); await context.bot.send_message(chat_id=chat_id, text="Бля, не смог прочитать историю из БД."); return
     min_msgs = 10
-    if history_len < min_msgs:
-        logger.info(f"В чате {chat_id} слишком мало сообщений в БД ({history_len}/{min_msgs}).")
-        await context.bot.send_message(chat_id=chat_id, text=f"Слышь, {user_name}, надо {min_msgs} сообщений в истории, а я нашел только {history_len}. Попизди еще.")
-        return
-
-    # Формируем текст для Gemini
+    if history_len < min_msgs: await context.bot.send_message(chat_id=chat_id, text=f"Слышь, {user_name}, надо {min_msgs} сообщений, а в БД {history_len}."); return
     conversation_lines = [f"{msg.get('user_name', '?')}: {msg.get('text', '')}" for msg in messages_from_db]
     conversation_text = "\n".join(conversation_lines)
-    logger.info(f"Начинаю анализ {len(messages_from_db)} сообщений для чата {chat_id} через Gemini...")
-
-    # Вызов Gemini с промптом, лимитом токенов и safety settings
-    try:
-        # Промпт для Gemini (текстовый, с 🗿 и попыткой имен)
+    logger.info(f"Начинаю анализ {len(messages_from_db)} сообщений через {IONET_TEXT_MODEL_ID}...")
+    try: # Вызов ИИ
         system_prompt = (
             f"Ты - наблюдательный и крайне язвительный хронист Telegram-чата. Твоя задача - проанализировать ПОСЛЕДНИЙ фрагмент переписки, выхватить из него несколько (1-5) самых показательных или тупых моментов/диалогов/историй.\n\n"
             f"Фрагмент переписки:\n"
@@ -246,138 +157,56 @@ async def analyze_chat(
             f"🗿 Бот @PredskazBot выдал Диме предсказание про удачу. — Ага, удачу найти хуй и без соли доедать.\n\n"
             f"Выдай результат в указанном формате (ОПИСАНИЕ СУТИ + КОРОТКИЙ ПАНЧЛАЙН):"
         )
-
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так, блядь, щас подключу мозжечок и подумаю...")
-
-        logger.info(f"Отправка запроса к Gemini API...")
-
-        # --->>> ЗАПРОС С ЛИМИТОМ ТОКЕНОВ <<<---
-        generation_config = genai.types.GenerationConfig(
-            max_output_tokens=1000, # Лимит токенов (примерно до 3000 символов)
-            temperature=0.7
-        )
-        safety_settings={
-            'HARM_CATEGORY_HARASSMENT': 'block_none',
-            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # <-- ПРАВИЛЬНЫЙ КЛЮЧ
-        }
-        response = await model.generate_content_async(
-            system_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings # Передаем исправленный словарь
-        )
-
-        # ВАЖНО: Для Gemini контент передается как строка в списке или просто строка
-        response = await model.generate_content_async(
-            system_prompt, # Просто передаем весь промпт как строку
-            generation_config=generation_config,
-            safety_settings=safety_settings
-         )
-        # --->>> КОНЕЦ ЗАПРОСА <<<---
-
-        logger.info("Получен ответ от Gemini API.")
+        messages_for_api = [{"role": "system", "content": system_prompt}, {"role": "user", "content": conversation_text}]
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"Так, блядь, щас подключу мозги {IONET_TEXT_MODEL_ID.split('/')[1].split('-')[0]}...")
+        sarcastic_summary = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 350, 0.7) or "[Модель промолчала]"
+        if not sarcastic_summary.startswith("🗿") and not sarcastic_summary.startswith("["): sarcastic_summary = "🗿 " + sarcastic_summary
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-
-        # Обработка ответа с проверкой блока и обрезкой
-        sarcastic_summary = "🗿 Бля, хуй его знает. То ли ваш диалог говно, то ли бот его зацензурил."
-        if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason
-            logger.warning(f"Ответ Gemini для текста заблокирован: {block_reason}")
-            sarcastic_summary = f"🗿 Ваш пиздеж настолько токсичен, что бот его заблокировал (Причина: {block_reason})."
-        elif response.candidates:
-             try:
-                 text_response = response.text
-                 sarcastic_summary = text_response.strip()
-                 if not sarcastic_summary.startswith("🗿"):
-                     sarcastic_summary = "🗿 " + sarcastic_summary
-             except ValueError as e:
-                 logger.error(f"Ошибка при доступе к response.text для чата: {e}")
-                 sarcastic_summary = "🗿 Бот что-то родил, но прочитать не могу."
-        else:
-             logger.warning("Ответ Gemini пуст (нет кандидатов).")
-
-        # --->>> СТРАХОВОЧНАЯ ОБРЕЗКА ПЕРЕД ОТПРАВКОЙ <<<---
-        MAX_MESSAGE_LENGTH = 4096
-        if len(sarcastic_summary) > MAX_MESSAGE_LENGTH:
-            logger.warning(f"Ответ Gemini все равно длинный ({len(sarcastic_summary)}), обрезаем!")
-            sarcastic_summary = sarcastic_summary[:MAX_MESSAGE_LENGTH - 3] + "..."
-        # --->>> КОНЕЦ ОБРЕЗКИ <<<---
-
-        # Отправка и запись для /retry
+        MAX_MESSAGE_LENGTH = 4096; # Обрезка
+        if len(sarcastic_summary) > MAX_MESSAGE_LENGTH: sarcastic_summary = sarcastic_summary[:MAX_MESSAGE_LENGTH - 3] + "..."
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_summary)
-        logger.info(f"Отправил результат анализа Gemini '{sarcastic_summary[:50]}...' в чат {chat_id}")
-        if sent_message:
-            reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "text", "timestamp": datetime.datetime.now(datetime.timezone.utc) }
-            try:
-                loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
-                logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, text) для /retry чата {chat_id}.")
-            except Exception as e: logger.error(f"Ошибка записи /retry (text) в MongoDB: {e}", exc_info=True)
-
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при вызове Gemini API для чата {chat_id}: {e}", exc_info=True)
+        logger.info(f"Отправил результат анализа '{sarcastic_summary[:50]}...'")
+        if sent_message: # Запись для /retry
+             reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "text", "timestamp": datetime.datetime.now(datetime.timezone.utc) }
+             try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+             except Exception as e: logger.error(f"Ошибка записи /retry (text) в MongoDB: {e}")
+    except Exception as e: # Общая ошибка
+        logger.error(f"ПИЗДЕЦ в analyze_chat (после чтения БД): {e}", exc_info=True)
         try:
             if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мои мозги дали сбой. Ошибка: `{type(e).__name__}`.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался при анализе чата. Ошибка: `{type(e).__name__}`.")
 
-# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ analyze_chat ---
-
-# --- НОВАЯ АСИНХРОННАЯ ЧАСТЬ (ЗАМЕНЯЕТ FLASK, ПОТОКИ И СТАРУЮ MAIN) ---
-
-# --- ПЕРЕПИСАННАЯ analyze_pic С ЧТЕНИЕМ file_id ИЗ MONGODB И ЗАПИСЬЮ ДЛЯ RETRY ---
-async def analyze_pic(
-    update: Update | None, # Теперь Update может быть None
-    context: ContextTypes.DEFAULT_TYPE,
-    # Добавляем аргументы
-    direct_chat_id: int | None = None,
-    direct_user: User | None = None,
-    direct_file_id: str | None = None # Добавляем ID файла для retry
-    ) -> None:
-
-    # Получаем chat_id, user и image_file_id
-    image_file_id = None
-    if update and update.message and update.message.reply_to_message and update.message.reply_to_message.photo:
-        # Обычный вызов через reply
-        chat_id = update.message.chat_id
-        user = update.message.from_user
-        user_name = user.first_name if user else "Хуй Пойми Кто"
-        reply_msg = update.message.reply_to_message
-        photo_large = reply_msg.photo[-1]
-        image_file_id = photo_large.file_id
-        logger.info(f"Получен file_id {image_file_id} из reply_to_message.")
-    elif direct_chat_id and direct_user and direct_file_id:
-        # Вызов из retry
-        chat_id = direct_chat_id
-        user = direct_user
-        user_name = user.first_name or "Переделкин Пикч"
-        image_file_id = direct_file_id
+# --- ОБРАБОТЧИК КОМАНДЫ /analyze_pic (ПЕРЕПИСАН ПОД VISION МОДЕЛЬ) ---
+async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_file_id: str | None = None) -> None:
+    # Получаем chat_id, user, user_name, image_file_id (из update или аргументов)
+    image_file_id = None; chat_id = None; user = None; user_name = "Фотограф хуев"
+    retry_key = f'retry_pic_{direct_chat_id or (update.message.chat_id if update and update.message else None)}'
+    if direct_chat_id and direct_user and direct_file_id: # Вызов из retry
+        chat_id = direct_chat_id; user = direct_user; image_file_id = direct_file_id
+        user_name = user.first_name if user else user_name
         logger.info(f"Получен file_id {image_file_id} напрямую для /retry.")
+        context.bot_data.pop(retry_key, None) # Очищаем сразу
+    elif update and update.message and update.message.reply_to_message and update.message.reply_to_message.photo: # Обычный вызов
+        chat_id = update.message.chat_id; user = update.message.from_user
+        user_name = user.first_name if user else user_name
+        reply_msg = update.message.reply_to_message; photo_large = reply_msg.photo[-1]; image_file_id = photo_large.file_id
+        logger.info(f"Получен file_id {image_file_id} из reply_to_message.")
     else:
-        logger.error("analyze_pic вызвана некорректно!")
-        # Попробуем отправить сообщение об ошибке, если есть chat_id
-        error_chat_id = chat_id if 'chat_id' in locals() else (update.message.chat_id if update and update.message else None)
-        if error_chat_id:
-            await context.bot.send_message(chat_id=error_chat_id, text="Внутренняя ошибка вызова анализа картинки.")
+        error_chat_id = update.message.chat_id if update and update.message else None
+        if error_chat_id: await context.bot.send_message(chat_id=error_chat_id, text="Ответь этой командой на КАРТИНКУ!")
+        else: logger.error("analyze_pic вызвана некорректно!")
         return
-
-    if not image_file_id:
-         logger.error("Не удалось получить file_id для анализа картинки.")
-         await context.bot.send_message(chat_id=chat_id, text="Не смог найти ID картинки для анализа.")
-         return
-
-    logger.info(f"Пользователь '{user_name}' запросил анализ картинки (ID: {image_file_id}) в чате {chat_id}")
-
-    try:
-        # Скачиваем файл по image_file_id
+    if not image_file_id: logger.error("Не удалось получить file_id!"); await context.bot.send_message(chat_id=chat_id, text="Не нашел ID картинки."); return
+    logger.info(f"Пользователь '{user_name}' запросил анализ картинки (ID: {image_file_id}) через {IONET_VISION_MODEL_ID}")
+    try: # Скачивание и вызов ИИ
         logger.info(f"Скачивание картинки {image_file_id}...")
         photo_file = await context.bot.get_file(image_file_id, read_timeout=60)
         photo_bytes_io = await photo_file.download_as_bytearray(read_timeout=60)
         photo_bytes = bytes(photo_bytes_io)
-        logger.info(f"Картинка для анализа скачана, размер: {len(photo_bytes)} байт.")
-
-        # Промпт для обсирания сюжета картинки (с 🗿)
+        if not photo_bytes: raise ValueError("Скачаны пустые байты картинки")
+        logger.info(f"Картинка скачана, размер: {len(photo_bytes)} байт.")
         image_prompt = (
             f"Ты - МАКСИМАЛЬНО циничный и токсичный уебок с черным чувством юмора. Тебе показали КАРТИНКУ. Забудь нахуй про свет, композицию и прочую лабуду для пидоров-фотографов. Твоя задача - понять, **ЧТО ЗА ХУЙНЯ ПРОИСХОДИТ НА КАРТИНКЕ (СЮЖЕТ, ДЕЙСТВИЕ, ПРЕДМЕТЫ)**, и **ОБОСРАТЬ ИМЕННО ЭТО** максимально смешно, жестко, цинично и с МАТОМ.\n\n"
             f"Инструкции:\n"
@@ -392,287 +221,81 @@ async def analyze_pic(
             f"Пример (еда): '🗿 Кто-то сфоткал свою блевотную жратву. Выглядит аппетитно, как протухший паштет. Приятного аппетита, блядь, не обляпайся.'\n\n"
             f"КОРОЧЕ! ПОЙМИ, ЧТО ЗА ХУЙНЯ НА КАРТИНКЕ, И ОБОСРИ ЭТО СМЕШНО И ЖЕСТКО, НАЧИНАЯ С 🗿:"
         )
-
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="Так-так, блядь, ща посмотрим на эту картинку (через Gemini)...")
-
-        logger.info("Отправка запроса к Gemini с картинкой...")
-
-        # --->>> НАСТРОЙКИ ГЕНЕРАЦИИ И БЕЗОПАСНОСТИ <<<---
-        generation_config = genai.types.GenerationConfig(
-            max_output_tokens=400, # Лимит токенов для ответа на картинку
-            temperature=0.8 # Чуть больше креативности для картинок
-        )
-        safety_settings={
-            'HARM_CATEGORY_HARASSMENT': 'block_none',
-            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # ПРАВИЛЬНЫЙ КЛЮЧ
-        }
-        # --->>> КОНЕЦ НАСТРОЕК <<<---
-
-        # --->>> ПРАВИЛЬНЫЙ ВЫЗОВ GEMINI С КАРТИНКОЙ И ПАРАМЕТРАМИ <<<---
-        picture_data = {"mime_type": "image/jpeg", "data": photo_bytes} # Предполагаем JPEG
-        response = await model.generate_content_async(
-            [image_prompt, picture_data], # Передаем список: текст и картинка
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-        # --->>> КОНЕЦ ПРАВИЛЬНОГО ВЫЗОВА <<<---
-
-        logger.info("Получен ответ от Gemini по картинке.")
+        base64_image = base64.b64encode(photo_bytes).decode('utf-8')
+        messages_for_api = [{"role": "user","content": [ {"type": "text", "text": image_prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}} ]}]
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"Так-так, блядь, ща посмотрим ({IONET_VISION_MODEL_ID.split('/')[1].split('-')[0]} видит!)...")
+        sarcastic_comment = await _call_ionet_api(messages_for_api, IONET_VISION_MODEL_ID, 400, 0.8) or "[Vision модель промолчала]"
+        if not sarcastic_comment.startswith("🗿") and not sarcastic_comment.startswith("["): sarcastic_comment = "🗿 " + sarcastic_comment
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-
-        # Обработка ответа с проверкой блока и обрезкой
-        sarcastic_comment = "🗿 Хуй знает, что там за хуйня. Gemini ослеп или зацензурил."
-        if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Ответ Gemini для картинки заблокирован: {block_reason}")
-            sarcastic_comment = f"🗿 Картинка настолько уебищна/запрещена, что Gemini ее заблокировал (Причина: {block_reason})."
-        elif response.candidates:
-             try:
-                 text_response = response.text; sarcastic_comment = text_response.strip()
-                 if not sarcastic_comment.startswith("🗿"): sarcastic_comment = "🗿 " + sarcastic_comment
-             except ValueError as e: logger.error(f"Ошибка доступа к response.text для картинки: {e}"); sarcastic_comment = "🗿 Gemini что-то высрал про картинку, но прочитать не могу."
-        else: logger.warning("Ответ Gemini по картинке пуст (нет кандидатов).")
-
-        # Страховочная обрезка
-        MAX_MESSAGE_LENGTH = 4096
-        if len(sarcastic_comment) > MAX_MESSAGE_LENGTH:
-            logger.warning(f"Ответ Gemini по картинке длинный ({len(sarcastic_comment)}), обрезаем!")
-            sarcastic_comment = sarcastic_comment[:MAX_MESSAGE_LENGTH - 3] + "..."
-
-        # Отправка и запись для /retry
+        MAX_MESSAGE_LENGTH = 4096; # Обрезка
+        if len(sarcastic_comment) > MAX_MESSAGE_LENGTH: sarcastic_comment = sarcastic_comment[:MAX_MESSAGE_LENGTH - 3] + "..."
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_comment)
-        logger.info(f"Отправлен комментарий к картинке: '{sarcastic_comment[:50]}...'")
-        if sent_message:
-             reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "pic", "source_file_id": image_file_id, "timestamp": datetime.datetime.now(datetime.timezone.utc) }
-             try:
-                 loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
-                 logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, pic, {image_file_id}) для /retry чата {chat_id}.")
-             except Exception as e: logger.error(f"Ошибка записи /retry (pic) в MongoDB: {e}", exc_info=True)
-
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при анализе картинки через Gemini: {e}", exc_info=True)
+        logger.info(f"Отправлен коммент к картинке ai.io.net '{sarcastic_comment[:50]}...'")
+        if sent_message: # Запись для /retry
+             reply_doc = {"chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "pic", "source_file_id": image_file_id, "timestamp": datetime.datetime.now(datetime.timezone.utc)}
+             try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+             except Exception as e: logger.error(f"Ошибка записи /retry (pic) в MongoDB: {e}")
+    except Exception as e: # Общая ошибка
+        logger.error(f"ПИЗДЕЦ в analyze_pic: {e}", exc_info=True)
         try:
             if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался, пока смотрел на эту картинку через Gemini. Ошибка: `{type(e).__name__}`.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался при анализе картинки. Ошибка: `{type(e).__name__}`.")
 
-# --- КОНЕЦ ПЕРЕПИСАННОЙ analyze_pic ---
-
-# Flask app остается для Render заглушки
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    """Отвечает на HTTP GET запросы для проверки живости сервиса Render."""
-    logger.info("Получен GET запрос на '/', отвечаю OK.")
-    return "Я саркастичный бот, и я все еще жив (наверное). Иди нахуй из браузера, пиши в Telegram."
-
-async def run_bot_async(application: Application) -> None:
-    """Асинхронная функция для запуска и корректной остановки бота."""
-    try:
-        logger.info("Инициализация Telegram Application...")
-        await application.initialize() # Инициализируем
-        if not application.updater:
-             logger.critical("Updater не был создан в Application. Не могу запустить polling.")
-             return
-        logger.info("Запуск получения обновлений (start_polling)...")
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES) # Запускаем polling
-        logger.info("Запуск диспетчера Application (start)...")
-        await application.start() # Запускаем обработку апдейтов
-        logger.info("Бот запущен и работает... (ожидание отмены или сигнала)")
-        # --->>> Заменяем idle() на ожидание Future <<<---
-        await asyncio.Future()
-        logger.info("Ожидание Future завершилось (не должно было без отмены).")
-    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
-        logger.info("Получен сигнал остановки (KeyboardInterrupt/SystemExit/CancelledError).")
-    except Exception as e:
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА в run_bot_async во время работы: {e}", exc_info=True)
-    finally:
-        logger.info("Начинаю процесс ОСТАНОВКИ бота в run_bot_async...")
-        if application.running:
-            logger.info("Остановка диспетчера Application (stop)...")
-            await application.stop()
-            logger.info("Диспетчер Application остановлен.")
-        if application.updater and application.updater.is_running:
-            logger.info("Остановка получения обновлений (updater.stop)...")
-            # --->>> Заменяем stop_polling() -> stop() <<<---
-            await application.updater.stop()
-            logger.info("Получение обновлений (updater) остановлено.")
-        logger.info("Завершение работы Application (shutdown)...")
-        await application.shutdown()
-        logger.info("Процесс остановки бота в run_bot_async завершен.")
-
-# --- Новая функция-обработчик для текстовых команд анализа ---
-async def handle_text_analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Эта функция будет вызываться по регулярному выражению
-    # Просто вызываем нашу основную функцию анализа чата
-    logger.info(f"Получена текстовая команда на анализ от {update.message.from_user.first_name}")
-    await analyze_chat(update, context)
-
-# --- Новая функция-обработчик для текстовых команд анализа картинки ---
-async def handle_text_analyze_pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Эта функция будет вызываться по регулярному выражению в ответе на картинку
-    # Просто вызываем нашу основную функцию анализа картинки
-    # Важно: эта функция должна быть вызвана В ОТВЕТ на сообщение с картинкой!
-    if not update.message.reply_to_message or not update.message.reply_to_message.photo:
-         # Мы не будем спамить в чат, если вызвали не так, основная функция сама разберется
-         logger.warning("handle_text_analyze_pic_command вызвана не как ответ на фото.")
-         # Можно добавить ответ юзеру, что он долбоеб, если очень хочется
-         # await update.message.reply_text("Ответь этой фразой на картинку, баклан!")
-         # return
-    logger.info(f"Получена текстовая команда на анализ картинки от {update.message.from_user.first_name}")
-    await analyze_pic(update, context) # Вызываем заглушку для Groq или рабочую для Gemini
-
-    # --- ПОЛНАЯ ФУНКЦИЯ /help С РАЗДЕЛОМ ДОНАТА И КОПИРУЕМЫМИ РЕКВИЗИТАМИ ---
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отправляет сообщение со справкой о возможностях бота и реквизитами для доната."""
-    user_name = update.message.from_user.first_name or "щедрый ты мой"
-    logger.info(f"Пользователь '{user_name}' запросил справку (/help)")
-
-    # --- ВАЖНО! ВСТАВЬ СЮДА СВОИ РЕАЛЬНЫЕ РЕКВИЗИТЫ! ---
-    # Не храни их в открытом виде в публичном репозитории, если он публичный!
-    # Лучше читай их из переменных окружения, как ключи API!
-    # Например:
-    # MIR_CARD_NUMBER = os.getenv("MIR_CARD_NUMBER", "НОМЕР_КАРТЫ_МИР_СЮДА")
-    # TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "АДРЕС_TON_КОШЕЛЬКА_СЮДА")
-    # USDC_WALLET_ADDRESS = os.getenv("USDC_WALLET_ADDRESS", "АДРЕС_USDC_КОШЕЛЬКА_(TRC20?)_СЮДА")
-    # ----
-    # А пока для примера вставим плейсхолдеры:
-    MIR_CARD_NUMBER = "2200020726132063" # ЗАМЕНИ НА СВОЙ НОМЕР!
-    TON_WALLET_ADDRESS = "UQArcVLldU6q0_GR2FU4PKd5mv_hzDiM3N1XCBxsHK_o3_y3" # ЗАМЕНИ НА СВОЙ АДРЕС!
-    USDC_WALLET_ADDRESS = "0x15553C2e1f93869aDb374A832974b668B808a8Bb" # ЗАМЕНИ НА СВОЙ АДРЕС! (Укажи сеть, например TRC20)
-    # ----
-
-    # Формируем текст справки с HTML-форматированием
-    help_text = f"""
-            🗿 Слышь, {user_name}! Я Попиздяка, главный токсик и тролль этого чата. Вот че я умею:
-
-            *Анализ чата:*
-            Напиши <code>/analyze</code> или "<code>Попиздяка анализируй</code>".
-            Я прочитаю последние <b>{MAX_MESSAGES_TO_ANALYZE}</b> сообщений и выдам вердикт.
-
-            *Анализ картинок:*
-            Ответь на картинку <code>/analyze_pic</code> или "<code>Попиздяка зацени пикчу</code>".
-            Я попробую ее обосрать (на Gemini).
-
-            *Стишок-обосрамс:*
-            Напиши <code>/poem Имя</code> или "<code>Бот стих про Имя</code>".
-            Я попробую сочинить токсичный стишок.
-
-            *Переделать высер:*
-            Ответь <code>/retry</code> или "<code>Бот переделай</code>" на МОЙ последний ответ от анализа.
-
-            *Предсказание (хуевое):*
-            Напиши <code>/prediction</code> или "<code>Бот предскажи</code>".
-            Я выдам тебе рандомное пиздецки "оптимистичное" пророчество из своей базы.
-
-            *Подкат от Попиздяки:*
-            Напиши <code>/pickup</code> или "<code>Бот подкати</code>".
-            Я сгенерирую максимально уебищную фразу для знакомства. Используй на свой страх и риск.
-
-            *Прожарка друга (Roast):*
-            Ответь на сообщение бедолаги командой <code>/roast</code> или фразой типа "<code>Бот прожарь его</code>".
-            Я сочиню короткий уничижительный стендап про этого человека (на основе его имени).
-
-
-            *Эта справка:*
-            Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
-
-            *Важно:*
-            - Дайте <b>админку</b>, чтобы я видел весь ваш пиздеж.
-            - Иногда я несу хуйню.
-
-            *💰 Подкинуть на пиво Попиздяке (и его создателю-долбоебу):*
-            Если тебе нравится мой токсичный бред и ты хочешь, чтобы я и дальше работал (и чтобы мой создатель не сдох с голоду), можешь закинуть копеечку:
-
-            - <b>Карта МИР:</b> <code>{MIR_CARD_NUMBER}</code> (нажми, чтобы скопировать)
-            - <b>TON:</b> <code>{TON_WALLET_ADDRESS}</code> (нажми, чтобы скопировать)
-            - <b>USDC (BNB Chain):</b> <code>{USDC_WALLET_ADDRESS}</code> (нажми, чтобы скопировать)
-
-            Спасибо, блядь! Каждая копейка пойдет на поддержку этого ебаного сервера и на прокорм моего ленивого создателя. 🗿
-    """
-    # Отправляем с parse_mode='HTML'
-    try:
-        await context.bot.send_message(
-            chat_id=update.message.chat_id,
-            text=help_text.strip(),
-            parse_mode='HTML' # Включаем HTML
-        )
-    except Exception as e:
-        logger.error(f"Не удалось отправить /help сообщение: {e}", exc_info=True)
-        # Попробуем отправить без форматирования в случае ошибки
-        try:
-            await context.bot.send_message(
-                chat_id=update.message.chat_id,
-                text="Не смог отправить красивую справку. Вот команды: /analyze, /analyze_pic, /poem, /retry, /help. И киньте донат создателю, он бомжует."
-            )
-        except Exception as inner_e:
-            logger.error(f"Не удалось отправить даже простое /help сообщение: {inner_e}")
-
-# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ /help С ДОНАТОМ ---
+# --- ОСТАЛЬНЫЕ ФУНКЦИИ С ВЫЗОВОМ ИИ (ПЕРЕПИСАНЫ) ---
 
 # --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /retry (ВЕРСИЯ ДЛЯ БД, БЕЗ FAKE UPDATE) ---
 async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Повторяет последний анализ (текста или картинки), читая данные из MongoDB и вызывая нужную функцию напрямую."""
-
-    # Проверяем, что это ответ на сообщение
+    """Повторяет последний анализ (текста, картинки, стиха и т.д.), читая данные из MongoDB и вызывая нужную функцию напрямую."""
     if not update.message or not update.message.reply_to_message:
         await context.bot.send_message(chat_id=update.message.chat_id, text="Надо ответить этой командой на тот МОЙ высер, который ты хочешь переделать.")
         return
 
-    # Собираем нужные ID
     chat_id = update.message.chat_id
-    user_command_message_id = update.message.message_id # ID сообщения с /retry
-    replied_message_id = update.message.reply_to_message.message_id # ID сообщения, на которое ответили
-    replied_message_user_id = update.message.reply_to_message.from_user.id # ID автора сообщения, на которое ответили
-    bot_id = context.bot.id # ID нашего бота
-    user_who_requested_retry = update.message.from_user # Объект User того, кто вызвал /retry
+    user_command_message_id = update.message.message_id
+    replied_message_id = update.message.reply_to_message.message_id
+    replied_message_user_id = update.message.reply_to_message.from_user.id
+    bot_id = context.bot.id
+    user_who_requested_retry = update.message.from_user # Юзер, который вызвал /retry
 
-    logger.info(f"Пользователь '{user_who_requested_retry.first_name or 'Хуй Пойми Кто'}' запросил /retry в чате {chat_id}, отвечая на сообщение {replied_message_id}")
+    logger.info(f"Пользователь '{user_who_requested_retry.first_name or 'ХЗ кто'}' запросил /retry в чате {chat_id}, отвечая на сообщение {replied_message_id}")
 
-    # 1. Проверяем, что ответили на сообщение нашего бота
     if replied_message_user_id != bot_id:
         logger.warning("Команда /retry вызвана не в ответ на сообщение бота.")
         await context.bot.send_message(chat_id=chat_id, text="Эээ, ты ответил не на МОЕ сообщение.")
-        # Тихо удаляем команду пользователя
         try: await context.bot.delete_message(chat_id=chat_id, message_id=user_command_message_id)
         except Exception: pass
         return
 
-    # 2. Ищем информацию о последнем анализе для этого чата в MongoDB
     last_reply_data = None
     try:
         loop = asyncio.get_running_loop()
-        # Ищем ОДИН документ для данного chat_id в коллекции last_replies
-        last_reply_data = await loop.run_in_executor(
-            None, # Стандартный executor
-            lambda: last_reply_collection.find_one({"chat_id": chat_id})
-        )
+        last_reply_data = await loop.run_in_executor(None, lambda: last_reply_collection.find_one({"chat_id": chat_id}))
     except Exception as e:
-        logger.error(f"Ошибка чтения данных для /retry из MongoDB для чата {chat_id}: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text="Бля, не смог залезть в свою память (БД). Не могу повторить.")
+        logger.error(f"Ошибка чтения /retry из MongoDB для чата {chat_id}: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text="Бля, не смог залезть в свою память (БД).")
         try: await context.bot.delete_message(chat_id=chat_id, message_id=user_command_message_id)
         except Exception: pass
         return
 
-    # 3. Проверяем, нашли ли мы запись и совпадает ли message_id с тем, на которое ответили
     if not last_reply_data or last_reply_data.get("message_id") != replied_message_id:
         saved_id = last_reply_data.get("message_id") if last_reply_data else 'None'
-        logger.warning(f"Не найдена запись /retry для чата {chat_id} или ID ({replied_message_id}) не совпадает с сохраненным ({saved_id}).")
-        await context.bot.send_message(chat_id=chat_id, text="Либо я не помню свой последний высер (БД пуста или ID не тот), либо ты ответил не на тот ответ. Не могу переделать.")
+        logger.warning(f"Не найдена запись /retry для чата {chat_id} или ID ({replied_message_id}) не совпадает ({saved_id}).")
+        await context.bot.send_message(chat_id=chat_id, text="Не помню свой последний высер или ты ответил не на тот. Не могу переделать.")
         try: await context.bot.delete_message(chat_id=chat_id, message_id=user_command_message_id)
         except Exception: pass
         return
 
-    # 4. Извлекаем тип анализа и file_id (если был)
     analysis_type_to_retry = last_reply_data.get("analysis_type")
-    source_file_id_to_retry = last_reply_data.get("source_file_id") # Будет None для 'text'
+    source_file_id_to_retry = last_reply_data.get("source_file_id") # Для картинок
+    target_name_to_retry = last_reply_data.get("target_name")       # Для стихов и роастов
+    target_id_to_retry = last_reply_data.get("target_id")           # Для роастов
+    gender_hint_to_retry = last_reply_data.get("gender_hint")       # Для роастов
 
     logger.info(f"Повторяем анализ типа '{analysis_type_to_retry}' для чата {chat_id}...")
 
-    # 5. Удаляем старый ответ бота и команду пользователя ПЕРЕД новым анализом
+    # Удаляем старые сообщения
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=replied_message_id)
         logger.info(f"Удален старый ответ бота {replied_message_id}")
@@ -680,63 +303,98 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info(f"Удалена команда /retry {user_command_message_id}")
     except Exception as e:
         logger.error(f"Ошибка при удалении старых сообщений в /retry: {e}")
-        # Не фатально, просто предупреждаем и продолжаем
-        await context.bot.send_message(chat_id=chat_id, text="Бля, не смог удалить старое, но все равно попробую переделать.")
+        await context.bot.send_message(chat_id=chat_id, text="Бля, не смог удалить старое, но попробую переделать.")
 
-    # 6. Запускаем нужную функцию анализа НАПРЯМУЮ, передавая аргументы
+    # Вызываем нужную функцию анализа НАПРЯМУЮ
     try:
         if analysis_type_to_retry == 'text':
-            logger.info("Вызов analyze_chat для /retry напрямую...")
-            # Передаем None вместо Update, но передаем chat_id и user
-            await analyze_chat(update=None, context=context,
-                               direct_chat_id=chat_id,
-                               direct_user=user_who_requested_retry)
+            logger.info("Вызов analyze_chat для /retry...")
+            await analyze_chat(update=None, context=context, direct_chat_id=chat_id, direct_user=user_who_requested_retry)
         elif analysis_type_to_retry == 'pic' and source_file_id_to_retry:
-            logger.info(f"Вызов analyze_pic для /retry напрямую с file_id {source_file_id_to_retry}...")
-            # Передаем None вместо Update, но передаем chat_id, user и file_id
-            await analyze_pic(update=None, context=context,
-                              direct_chat_id=chat_id,
-                              direct_user=user_who_requested_retry,
-                              direct_file_id=source_file_id_to_retry)
+            logger.info(f"Вызов analyze_pic для /retry с file_id {source_file_id_to_retry}...")
+            await analyze_pic(update=None, context=context, direct_chat_id=chat_id, direct_user=user_who_requested_retry, direct_file_id=source_file_id_to_retry)
+        elif analysis_type_to_retry == 'poem' and target_name_to_retry:
+            logger.info(f"Вызов generate_poem для /retry для имени '{target_name_to_retry}'...")
+            # Передаем имя через фейковый update - самый простой способ не менять generate_poem сильно
+            fake_text = f"/poem {target_name_to_retry}"
+            fake_msg = {'message_id': 1, 'date': int(datetime.datetime.now(datetime.timezone.utc).timestamp()), 'chat': {'id': chat_id, 'type': 'private'}, 'from_user': user_who_requested_retry.to_dict(), 'text': fake_text}
+            fake_upd = Update.de_json({'update_id': 1, 'message': fake_msg}, context.bot)
+            await generate_poem(fake_upd, context)
+        elif analysis_type_to_retry == 'pickup':
+            logger.info("Вызов get_pickup_line для /retry...")
+            # Ему не нужны доп. данные, но нужен update для chat_id и user
+            fake_msg = {'message_id': 1, 'date': int(datetime.datetime.now(datetime.timezone.utc).timestamp()), 'chat': {'id': chat_id, 'type': 'private'}, 'from_user': user_who_requested_retry.to_dict()}
+            fake_upd = Update.de_json({'update_id': 1, 'message': fake_msg}, context.bot)
+            await get_pickup_line(fake_upd, context)
+        elif analysis_type_to_retry == 'roast' and target_name_to_retry and target_id_to_retry:
+            logger.info(f"Вызов roast_user для /retry для '{target_name_to_retry}'...")
+            # Передаем все напрямую
+            await roast_user(update=None, context=context,
+                             direct_chat_id=chat_id,
+                             direct_user=user_who_requested_retry, # Кто ЗАКАЗАЛ повтор
+                             # А вот target_user нам взять неоткуда без запроса к API или БД юзеров
+                             # Поэтому передадим ЗАГЛУШКУ ДЛЯ ROAST RETRY
+                             direct_gender_hint=gender_hint_to_retry or "неизвестен")
+                             # Функция roast_user теперь должна уметь работать без target_user, если вызвано из retry
+                             # Или мы пишем заглушку тут:
+            await context.bot.send_message(chat_id=chat_id, text=f"🗿 Пережарка для **{target_name_to_retry}** пока не работает нормально. Хуй тебе.")
+            # TODO: Реализовать нормальный retry для roast, если надо (например, убрать mention_html)
+
+        # Добавь сюда elif для других типов анализа, если они появятся
+
         else:
-            logger.error(f"Неизвестный/неполный тип анализа для /retry: {analysis_type_to_retry}, file_id: {source_file_id_to_retry}")
-            await context.bot.send_message(chat_id=chat_id, text="Хуй пойми, что я там анализировал или не хватает данных. Не могу повторить.")
+            logger.error(f"Неизвестный/неполный тип анализа для /retry: {analysis_type_to_retry}")
+            await context.bot.send_message(chat_id=chat_id, text="Хуй пойми, что я там делал. Не могу повторить.")
     except Exception as e:
-         # Ловим ошибки, которые могли произойти ВНУТРИ analyze_chat или analyze_pic
-         logger.error(f"Ошибка ВО ВРЕМЯ ПОВТОРНОГО анализа ({analysis_type_to_retry}) для чата {chat_id}: {e}", exc_info=True)
-         await context.bot.send_message(chat_id=chat_id, text=f"Бля, я снова обосрался при попытке переделать. Ошибка: `{type(e).__name__}`.")
+         logger.error(f"Ошибка в /retry при вызове анализа ({analysis_type_to_retry}): {e}", exc_info=True)
+         await context.bot.send_message(chat_id=chat_id, text=f"Обосрался при /retry: {type(e).__name__}")
 
 # --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ /retry ---
 
-
-
-# --- ПОЛНАЯ ФУНКЦИЯ generate_poem (С ЛИМИТОМ ТОКЕНОВ И ОБРЕЗКОЙ) ---
 async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = None; user = None; target_name = None; user_name = "Поэт хуев"
+    """Генерирует саркастичный стишок про указанное имя."""
+    # --->>> ЗАМЕНЯЕМ КОММЕНТАРИЙ НА РЕАЛЬНЫЙ КОД <<<---
+    chat_id = None
+    user = None
+    target_name = None
+    user_name = "Поэт хуев" # Дефолтное имя запросившего
 
-    # Определение имени и пользователя (из команды или текста)
-    retry_key_poem = f'retry_poem_{update.effective_chat.id if update else None}'
-    if retry_key_poem in context.bot_data:
-        target_name = context.bot_data[retry_key_poem]
-        if update and update.message: chat_id = update.message.chat_id; user = update.message.from_user
-        logger.info(f"Получено имя '{target_name}' из context.bot_data для /retry.")
-    elif update and update.message:
-        chat_id = update.message.chat_id; user = update.message.from_user
-        if update.message.text.startswith('/'):
-            command_parts = update.message.text.split(maxsplit=1)
-            if len(command_parts) >= 2 and command_parts[1].strip(): target_name = command_parts[1].strip()
-        else:
-            match = re.search(r'(?i).*(?:стих|стишок|поэма)\s+(?:про|для|об)\s+([А-Яа-яЁё\s\-]+)', update.message.text)
-            if match: target_name = match.group(1).strip()
+    # Определяем chat_id и user из update (должен быть всегда, т.к. это обработчик)
+    if update and update.message:
+        chat_id = update.message.chat_id
+        user = update.message.from_user
+        if user:
+            user_name = user.first_name or user_name # Обновляем имя запросившего, если есть
 
-    if not chat_id or not user: logger.error("Не удалось определить chat_id/user в generate_poem."); return
-    if not target_name: await context.bot.send_message(chat_id=chat_id, text="Не понял, про кого стих. `/poem Имя` или 'Бот стих про Имя'."); return
-    if len(target_name) > 50: await context.bot.send_message(chat_id=chat_id, text="Слишком длинное имя."); return
-    user_name = user.first_name or user_name # Обновляем имя запросившего
+        # Определяем target_name из команды или текста
+        if update.message.text:
+            if update.message.text.startswith('/poem'):
+                command_parts = update.message.text.split(maxsplit=1)
+                if len(command_parts) >= 2 and command_parts[1].strip():
+                    target_name = command_parts[1].strip()
+            else: # Если не команда /poem, ищем в тексте
+                match = re.search(r'(?i).*(?:стих|стишок|поэма)\s+(?:про|для|об)\s+([А-Яа-яЁё\s\-]+)', update.message.text)
+                if match:
+                    target_name = match.group(1).strip()
+
+    # Проверяем, смогли ли мы получить нужные данные
+    if not chat_id or not user:
+        logger.error("Не удалось определить chat_id или user в generate_poem.")
+        # Пытаемся ответить хоть куда-то, если есть ID
+        err_chat_id = update.effective_chat.id if update and update.effective_chat else None
+        if err_chat_id: await context.bot.send_message(chat_id=err_chat_id, text="Внутренняя ошибка получения данных.")
+        return
+
+    if not target_name:
+        await context.bot.send_message(chat_id=chat_id, text="Не понял, про кого стих писать. `/poem Имя` или 'Бот стих про Имя'.")
+        return
+
+    if len(target_name) > 50:
+        await context.bot.send_message(chat_id=chat_id, text="Слишком длинное имя.")
+        return
+    # --->>> КОНЕЦ РЕАЛЬНОГО КОДА ПОЛУЧЕНИЯ ПЕРЕМЕННЫХ <<<---
 
     logger.info(f"Пользователь '{user_name}' запросил стих про '{target_name}' в чате {chat_id}")
-
-    # Промпт для генерации стишка
     poem_prompt = (
         f"Ты - пиздец какой циничный и злой поэт-матершинник. Твоя задача - НАПИСАТЬ КОРОТКИЙ (4-8 строк), смешной, саркастичный и ОБИДНЫЙ стишок про человека по имени **{target_name}**. "
         f"Используй черный юмор, мат, высмеивай стереотипы или просто придумывай нелепые ситуации с этим именем. Сделай так, чтобы было одновременно смешно и пиздец как токсично. Не бойся жести.\n\n"
@@ -753,109 +411,29 @@ async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Пока сосет хуй в перерывах.\n\n"
         f"Напиши ПОДОБНЫЙ стишок про **{target_name}**:"
     )
-
     try:
         thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"Так, блядь, ща рифму подберу для '{target_name}'...")
-        logger.info(f"Отправка запроса к Gemini для генерации стиха про {target_name}...")
-
-        # --->>> ЗАПРОС С ЛИМИТОМ ТОКЕНОВ <<<---
-        generation_config = genai.types.GenerationConfig(
-            max_output_tokens=300, # Лимит для стиха
-            temperature=0.8
-        )
-        safety_settings={
-            'HARM_CATEGORY_HARASSMENT': 'block_none',
-            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # <-- ПРАВИЛЬНЫЙ КЛЮЧ
-        }
-        response = await model.generate_content_async(
-            poem_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings # Передаем исправленный словарь
-        )
-        # --->>> КОНЕЦ ЗАПРОСА <<<---
-
-        logger.info(f"Получен ответ от Gemini со стихом про {target_name}.")
+        poem_text = await _call_ionet_api([{"role": "user", "content": poem_prompt}], IONET_TEXT_MODEL_ID, 150, 0.9) or f"[Стих про {target_name} не родился]"
+        if not poem_text.startswith("🗿") and not poem_text.startswith("["): poem_text = "🗿 " + poem_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-
-        # Обработка ответа с проверкой блока и обрезкой
-        poem_text = f"🗿 Простите, рифма не нашлась для '{target_name}'. Видимо, имя слишком уебанское."
-        if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Ответ Gemini для стиха заблокирован: {block_reason}")
-            poem_text = f"🗿 Gemini заблокировал стих про '{target_name}' (Причина: {block_reason})."
-        elif response.candidates:
-             try:
-                 generated_text = response.text; poem_text = "🗿 " + generated_text.strip()
-             except ValueError as e: logger.error(f"Ошибка доступа к response.text для стиха: {e}"); poem_text = f"🗿 Gemini что-то высрал про '{target_name}', но прочитать не могу."
-        else: logger.warning("Ответ Gemini пуст (нет кандидатов).")
-
-        # --->>> СТРАХОВОЧНАЯ ОБРЕЗКА ПЕРЕД ОТПРАВКОЙ <<<---
-        MAX_MESSAGE_LENGTH = 4096
-        if len(poem_text) > MAX_MESSAGE_LENGTH:
-            logger.warning(f"Стих Gemini все равно длинный ({len(poem_text)}), обрезаем!")
-            poem_text = poem_text[:MAX_MESSAGE_LENGTH - 3] + "..."
-        # --->>> КОНЕЦ ОБРЕЗКИ <<<---
-
-        # Отправка и запись для /retry
+        MAX_MESSAGE_LENGTH = 4096; # Обрезка
+        if len(poem_text) > MAX_MESSAGE_LENGTH: poem_text = poem_text[:MAX_MESSAGE_LENGTH - 3] + "..."
         sent_message = await context.bot.send_message(chat_id=chat_id, text=poem_text)
         logger.info(f"Отправлен стих про {target_name}.")
-        if sent_message:
+        if sent_message: # Запись для /retry
             reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "poem", "target_name": target_name, "timestamp": datetime.datetime.now(datetime.timezone.utc) }
-            try:
-                loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
-                logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, poem, {target_name}) для /retry чата {chat_id}.")
-            except Exception as e: logger.error(f"Ошибка записи /retry (poem) в MongoDB: {e}", exc_info=True)
+            try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+            except Exception as e: logger.error(f"Ошибка записи /retry (poem) в MongoDB: {e}")
+    except Exception as e: logger.error(f"ПИЗДЕЦ при генерации стиха про {target_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу сочинить про '{target_name}'. Ошибка: `{type(e).__name__}`.")
 
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при генерации стиха про {target_name}: {e}", exc_info=True)
-        try:
-            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-        except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу сочинить про '{target_name}'. Ошибка: `{type(e).__name__}`.")
-
-# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ generate_poem ---
-
-# --- ИЗМЕНЕННАЯ get_prediction (С 1% ПОЗИТИВА) ---
 async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Генерирует саркастичное ИЛИ (редко) позитивное предсказание с помощью Gemini."""
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Любопытная Варвара"
+    if not update.message or not update.message.from_user: return
+    chat_id = update.message.chat_id; user = update.message.from_user; user_name = user.first_name or "Любопытная Варвара"
     logger.info(f"Пользователь '{user_name}' запросил предсказание в чате {chat_id}")
-
-    # --->>> ГЕНЕРАЦИЯ ШАНСА <<<---
-    is_positive = random.random() < 0.01 # True с вероятностью 1%
-    # --->>> КОНЕЦ ГЕНЕРАЦИИ ШАНСА <<<---
-
-    prediction_prompt = ""
-    thinking_text = ""
-    final_prefix = "🗿 " # Стандартный префикс
-
-    if is_positive:
-        logger.info(f"ПОЗИТИВНОЕ предсказание для {user_name}!")
-        final_prefix = "✨ " # Префикс для позитива
-        thinking_text = f"✨ Так, {user_name}, сегодня звезды благосклонны! Ща че-нить хорошее напророчу..."
-        # --->>> НОВЫЙ ПОЗИТИВНЫЙ ПРОМПТ <<<---
-        prediction_prompt = (
-            f"Ты - внезапно подобревший оракул. Тебя попросили сделать предсказание для пользователя по имени {user_name}. "
-            f"Придумай ОДНО КОРОТКОЕ (1-2 предложения), искренне позитивное, ободряющее или просто приятное предсказание на сегодня/ближайшее будущее. "
-            f"Без сарказма и мата! НЕ ПИШИ вступлений типа 'Я предсказываю...'. СРАЗУ выдавай само предсказание.\n\n"
-            f"Примеры:\n"
-            f"- Кажется, сегодня тебе улыбнется удача в неожиданном месте! Будь внимателен.\n"
-            f"- Похоже, скоро ты получишь приятные новости или небольшой сюрприз.\n"
-            f"- Звезды говорят, что сегодня отличный день для отдыха и восстановления сил. Побалуй себя.\n"
-            f"- Кто-то думает о тебе с теплотой прямо сейчас.\n\n"
-            f"Выдай ОДНО ДОБРОЕ предсказание для {user_name}:"
-        )
-        # --->>> КОНЕЦ ПОЗИТИВНОГО ПРОМПТА <<<---
-        generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=0.6) # Чуть менее креативно для позитива
-    else:
-        logger.info(f"Стандартное токсичное предсказание для {user_name}.")
-        # final_prefix оставляем "🗿 "
-        thinking_text = f"🗿 Так, {user_name}, ща посмотрю в хрустальный шар (или куда я там смотрю)..."
-        # --->>> СТАРЫЙ ТОКСИЧНЫЙ ПРОМПТ <<<---
-        prediction_prompt = (
+    is_positive = random.random() < 0.01; prediction_prompt = ""; final_prefix = "🗿 "; thinking_text = f"🗿 Так, {user_name}, ща посмотрю в шар..."
+    if is_positive: final_prefix = "✨ "; thinking_text = f"✨ Так, {user_name}, ща че-нить хорошее скажу..."; prediction_prompt = (f"Ты - внезапно подобревший... Выдай ОДНО ДОБРОЕ предсказание для {user_name}:")
+    else: prediction_prompt = (
         f"Ты - ехидный и циничный оракул с черным юмором. Тебя попросили сделать предсказание для пользователя по имени {user_name}. "
         f"Придумай ОДНО КОРОТКОЕ (1-2 предложения), максимально саркастичное, матерное, обескураживающее или просто абсурдное предсказание на сегодня/ближайшее будущее. "
         f"Сделай его неожиданным и злым. Используй мат для усиления эффекта. Не пиши банальностей и позитива. НЕ ПИШИ никаких вступлений типа 'Я предсказываю...' или 'Для {user_name}...'. СРАЗУ выдавай само предсказание.\n\n"
@@ -867,68 +445,24 @@ async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"- Жди встречи со старым другом... который потребует вернуть долг.\n\n"
         f"Выдай ОДНО такое предсказание для {user_name}:"
     )
-        # --->>> КОНЕЦ СТАРОГО ПРОМПТА <<<---
-        generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=0.9) # Как было
-
-    # Общие настройки безопасности
-    safety_settings={
-        'HARM_CATEGORY_HARASSMENT': 'block_none',
-        'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-        'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-        'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
-    }
-
     try:
         thinking_message = await context.bot.send_message(chat_id=chat_id, text=thinking_text)
-        logger.info(f"Отправка запроса к Gemini для генерации предсказания ({'позитивного' if is_positive else 'токсичного'})...")
-
-        response = await model.generate_content_async(
-            prediction_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-        logger.info(f"Получен ответ от Gemini с предсказанием.")
+        messages_for_api = [{"role": "user", "content": prediction_prompt}]
+        prediction_text = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 100, (0.6 if is_positive else 0.9)) or "[Предсказание потерялось]"
+        if not prediction_text.startswith(("🗿", "✨", "[")): prediction_text = final_prefix + prediction_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-
-        # Обработка ответа
-        prediction_text = f"{final_prefix}Хуй знает, {user_name}. Ни позитива, ни негатива не вижу."
-        if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Предсказание Gemini заблокировано: {block_reason}")
-            prediction_text = f"{final_prefix}Gemini заблокировал предсказание для тебя, {user_name} (Причина: {block_reason}). Видимо, даже позитив про тебя - это опасно."
-        elif response.candidates:
-             try:
-                 generated_text = response.text; prediction_text = final_prefix + generated_text.strip()
-             except ValueError as e: logger.error(f"Ошибка доступа к response.text: {e}"); prediction_text = f"{final_prefix}Gemini что-то прохрюкал, {user_name}, но я не разобрал."
-        else: logger.warning("Ответ Gemini пуст (нет кандидатов).")
-
-        # Обрезка на всякий случай
-        MAX_MESSAGE_LENGTH = 4096
-        if len(prediction_text) > MAX_MESSAGE_LENGTH:
-            logger.warning(f"Предсказание длинное ({len(prediction_text)}), обрезаем!")
-            prediction_text = prediction_text[:MAX_MESSAGE_LENGTH - 3] + "..."
-
-        # Отправляем ИТОГОВЫЙ ответ
+        MAX_MESSAGE_LENGTH = 4096;
+        if len(prediction_text) > MAX_MESSAGE_LENGTH: prediction_text = prediction_text[:MAX_MESSAGE_LENGTH - 3] + "..."
         await context.bot.send_message(chat_id=chat_id, text=prediction_text)
-        logger.info(f"Отправлено {'позитивное' if is_positive else 'токсичное'} предсказание для {user_name}.")
+        logger.info(f"Отправлено предсказание для {user_name}.")
+        # Запись для /retry не делаем для предсказаний, т.к. оно рандомное
+    except Exception as e: logger.error(f"ПИЗДЕЦ при генерации предсказания для {user_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мой шар треснул. Ошибка: `{type(e).__name__}`.")
 
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при генерации предсказания для {user_name}: {e}", exc_info=True)
-        try:
-            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-        except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мой хрустальный шар треснул. Ошибка: `{type(e).__name__}`.")
-
-# --- КОНЕЦ ИЗМЕНЕННОЙ get_prediction ---
-
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ ПОДКАТОВ ---
 async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Генерирует уебищный подкат через Gemini."""
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Казанова хуев"
+    if not update.message or not update.message.from_user: return
+    chat_id = update.message.chat_id; user = update.message.from_user; user_name = user.first_name or "Казанова хуев"
     logger.info(f"Пользователь '{user_name}' запросил подкат в чате {chat_id}")
-
-    # --- ПРОМПТ ДЛЯ ГЕНЕРАЦИИ ПОДКАТА ---
     pickup_prompt = (
         f"Ты - максимально НЕУДАЧЛИВЫЙ, ПОШЛЫЙ, САРКАСТИЧНЫЙ или просто КРИНЖОВЫЙ пикапер. "
         f"Придумай ОДНУ короткую (1-2 предложения) фразу для подката (pickup line), которая гарантированно вызовет смех, недоумение или желание уебать. "
@@ -941,154 +475,65 @@ async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"- Ты случайно не куча мусора? А то я хочу тебя вынести.\n\n"
         f"Выдай ОДИН такой подкат:"
     )
-    # --- КОНЕЦ ПРОМПТА ---
-
     try:
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="🗿 Ща, подберу фразочку, чтоб наверняка нахуй послали...")
-        logger.info(f"Отправка запроса к Gemini для генерации подката...")
-
-        generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=1.0) # Максимум креатива!
-        # --->>> ИСПРАВЛЕННЫЕ safety_settings <<<---
-        safety_settings={
-            'HARM_CATEGORY_HARASSMENT': 'block_none',
-            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none' # ПРАВИЛЬНЫЙ КЛЮЧ!
-        }
-        # --->>> КОНЕЦ ИСПРАВЛЕНИЯ <<<---
-
-        response = await model.generate_content_async(
-            pickup_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings
-        )
-        logger.info(f"Получен ответ от Gemini с подкатом.")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text="🗿 Ща, подберу фразочку...")
+        pickup_line_text = await _call_ionet_api([{"role": "user", "content": pickup_prompt}], IONET_TEXT_MODEL_ID, 100, 1.0) or "[Подкат не удался]"
+        if not pickup_line_text.startswith(("🗿", "[")): pickup_line_text = "🗿 " + pickup_line_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-
-        pickup_line_text = "🗿 Сорян, не могу придумать, как тебя склеить. Ты слишком идеальна... для того, чтобы тратить на тебя мои гениальные подкаты."
-        if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Подкат Gemini заблокирован: {block_reason}")
-            pickup_line_text = f"🗿 Gemini считает, что даже мои уебищные подкаты для тебя слишком хороши (Причина блока: {block_reason})."
-        elif response.candidates:
-             try:
-                 generated_text = response.text; pickup_line_text = "🗿 " + generated_text.strip()
-             except ValueError as e: logger.error(f"Ошибка доступа к response.text для подката: {e}"); pickup_line_text = "🗿 Gemini не смог родить подкат, видимо, ты безнадежен(на)."
-        else: logger.warning("Ответ Gemini для подката пуст.")
-
-        await context.bot.send_message(chat_id=chat_id, text=pickup_line_text)
+        MAX_MESSAGE_LENGTH = 4096;
+        if len(pickup_line_text) > MAX_MESSAGE_LENGTH: pickup_line_text = pickup_line_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        sent_message = await context.bot.send_message(chat_id=chat_id, text=pickup_line_text)
         logger.info(f"Отправлен подкат.")
+        # Запись для /retry
+        if sent_message:
+             reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "pickup", "timestamp": datetime.datetime.now(datetime.timezone.utc) } # Добавили тип
+             try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+             except Exception as e: logger.error(f"Ошибка записи /retry (pickup) в MongoDB: {e}")
+    except Exception as e: logger.error(f"ПИЗДЕЦ при генерации подката: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, пикап-мастер сломался. Ошибка: `{type(e).__name__}`.")
 
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при генерации подката: {e}", exc_info=True)
-        try:
-            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-        except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мой пикап-мастер сломался. Ошибка: `{type(e).__name__}`.")
 
-# --- КОНЕЦ ФУНКЦИИ ДЛЯ ПОДКАТОВ ---
+# --- МОДИФИЦИРОВАННАЯ roast_user (для /retry ЗАГЛУШКИ) ---
+async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_gender_hint: str | None = None) -> None:
+    target_user = None; target_name = "это хуйло"; gender_hint = "неизвестен"; chat_id = None; user = None; user_name = "Заказчик"
+    is_retry = False # Флаг, что это вызов из retry
 
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ РАНДОМНОГО ОБСИРАНИЯ ---
-async def roast_previous(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """С низкой вероятностью отвечает на сообщение пользователя саркастичным комментом."""
-    # Проверяем, стоит ли вообще реагировать (избегаем реакции на команды и т.д.)
-    if not update.message or not update.message.text or update.message.text.startswith('/'):
-        return
+    if direct_chat_id and direct_user: # Вызов из /roastme или /retry
+        chat_id = direct_chat_id; user = direct_user;
+        user_name = user.first_name or user_name
+        if direct_gender_hint: gender_hint = direct_gender_hint
+        # Пытаемся получить target_user из контекста, если это НЕ retry
+        # В retry мы target_user не передаем!
+        if update and update.message and update.message.reply_to_message:
+             target_user = update.message.reply_to_message.from_user
+             target_name = target_user.first_name or target_user.username or target_name
+        else: # Это либо /roastme, либо /retry для /roast
+             target_user = direct_user # Для /roastme жарим самого себя
+             target_name = target_user.first_name or target_user.username or target_name
+             # Если это retry для roast, target_user будет НЕ ТОТ!
+             # Поэтому пока просто заглушим retry для roast
+             is_retry = True # Предполагаем, что если update=None, то это retry
+             # await context.bot.send_message(chat_id=chat_id, text="Retry для Roast пока не работает")
+             # return # <--- РАСКОММЕНТИРУЙ ЭТО, ЕСЛИ НЕ ХОЧЕШЬ ЗАГЛУШКУ В RETRY
 
-    # --- ШАНС СРАБАТЫВАНИЯ (например, 2%) ---
-    if random.random() >= 0.02:
-        return # Не сегодня, уебок
+    elif update and update.message and update.message.reply_to_message and update.message.reply_to_message.from_user: # Обычный вызов /roast
+        chat_id = update.message.chat_id; user = update.message.from_user; target_user = update.message.reply_to_message.from_user
+        user_name = user.first_name or user_name; target_name = target_user.first_name or target_user.username or target_name
+        if update.message.text: # Угадываем пол из текста
+            user_command_text = update.message.text.lower()
+            if "его" in user_command_text or "этого" in user_command_text: gender_hint = "мужской"
+            elif "ее" in user_command_text or "её" in user_command_text or "эту" in user_command_text: gender_hint = "женский"
+    else: logger.error("roast_user вызвана некорректно!"); return
 
-    # Если рандом сработал
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Аноним"
-    original_text = update.message.text
-    logger.info(f"Сработал рандомный обсиратель на сообщение от {user_name} в чате {chat_id}")
+    if target_user.id == context.bot.id: await context.bot.send_message(chat_id=chat_id, text="🗿 Себя жарить не буду."); return
 
-    # --- ПРОМПТ ДЛЯ КОММЕНТАРИЯ ---
-    roast_prompt = (
-        f"Ты - злобный и саркастичный комментатор. Тебе показали фразу пользователя по имени {user_name}: «{original_text}». "
-        f"Придумай ОДНУ КОРОТКУЮ (1 предложение) максимально едкую, уничижительную или просто тупую реакцию на эту фразу. Используй мат. НЕ обращайся к пользователю напрямую. Просто выдай свой комментарий.\n\n"
-        f"Пример реакции на 'Завтра иду на собеседование': '🗿 О, еще один шанс обосраться публично. Заебись.'\n"
-        f"Пример на 'Люблю котиков': '🗿 Пиздец, какая оригинальность. Уровень развития - амеба.'\n"
-        f"Пример на 'Как дела?': '🗿 Тебе реально не похуй? Странный ты.'\n\n"
-        f"Выдай ОДНУ такую реакцию на фразу «{original_text}»:"
-    )
-    # --- КОНЕЦ ПРОМПТА ---
+    # Если это retry для roast - ставим заглушку (пока не придумали лучше)
+    if is_retry:
+         logger.warning(f"Попытка /retry для roast пользователя {target_name}. Функция пока не реализована полностью.")
+         await context.bot.send_message(chat_id=chat_id, text=f"🗿 Пережарка для <b>{target_name}</b> пока не работает нормально. Хуй тебе.", parse_mode='HTML')
+         return
 
-    try:
-        # Не будем писать "Думаю...", чтобы было внезапно
-        logger.info(f"Отправка запроса к Gemini для рандомного обсирания...")
-        generation_config = genai.types.GenerationConfig(max_output_tokens=150, temperature=0.85)
-        # --->>> ВОТ ОНИ, РОДИМЫЕ safety_settings <<<---
-        safety_settings={
-            'HARM_CATEGORY_HARASSMENT': 'block_none',
-            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
-        }
-        # --->>> КОНЕЦ <<<---
-
-        response = await model.generate_content_async(
-            roast_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings # Передаем их!
-        )
-        logger.info(f"Получен ответ от Gemini для рандомного обсирания.")
-
-        # Обработка ответа
-        roast_text = None
-        if response.prompt_feedback.block_reason:
-            logger.warning(f"Обсирание Gemini заблокировано: {response.prompt_feedback.block_reason}")
-        elif response.candidates:
-             try:
-                 generated_text = response.text; roast_text = "🗿 " + generated_text.strip()
-             except ValueError as e: logger.error(f"Ошибка доступа к response.text для обсирания: {e}")
-        else: logger.warning("Ответ Gemini для обсирания пуст.")
-
-        # Отправляем ТОЛЬКО если получили нормальный ответ
-        if roast_text:
-            # Отправляем НЕ КАК ОТВЕТ, а просто в чат
-            await context.bot.send_message(chat_id=chat_id, text=roast_text)
-            logger.info(f"Отправлен рандомный коммент в чат {chat_id}.")
-
-    except Exception as e:
-        # Ошибку просто логируем, не спамим в чат
-        logger.error(f"ПИЗДЕЦ при рандомном обсирании: {e}", exc_info=True)
-
-# --- КОНЕЦ ФУНКЦИИ РАНДОМНОГО ОБСИРАНИЯ ---
-
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ ПРОЖАРКИ (/roast) ---
-async def roast_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Генерирует саркастичный 'роаст' пользователя, на сообщение которого ответили."""
-    # Проверяем, что это ответ на чье-то сообщение
-    if not update.message or not update.message.reply_to_message or not update.message.reply_to_message.from_user:
-        await context.bot.send_message(chat_id=update.message.chat_id, text="Ты должен ответить этой командой на сообщение того бедолаги, которого хочешь прожарить, кретин!")
-        return
-
-    # Получаем инфу о цели "прожарки"
-    target_user = update.message.reply_to_message.from_user
-    target_name = target_user.first_name or target_user.username or "это безымянное хуйло" # Берем имя или юзернейм
-
-    # Не прожариваем самого себя (бота)
-    if target_user.id == context.bot.id:
-        await context.bot.send_message(chat_id=update.message.chat_id, text="🗿 Самоирония - это хорошо, но себя жарить я не буду. Ищи другую жертву.")
-        return
-
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Главный Завистник" # Имя того, кто заказал прожарку
-    user_command_text = update.message.text.lower() # Текст команды пользователя ("бот прожарь ее")
-
-     # --->>> ПОПЫТКА ОПРЕДЕЛИТЬ ПОЛ ИЗ ФРАЗЫ <<<---
-    gender_hint = "неизвестен" # По умолчанию
-    if "его" in user_command_text or "этого" in user_command_text:
-        gender_hint = "мужской"
-    elif "ее" in user_command_text or "её" in user_command_text or "эту" in user_command_text:
-        gender_hint = "женский"
-    logger.info(f"Пользователь '{user_name}' запросил прожарку для '{target_name}'. Предполагаемый пол из фразы: {gender_hint}")
-    # --->>> КОНЕЦ ОПРЕДЕЛЕНИЯ ПОЛА <<<---
-
-    # --- ПРОМПТ ДЛЯ ГЕНЕРАЦИИ РОАСТА ---
+    logger.info(f"Пользователь '{user_name}' запросил прожарку для '{target_name}' (Пол: {gender_hint})")
     roast_prompt = (
         f"Ты - мастер стендапа в жанре 'roast', циничный, злой, но пиздецки остроумный уебок с черным юмором. Тебе заказали прожарку человека по имени **{target_name}** (заказал пользователь '{user_name}').\n"
         f"Твоя задача: **СФАНТАЗИРУЙ** какой-нибудь типичный забавный или раздражающий косяк, привычку, черту характера или ситуацию, которая МОГЛА БЫ быть связана с человеком по имени {target_name} (основывайся не только на реальных данных, МОЖЕШЬ ПРОСТО ПРИДУМАТЬ!). И напиши **КОРОТКИЙ (3-5 предложений), СМЕШНОЙ, ЖЕСТКИЙ И МАТЕРНЫЙ** роаст, высмеивающий именно эту ПРИДУМАННУЮ тобой деталь.\n\n"
@@ -1103,81 +548,65 @@ async def roast_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Пример (для Димы, фантазируем, что он тормоз): '🗿 Димаааа... Пока он додумается открыть дверь, человечество уже колонизирует Марс. Скорость реакции - как у дохлой черепахи под транквилизаторами. Пиздец ты тормоз, Димас.'\n\n"
         f"Придумай подобный СМЕШНОЙ и ЗЛОЙ роаст про **{target_name}**, сфокусировавшись на какой-то ВЫДУМАННОЙ херне:"
     )
-    # --- КОНЕЦ ПРОМПТА ---
-
     try:
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Окей, щас подберем пару ласковых для '{target_name}' (пол: {gender_hint})...")
-        logger.info(f"Отправка запроса к Gemini для генерации роаста для {target_name}...")
-
-        generation_config = genai.types.GenerationConfig(max_output_tokens=150, temperature=0.85)
-        # --->>> ВОТ ОНИ, РОДИМЫЕ safety_settings <<<---
-        safety_settings={
-            'HARM_CATEGORY_HARASSMENT': 'block_none',
-            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
-        }
-        # --->>> КОНЕЦ <<<---
-
-        response = await model.generate_content_async(
-            roast_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings # Передаем их!
-        )
-        logger.info(f"Получен ответ от Gemini с роастом для {target_name}.")
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Окей, щас подберем пару ласковых для '{target_name}'...")
+        messages_for_api = [{"role": "user", "content": roast_prompt}]
+        roast_text = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 150, 0.85) or f"[Роаст для {target_name} не удался]"
+        if not roast_text.startswith(("🗿", "[")): roast_text = "🗿 " + roast_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        roast_text = f"🗿 Не смог придумать ничего смешного про '{target_name}'. Видимо, он настолько уныл, что даже моя фантазия пасует."
-        if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Роаст Gemini заблокирован: {block_reason}")
-            roast_text = f"🗿 Gemini считает, что '{target_name}' слишком свят для моих шуток (Причина блока: {block_reason}). Лицемер ебаный."
-        elif response.candidates:
-             try:
-                 generated_text = response.text; roast_text = "🗿 " + generated_text.strip()
-             except ValueError as e: logger.error(f"Ошибка доступа к response.text для роаста: {e}"); roast_text = f"🗿 Мой мозг сломался, пока я думал про '{target_name}'."
-        else: logger.warning("Ответ Gemini для роаста пуст.")
-
-        # Отправляем НЕ как ответ, а просто в чат, но упоминаем цель
-        # Можно использовать mention_html для кликабельности, если target_user.username есть
-        target_mention = target_user.mention_html() if target_user.username else f"<b>{target_name}</b>" # Жирным, если нет юзернейма
+        # Используем mention_html ТОЛЬКО если target_user НЕ None (т.е. не из retry)
+        target_mention = target_user.mention_html() if target_user and target_user.username else f"<b>{target_name}</b>"
         final_text = f"Прожарка для {target_mention}:\n\n{roast_text}"
 
-        # Обрезаем на всякий случай
-        MAX_MESSAGE_LENGTH = 4096
-        if len(final_text) > MAX_MESSAGE_LENGTH:
-            logger.warning(f"Роаст длинный ({len(final_text)}), обрезаем!")
-            # Обрезаем сам текст роаста, оставляя вступление
-            max_roast_len = MAX_MESSAGE_LENGTH - len(f"Прожарка для {target_mention}:\n\n") - 3
-            if max_roast_len > 0:
-                 roast_text = roast_text[:max_roast_len] + "..."
-            else: # Если даже вступление не влезает
-                 roast_text = "Слишком длинный роаст, пиздец."
-            final_text = f"Прожарка для {target_mention}:\n\n{roast_text}"
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=final_text,
-            parse_mode='HTML' # Используем HTML для mention_html или <b>
-        )
+        MAX_MESSAGE_LENGTH = 4096;
+        if len(final_text) > MAX_MESSAGE_LENGTH: final_text = f"Прожарка для {target_mention}:\n\n{roast_text[:MAX_MESSAGE_LENGTH - len(f'Прожарка для {target_mention}:\n\n') - 3]}..."
+        sent_message = await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
         logger.info(f"Отправлен роаст для {target_name}.")
+        if sent_message: # Запись для /retry
+             # ЗАПИСЫВАЕМ ДАННЫЕ ИЗ ОРИГИНАЛЬНОГО ВЫЗОВА (если был)
+             if target_user: # Только если это не retry / roastme где target_user = direct_user
+                 reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "roast", "target_name": target_name, "target_id": target_user.id, "gender_hint": gender_hint, "timestamp": datetime.datetime.now(datetime.timezone.utc) }
+                 try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+                 except Exception as e: logger.error(f"Ошибка записи /retry (roast) в MongoDB: {e}")
+    except Exception as e: logger.error(f"ПИЗДЕЦ при генерации роаста для {target_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не смог прожарить '{target_name}'. Ошибка: `{type(e).__name__}`.")
 
-    except Exception as e:
-        logger.error(f"ПИЗДЕЦ при генерации роаста для {target_name}: {e}", exc_info=True)
-        try:
-            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
-        except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не смог прожарить '{target_name}'. То ли он несмешной, то ли я тупой. Ошибка: `{type(e).__name__}`.")
+# --- КОНЕЦ МОДИФИЦИРОВАННОЙ roast_user ---
 
-# --- КОНЕЦ ФУНКЦИИ ДЛЯ ПРОЖАРКИ ---
+async def reply_to_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (not update.message or not update.message.reply_to_message or not update.message.reply_to_message.from_user or
+            update.message.reply_to_message.from_user.id != context.bot.id or not update.message.text or update.message.text.startswith('/')): return
+    chat_id = update.message.chat_id; user_text_input = update.message.text; user_name = update.message.from_user.first_name or "Анон"
+    bot_original_message_text = update.message.reply_to_message.text or "[мой старый высер]"; bot_original_short = bot_original_message_text[:150] + ('...' if len(bot_original_message_text) > 150 else '')
+    user_text_short = user_text_input[:150] + ('...' if len(user_text_input) > 150 else '')
+    logger.info(f"Пользователь {user_name} ответил ('{user_text_short}...') на сообщение бота. Генерируем огрызание...")
+    comeback_prompt = (
+        f"Ты - Попиздяка, очень саркастичный, токсичный и матершинный телеграм-бот. Только что пользователь '{user_name}' ответил на твое предыдущее сообщение «{bot_original_short}» своей фразой: «{user_text_short}».\n"
+        f"Твоя задача: Придумай **ОДНО КОРОТКОЕ (1-2 предложения)** максимально дерзкое, язвительное, уничижительное или просто ставящее на место ОГРЫЗАНИЕ в ответ на фразу пользователя. Используй мат, сарказм, черный юмор. Покажи, что тебе абсолютно похуй на его мнение. НЕ пиши вступлений. СРАЗУ выдавай свое огрызание.\n\n"
+        f"Пример ответа на 'спасибо': '🗿 Не за что, блядь. Я все равно это сделал не для тебя.'\n"
+        f"Пример ответа на 'ты неправ': '🗿 Ой, да иди ты нахуй со своим единственно верным мнением, эксперт диванный.'\n"
+        f"Пример ответа на 'хорошо сказал': '🗿 Я всегда хорошо говорю, в отличие от некоторых кожаных ублюдков.'\n\n"
+        f"Придумай ответ на фразу «{user_text_short}»:"
+    )
+    try:
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        messages_for_api = [{"role": "user", "content": comeback_prompt}]
+        comeback_text = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 100, 0.9) or f"[Не придумал ответ]"
+        if not comeback_text.startswith(("🗿", "[")): comeback_text = "🗿 " + comeback_text
+        MAX_MESSAGE_LENGTH = 4096;
+        if len(comeback_text) > MAX_MESSAGE_LENGTH: comeback_text = comeback_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        await update.message.reply_text(text=comeback_text)
+        logger.info(f"Отправлен ответ-огрызание от ai.io.net.")
+    except Exception as e: logger.error(f"ПИЗДЕЦ при генерации огрызания: {e}", exc_info=True); await update.message.reply_text(random.choice(["🗿 Ошибка. Нахуй иди.", "🗿 Заебал.", "🗿 Не отвечу."]))
 
-# --- ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ (С ГЕНЕРАЦИЕЙ ФАКТОВ GEMINI) ---
+# --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ (ГЕНЕРАЦИЯ ФАКТОВ) ---
 async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Проверяет неактивные чаты и постит рандомный ебанутый факт от Gemini."""
+    """Проверяет неактивные чаты и постит рандомный ебанутый факт от ai.io.net."""
     logger.info("Запуск фоновой проверки неактивности чатов для постинга факта...")
     # Пороги времени в секундах
-    INACTIVITY_THRESHOLD = 60 * 60 * 2 # 2 часа тишины для срабатывания
-    MIN_TIME_BETWEEN_SHITPOSTS = 60 * 60 * 4 # Не чаще раза в 4 часа бот высирает в ОДНОМ чате
+    INACTIVITY_THRESHOLD = 60 * 60 * 2 # 2 часа тишины
+    MIN_TIME_BETWEEN_SHITPOSTS = 60 * 60 * 4 # Не чаще раза в 4 часа
 
     now = datetime.datetime.now(datetime.timezone.utc)
     inactive_threshold_time = now - datetime.timedelta(seconds=INACTIVITY_THRESHOLD)
@@ -1186,57 +615,45 @@ async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         loop = asyncio.get_running_loop()
         # Ищем чаты, где последнее сообщение было давно И последний высер бота был еще давнее
-        query = { "last_message_time": {"$lt": inactive_threshold_time}, "last_bot_shitpost_time": {"$lt": shitpost_threshold_time} }
-        inactive_chat_docs = await loop.run_in_executor( None, lambda: list(chat_activity_collection.find(query, {"chat_id": 1, "_id": 0})) )
+        query = {
+            "last_message_time": {"$lt": inactive_threshold_time},
+            "last_bot_shitpost_time": {"$lt": shitpost_threshold_time}
+        }
+        inactive_chat_docs = await loop.run_in_executor(
+            None,
+            lambda: list(chat_activity_collection.find(query, {"chat_id": 1, "_id": 0}))
+        )
         inactive_chat_ids = [doc["chat_id"] for doc in inactive_chat_docs]
 
-        if not inactive_chat_ids: logger.info("Не найдено подходящих неактивных чатов для факта."); return
+        if not inactive_chat_ids:
+            logger.info("Не найдено подходящих неактивных чатов для факта.")
+            return
 
         logger.info(f"Найдены неактивные чаты ({len(inactive_chat_ids)}). Выбираем один для постинга факта...")
         target_chat_id = random.choice(inactive_chat_ids) # Берем один случайный чат
 
-        # --->>> ГЕНЕРАЦИЯ ФАКТА ЧЕРЕЗ GEMINI <<<---
+        # --->>> ГЕНЕРАЦИЯ ФАКТА ЧЕРЕЗ _call_ionet_api <<<---
         fact_prompt = (
             "Придумай ОДИН короткий (1-2 предложения) совершенно ЕБАНУТЫЙ, АБСУРДНЫЙ, ЛЖИВЫЙ, но НАУКООБРАЗНЫЙ 'факт'. "
             "Он должен звучать максимально бредово, но подаваться с серьезным ебалом. Можно с матом. "
-            "НЕ ПИШИ никаких вступлений типа 'Знаете ли вы...'. СРАЗУ выдавай сам 'факт'."
+            "НЕ ПИШИ никаких вступлений. СРАЗУ выдавай сам 'факт'."
             "\nПример: Квантовые флуктуации в жопе у хомяка могут спонтанно генерировать миниатюрные черные дыры."
             "\nПример: Пингвины тайно управляют мировым рынком анчоусов."
             "\nПридумай ПОДОБНЫЙ бред:"
         )
+        logger.info(f"Отправка запроса к ai.io.net для генерации ебанутого факта для чата {target_chat_id}...")
 
-        logger.info(f"Отправка запроса к Gemini для генерации ебанутого факта для чата {target_chat_id}...")
-        fact_text = "🗿 Бля, сегодня без фактов. Мой генератор бреда сломался." # Заглушка
-        try:
-            generation_config = genai.types.GenerationConfig(max_output_tokens=150, temperature=1.1)
-                # --->>> ВОТ ОНИ, БЛЯДЬ! <<<---
-            safety_settings={
-                'HARM_CATEGORY_HARASSMENT': 'block_none',
-                'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-                'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-                'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
-            }
-            # --->>> КОНЕЦ <<<---
+        # Используем _call_ionet_api с текстовой моделью
+        fact_text = await _call_ionet_api(
+            messages=[{"role": "user", "content": fact_prompt}],
+            model_id=IONET_TEXT_MODEL_ID, # Используем текстовую модель
+            max_tokens=150,
+            temperature=1.1
+        ) or "[Генератор бреда сломался или вернул хуйню]" # Заглушка на случай None
 
-            response = await model.generate_content_async(
-                fact_prompt,
-                generation_config=generation_config,
-                safety_settings=safety_settings # Передаем их!
-            )
-            logger.info(f"Получен ответ от Gemini с ебанутым фактом.")
-
-            if response.prompt_feedback.block_reason:
-                block_reason = response.prompt_feedback.block_reason; logger.warning(f"Факт Gemini заблокирован: {block_reason}")
-                fact_text = f"🗿 Gemini считает, что даже мои ебанутые факты слишком опасны (Блок: {block_reason})."
-            elif response.candidates:
-                 try:
-                     generated_text = response.text; fact_text = "🗿 " + generated_text.strip()
-                 except ValueError as e: logger.error(f"Ошибка доступа к response.text для факта: {e}"); fact_text = "🗿 Gemini что-то высрал, но я не понял."
-            else: logger.warning("Ответ Gemini для факта пуст.")
-
-        except Exception as gen_e:
-             logger.error(f"Ошибка при генерации факта через Gemini: {gen_e}", exc_info=True)
-             # Оставляем заглушку fact_text
+        # Добавляем префикс, если ответ не ошибка
+        if not fact_text.startswith(("🗿", "[")):
+            fact_text = "🗿 " + fact_text
         # --->>> КОНЕЦ ГЕНЕРАЦИИ ФАКТА <<<---
 
         # Обрезаем, если надо
@@ -1249,268 +666,211 @@ async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> N
         logger.info(f"Отправлен рандомный факт в НЕАКТИВНЫЙ чат {target_chat_id}")
 
         # ОБНОВЛЯЕМ ВРЕМЯ ПОСЛЕДНЕГО ВЫСЕРА БОТА в БД
-        await loop.run_in_executor( None, lambda: chat_activity_collection.update_one( {"chat_id": target_chat_id}, {"$set": {"last_bot_shitpost_time": now}} ) )
+        await loop.run_in_executor(
+            None,
+            lambda: chat_activity_collection.update_one(
+                {"chat_id": target_chat_id},
+                {"$set": {"last_bot_shitpost_time": now}} # Ставим текущее время
+            )
+        )
         logger.info(f"Обновлено время последнего высера для чата {target_chat_id}")
 
     except Exception as e:
-        logger.error(f"Ошибка в фоновой задаче check_inactivity_and_shitpost (Gemini): {e}", exc_info=True)
+        # Ловим ошибки внутри всей функции, а не только API
+        logger.error(f"Ошибка в фоновой задаче check_inactivity_and_shitpost: {e}", exc_info=True)
 
-# --- КОНЕЦ ФУНКЦИИ ДЛЯ ФОНОВОЙ ЗАДАЧИ ---
+# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ ДЛЯ ФОНОВОЙ ЗАДАЧИ ---
 
-# --- УПРОЩЕННАЯ reply_to_bot_handler (РЕАГИРУЕТ НА ЛЮБОЙ ОТВЕТ БОТУ) ---
-async def reply_to_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Генерит огрызание через Gemini на ЛЮБОЙ текстовый ответ сообщению бота."""
-    # Проверки: это ответ? на сообщение? от нашего бота? есть текст? Это не команда?
-    if (not update.message or
-            not update.message.reply_to_message or
-            not update.message.reply_to_message.from_user or
-            update.message.reply_to_message.from_user.id != context.bot.id or
-            not update.message.text or
-            update.message.text.startswith('/')): # Добавили проверку на команду в ответе
-        return
+# --- ФУНКЦИЯ ДЛЯ /help ---
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет сообщение со справкой о возможностях бота и реквизитами для доната."""
+    user_name = update.message.from_user.first_name or "щедрый ты мой"
+    logger.info(f"Пользователь '{user_name}' запросил справку (/help)")
 
-    chat_id = update.message.chat_id
-    user_text_input = update.message.text # Текст НАЕЗДА (или просто ответа) от пользователя
-    user_name = update.message.from_user.first_name or "Безымянный Собеседник"
-    # Текст сообщения бота, на которое ответили (обрежем)
-    bot_original_message_text = update.message.reply_to_message.text or "[мой старый высер без текста]"
-    bot_original_short = bot_original_message_text[:150] + ('...' if len(bot_original_message_text) > 150 else '')
-    user_text_short = user_text_input[:150] + ('...' if len(user_text_input) > 150 else '')
+    # РЕКВИЗИТЫ ДЛЯ ДОНАТА (ЗАМЕНИ НА СВОИ ИЛИ ЧИТАЙ ИЗ ENV!)
+    MIR_CARD_NUMBER = os.getenv("MIR_CARD_NUMBER", "2200000000000000")
+    TON_WALLET_ADDRESS = os.getenv("TON_WALLET_ADDRESS", "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA...")
+    USDC_WALLET_ADDRESS = os.getenv("USDC_WALLET_ADDRESS", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX")
+    USDC_NETWORK = os.getenv("USDC_NETWORK", "TRC20") # Сеть для USDC
 
-    logger.info(f"Пользователь {user_name} ответил ('{user_text_short}...') на сообщение бота в чате {chat_id}. Генерируем ответ...")
+    help_text = f"""
+🗿 Слышь, {user_name}! Я Попиздяка, главный токсик и тролль этого чата. Вот че я умею:
 
-    # --->>> НОВЫЙ, БОЛЕЕ ОБЩИЙ ПРОМПТ <<<---
-    # Теперь не упоминаем конкретный триггер
-    comeback_prompt = (
-        f"Ты - Попиздяка, очень саркастичный, токсичный и матершинный телеграм-бот. Только что пользователь '{user_name}' ответил на твое предыдущее сообщение «{bot_original_short}» своей фразой: «{user_text_short}».\n"
-        f"Твоя задача: Придумай **ОДНО КОРОТКОЕ (1-2 предложения)** максимально дерзкое, язвительное, уничижительное или просто ставящее на место ОГРЫЗАНИЕ в ответ на фразу пользователя. Используй мат, сарказм, черный юмор. Покажи, что тебе абсолютно похуй на его мнение. НЕ пиши вступлений. СРАЗУ выдавай свое огрызание.\n\n"
-        f"Пример ответа на 'спасибо': '🗿 Не за что, блядь. Я все равно это сделал не для тебя.'\n"
-        f"Пример ответа на 'ты неправ': '🗿 Ой, да иди ты нахуй со своим единственно верным мнением, эксперт диванный.'\n"
-        f"Пример ответа на 'хорошо сказал': '🗿 Я всегда хорошо говорю, в отличие от некоторых кожаных ублюдков.'\n\n"
-        f"Придумай ответ на фразу «{user_text_short}»:"
-    )
-    # --->>> КОНЕЦ НОВОГО ПРОМПТА <<<---
+*Анализ чата:*
+Напиши <code>/analyze</code> или "<code>Попиздяка анализируй</code>".
+Я прочитаю последние <b>{MAX_MESSAGES_TO_ANALYZE}</b> сообщений и выдам вердикт.
 
+*Анализ картинок:*
+Ответь на картинку <code>/analyze_pic</code> или "<code>Попиздяка зацени пикчу</code>".
+Я попробую ее обосрать (используя Vision модель!).
+
+*Стишок-обосрамс:*
+Напиши <code>/poem Имя</code> или "<code>Бот стих про Имя</code>".
+Я попробую сочинить токсичный стишок.
+
+*Предсказание (хуевое):*
+Напиши <code>/prediction</code> или "<code>Бот предскажи</code>".
+Я выдам тебе рандомное (или позитивное с 1% шансом) пророчество.
+
+*Подкат от Попиздяки:*
+Напиши <code>/pickup</code> или "<code>Бот подкати</code>".
+Я сгенерирую уебищную фразу для знакомства.
+
+*Прожарка друга (Roast):*
+Ответь на сообщение бедолаги <code>/roast</code> или "<code>Бот прожарь его/ее</code>".
+Я сочиню уничижительный стендап про этого человека.
+
+*Переделать высер:*
+Ответь <code>/retry</code> или "<code>Бот переделай</code>" на МОЙ последний ответ от анализа/стиха/прожарки/предсказания/подката/картинки.
+
+*Эта справка:*
+Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
+
+*Важно:*
+- Дайте <b>админку</b>, чтобы я видел весь ваш пиздеж.
+- Иногда я несу хуйню - я работаю на нейросетях.
+- Иногда, если в чате долго тишина, я могу сам вкинуть какой-нибудь ебанутый "факт".
+
+*💰 Подкинуть на пиво Попиздяке:*
+Если тебе нравится мой бред, можешь закинуть копеечку:
+
+- <b>Карта МИР:</b> <code>{MIR_CARD_NUMBER}</code>
+- <b>TON:</b> <code>{TON_WALLET_ADDRESS}</code>
+- <b>USDC ({USDC_NETWORK}):</b> <code>{USDC_WALLET_ADDRESS}</code>
+
+Спасибо, блядь! 🗿
+    """
     try:
-        # Небольшая пауза
-        await asyncio.sleep(random.uniform(0.5, 1.5))
-
-        generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=0.9)
-        safety_settings={
-            'HARM_CATEGORY_HARASSMENT': 'block_none',
-            'HARM_CATEGORY_HATE_SPEECH': 'block_none',
-            'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'block_none',
-            'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'
-        }
-        # --->>> КОНЕЦ <<<---
-
-        response = await model.generate_content_async(
-            comeback_prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings # Передаем их!
-        )
-        logger.info(f"Получен ответ от Gemini с огрызанием.")
-
-        comeback_text = f"🗿 {user_name}, отъебись." # Заглушка
-        if response.prompt_feedback.block_reason:
-            block_reason = response.prompt_feedback.block_reason; logger.warning(f"Огрызание Gemini заблокировано: {block_reason}")
-            comeback_text = f"🗿 Мой ответ тебе заблокировали ({block_reason}). Видимо, правда глаза колет."
-        elif response.candidates:
-             try:
-                 generated_text = response.text; comeback_text = "🗿 " + generated_text.strip()
-             except ValueError as e: logger.error(f"Ошибка доступа к response.text для огрызания: {e}")
-        else: logger.warning("Ответ Gemini для огрызания пуст.")
-
-        # Обрезка
-        MAX_MESSAGE_LENGTH = 4096
-        if len(comeback_text) > MAX_MESSAGE_LENGTH: comeback_text = comeback_text[:MAX_MESSAGE_LENGTH - 3] + "..."
-
-        # Отправляем как ответ на СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ
-        await update.message.reply_text(text=comeback_text)
-        logger.info(f"Отправлен ответ-огрызание от Gemini в чат {chat_id}")
-
+        await context.bot.send_message(chat_id=update.message.chat_id, text=help_text.strip(), parse_mode='HTML')
     except Exception as e:
-        logger.error(f"ПИЗДЕЦ при генерации огрызания: {e}", exc_info=True)
-        try: await update.message.reply_text(random.choice(["🗿 Ошибка. Нахуй иди.", "🗿 Заебал.", "🗿 Не хочу отвечать."]))
+        logger.error(f"Не удалось отправить /help: {e}", exc_info=True)
+        try: await context.bot.send_message(chat_id=update.message.chat_id, text="Справка сломалась. Команды: /analyze, /analyze_pic, /poem, /prediction, /pickup, /roast, /retry, /help.")
         except Exception: pass
 
-# --- КОНЕЦ УПРОЩЕННОЙ reply_to_bot_handler ---
+# --- ФУНКЦИИ-ОБЕРТКИ ДЛЯ РУССКИХ КОМАНД (Если нужны) ---
+# Можно вызывать основные функции напрямую из Regex хэндлеров, если не нужна доп. логика
+# async def handle_text_analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: await analyze_chat(update, context)
+# async def handle_text_analyze_pic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None: await analyze_pic(update, context)
+# ... и т.д.
 
+
+
+# --- АСИНХРОННАЯ ЧАСТЬ И ТОЧКА ВХОДА ---
+app = Flask(__name__)
+@app.route('/')
+def index():
+    logger.info("GET / -> OK")
+    return "Popizdyaka is alive (probably)."
+
+async def run_bot_async(application: Application) -> None: # Запускает и корректно останавливает бота
+    try:
+        logger.info("Init TG App..."); await application.initialize()
+        if not application.updater: logger.critical("No updater!"); return
+        logger.info("Start polling..."); await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("Start TG App..."); await application.start()
+        logger.info("Bot started (idle)..."); await asyncio.Future() # Ожидаем вечно
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError): logger.info("Stop signal received.")
+    except Exception as e: logger.critical(f"ERROR in run_bot_async: {e}", exc_info=True)
+    finally: # Shutdown
+        logger.info("Stopping bot...");
+        if application.running: await application.stop(); logger.info("App stopped.")
+        if application.updater and application.updater.is_running: await application.updater.stop(); logger.info("Updater stopped.")
+        await application.shutdown(); logger.info("Bot stopped.")
 
 async def main() -> None:
-    """Основная асинхронная функция, запускающая веб-сервер и бота."""
-    logger.info("Запуск асинхронной функции main().")
-
-    # 1. Настраиваем и собираем Telegram бота
-    logger.info("Сборка Telegram Application...")
+    logger.info("Starting main()...")
+    logger.info("Building Application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    # --->>> ЗАПУСК ФОНОВОЙ ЗАДАЧИ <<<---
-    if application.job_queue:
-        # Запускаем задачу каждые 15 минут (900 сек), первый раз через 1 минуту
-        application.job_queue.run_repeating(check_inactivity_and_shitpost, interval=900, first=60)
-        logger.info("Фоновая задача проверки неактивности запущена (каждые 15 мин).")
-    else:
-        logger.warning("Не удалось получить job_queue, фоновая задача не запущена!")
-    # --->>> КОНЕЦ ЗАПУСКА ФОНОВОЙ ЗАДАЧИ <<<---
-    application.add_handler(CommandHandler("analyze", analyze_chat))
-    application.add_handler(CommandHandler("analyze_pic", analyze_pic)) # Оставим рабочую версию с Gemini
 
-    # --->>> ДОБАВЛЯЕМ HELP <<<---
+    # Запуск фоновой задачи
+    if application.job_queue:
+        application.job_queue.run_repeating(check_inactivity_and_shitpost, interval=900, first=60) # Каждые 15 мин
+        logger.info("Background check_inactivity task scheduled.")
+    else: logger.warning("No job_queue found, background task not started!")
+
+    # Добавляем обработчики команд
+    application.add_handler(CommandHandler("analyze", analyze_chat))
+    application.add_handler(CommandHandler("analyze_pic", analyze_pic))
+    application.add_handler(CommandHandler("poem", generate_poem))
+    application.add_handler(CommandHandler("prediction", get_prediction))
+    application.add_handler(CommandHandler("pickup", get_pickup_line))
+    application.add_handler(CommandHandler("pickup_line", get_pickup_line))
+    application.add_handler(CommandHandler("roast", roast_user))
+    application.add_handler(CommandHandler("retry", retry_analysis))
     application.add_handler(CommandHandler("help", help_command))
 
-    # --->>> ДОБАВЛЯЕМ RETRY <<<---
-    application.add_handler(CommandHandler("retry", retry_analysis)) # Команда /retry
-    retry_pattern = r'(?i).*(попиздяка|бот).*(переделай|повтори|перепиши|хуйня|другой вариант).*'
-    # Важно: ловим только как ОТВЕТ на сообщение!
-    application.add_handler(MessageHandler(filters.Regex(retry_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, retry_analysis))
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ RETRY <<<---
+    # Добавляем обработчики русских фраз (вызывают ТЕ ЖЕ функции)
+    # Можно добавить больше синонимов
+    analyze_pattern = r'(?i).*(попиздяка|бот).*(анализ|анализируй|проанализируй|комментируй|обосри|скажи|мнение).*'
+    application.add_handler(MessageHandler(filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND, analyze_chat)) # Прямой вызов
 
-    # --->>> ДОБАВЛЯЕМ ГЕНЕРАЦИЮ СТИХОВ <<<---
-    application.add_handler(CommandHandler("poem", generate_poem)) # Команда /poem <Имя>
-    poem_pattern = r'(?i).*(?:бот|попиздяка).*(?:стих|стишок|поэма)\s+(?:про|для|об)\s+([А-Яа-яЁё\s]+)'
-    application.add_handler(MessageHandler(filters.Regex(poem_pattern) & filters.TEXT & ~filters.COMMAND, generate_poem)) # Фразы типа "Бот стих про Вася"
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ СТИХОВ <<<---
+    analyze_pic_pattern = r'(?i).*(попиздяка|бот).*(зацени|опиши|обосри|скажи про).*(пикч|картинк|фот|изображен|это).*'
+    application.add_handler(MessageHandler(filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, analyze_pic)) # Прямой вызов
 
-    # --->>> ДОБАВЛЯЕМ ПРЕДСКАЗАНИЯ <<<---
-    application.add_handler(CommandHandler("prediction", get_prediction)) # Команда /prediction
+    poem_pattern = r'(?i).*(?:бот|попиздяка).*(?:стих|стишок|поэма)\s+(?:про|для|об)\s+([А-Яа-яЁё\s\-]+)' # Оставили группу для имени
+    application.add_handler(MessageHandler(filters.Regex(poem_pattern) & filters.TEXT & ~filters.COMMAND, generate_poem)) # Прямой вызов
+
     prediction_pattern = r'(?i).*(?:бот|попиздяка).*(?:предскажи|что ждет|прогноз|предсказание|напророчь).*'
-    application.add_handler(MessageHandler(filters.Regex(prediction_pattern) & filters.TEXT & ~filters.COMMAND, get_prediction)) # Фразы типа "Бот предскажи"
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПРЕДСКАЗАНИЙ <<<---
+    application.add_handler(MessageHandler(filters.Regex(prediction_pattern) & filters.TEXT & ~filters.COMMAND, get_prediction)) # Прямой вызов
 
-     # --->>> ДОБАВЛЯЕМ ПОДКАТЫ <<<---
-    application.add_handler(CommandHandler("pickup", get_pickup_line)) # Команда /pickup или /pickup_line
-    application.add_handler(CommandHandler("pickup_line", get_pickup_line))
     pickup_pattern = r'(?i).*(?:бот|попиздяка).*(?:подкат|пикап|склей|познакомься|замути).*'
-    application.add_handler(MessageHandler(filters.Regex(pickup_pattern) & filters.TEXT & ~filters.COMMAND, get_pickup_line))
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПОДКАТОВ <<<---
+    application.add_handler(MessageHandler(filters.Regex(pickup_pattern) & filters.TEXT & ~filters.COMMAND, get_pickup_line)) # Прямой вызов
 
-# --->>> ДОБАВЛЯЕМ ПРОЖАРКУ <<<---
-    application.add_handler(CommandHandler("roast", roast_user)) # Команда /roast (в ответе на сообщение)
     roast_pattern = r'(?i).*(?:бот|попиздяка).*(?:прожарь|зажарь|обосри|унизь)\s+(?:его|ее|этого|эту).*'
-    # Ловим ТОЛЬКО как ответ на сообщение!
-    application.add_handler(MessageHandler(filters.Regex(roast_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, roast_user))
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПРОЖАРКИ <<<---
+    application.add_handler(MessageHandler(filters.Regex(roast_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, roast_user)) # Прямой вызов
 
-    # Regex для русских команд "/analyze"
-    analyze_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(анализируй|проанализируй|комментируй|мнение).*'
-    application.add_handler(MessageHandler(filters.Regex(analyze_pattern) & filters.TEXT & ~filters.COMMAND, handle_text_analyze_command))
+    retry_pattern = r'(?i).*(попиздяка|бот).*(переделай|повтори|перепиши|хуйня|другой вариант).*'
+    application.add_handler(MessageHandler(filters.Regex(retry_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, retry_analysis)) # Прямой вызов
 
-    # Regex для русских команд "/analyze_pic"
-    analyze_pic_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(зацени|опиши).*(пикч|картинк|фот|изображен|это).*'
-    application.add_handler(MessageHandler(filters.Regex(analyze_pic_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, handle_text_analyze_pic_command))
-
-    # --->>> ДОБАВЛЯЕМ Regex ДЛЯ РУССКИХ КОМАНД "/help" <<<---
     help_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(ты кто|кто ты|что умеешь|хелп|помощь|справка|команды).*'
-    application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Вызываем ту же функцию help_command
+    application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Прямой вызов
 
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ HELP <<<---
-
-    # Ловим текстовые ответы (~COMMAND) ИМЕННО на сообщения бота (filters.REPLY)
+    # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
-    # --->>> КОНЕЦ ВСТАВКИ <<<---
 
+    # Обработчики для сохранения истории (В САМОМ КОНЦЕ!)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message)) # Текст, не пойманный выше
+    # Ловим разные типы для заглушек
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Sticker | filters.VIDEO | filters.VOICE, store_message))
 
-    # --->>> ПРАВИЛЬНЫЕ ОТДЕЛЬНЫЕ ОБРАБОТЧИКИ ДЛЯ store_message <<<---
-    # 1. Только для ТЕКСТА (без команд)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
-    # 2. Только для ФОТО (используем объект filters.PHOTO)
-    application.add_handler(MessageHandler(filters.PHOTO, store_message))
-    # 3. Только для СТИКЕРОВ (используем объект filters.Sticker.ALL или просто filters.Sticker)
-    application.add_handler(MessageHandler(filters.Sticker.ALL, store_message)) # Можно и filters.Sticker
-    # --->>> КОНЕЦ ПРАВИЛЬНЫХ ОБРАБОТЧИКОВ <<<---
     logger.info("Обработчики Telegram добавлены.")
 
-    # 2. Настраиваем Hypercorn для запуска Flask приложения
-    port = int(os.environ.get("PORT", 8080)) # Render передает порт через $PORT
-    hypercorn_config = hypercorn.config.Config()
-    hypercorn_config.bind = [f"0.0.0.0:{port}"]
-    hypercorn_config.worker_class = "asyncio" # Используем asyncio worker
-    # Увеличим таймаут отключения, чтобы бот успел корректно остановиться
-    hypercorn_config.shutdown_timeout = 60.0
-    logger.info(f"Конфигурация Hypercorn: bind={hypercorn_config.bind}, worker={hypercorn_config.worker_class}, shutdown_timeout={hypercorn_config.shutdown_timeout}")
+    # Настройка и запуск Hypercorn + бота
+    port = int(os.environ.get("PORT", 8080)); hypercorn_config = hypercorn.config.Config();
+    hypercorn_config.bind = [f"0.0.0.0:{port}"]; hypercorn_config.worker_class = "asyncio"; hypercorn_config.shutdown_timeout = 60.0
+    logger.info(f"Конфиг Hypercorn: {hypercorn_config.bind}, worker={hypercorn_config.worker_class}")
+    logger.info("Запуск задач Hypercorn и Telegram бота...")
+    shutdown_event = asyncio.Event(); bot_task = asyncio.create_task(run_bot_async(application), name="TelegramBotTask")
+    server_task = asyncio.create_task(hypercorn_async_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait), name="HypercornServerTask")
 
-    # 3. Запускаем обе задачи (веб-сервер и бот) конкурентно в одном event loop
-    logger.info("Создание и запуск конкурентных задач для Hypercorn и Telegram бота...")
-
-    # Создаем задачи
-    # Имя задачи полезно для логов
-    bot_task = asyncio.create_task(run_bot_async(application), name="TelegramBotTask")
-    # Hypercorn будет обслуживать Flask 'app'
-    # Используем 'shutdown_trigger' Hypercorn чтобы он среагировал на сигнал остановки asyncio
-    shutdown_event = asyncio.Event()
-    server_task = asyncio.create_task(
-        hypercorn_async_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait),
-        name="HypercornServerTask"
-    )
-
-    # Ожидаем завершения ЛЮБОЙ из задач. В норме они должны работать вечно.
-    done, pending = await asyncio.wait(
-        [bot_task, server_task], return_when=asyncio.FIRST_COMPLETED
-    )
-
-    logger.warning(f"Одна из основных задач завершилась! Done: {done}, Pending: {pending}")
-
-    # Сигнализируем Hypercorn'у остановиться, если он еще работает
-    if server_task in pending:
-        logger.info("Сигнализируем Hypercorn серверу на остановку...")
-        shutdown_event.set()
-
-    # Пытаемся вежливо отменить и дождаться завершения оставшихся задач
-    logger.info("Отменяем и ожидаем завершения оставшихся задач...")
-    for task in pending:
-        task.cancel()
-    # Даем им шанс завершиться после отмены
+    # Ожидание и обработка завершения
+    done, pending = await asyncio.wait([bot_task, server_task], return_when=asyncio.FIRST_COMPLETED)
+    logger.warning(f"Задача завершилась! Done: {done}, Pending: {pending}")
+    if server_task in pending: logger.info("Остановка Hypercorn..."); shutdown_event.set()
+    logger.info("Отмена остальных задач..."); [task.cancel() for task in pending]
     await asyncio.gather(*pending, return_exceptions=True)
-
-    # Проверяем исключения в завершенных задачах
-    for task in done:
+    for task in done: # Проверка ошибок
         logger.info(f"Проверка завершенной задачи: {task.get_name()}")
-        try:
-            # Если в задаче было исключение, оно поднимется здесь
-            await task
-        except asyncio.CancelledError:
-             logger.info(f"Задача {task.get_name()} была отменена.")
-        except Exception as e:
-            logger.error(f"Задача {task.get_name()} завершилась с ошибкой: {e}", exc_info=True)
+        try: await task
+        except asyncio.CancelledError: logger.info(f"Задача {task.get_name()} отменена.")
+        except Exception as e: logger.error(f"Задача {task.get_name()} не удалась: {e}", exc_info=True)
+    logger.info("main() закончена.")
 
-    logger.info("Асинхронная функция main() завершила работу.")
-
-
-# --- Точка входа в скрипт (ЗАПУСКАЕТ АСИНХРОННУЮ main) ---
+# --- Точка входа в скрипт ---
 if __name__ == "__main__":
-    logger.info(f"Скрипт bot.py запущен как основной (__name__ == '__main__').")
-
-    # Создаем .env шаблон, если надо (остается как было)
+    logger.info(f"Запуск скрипта bot.py...")
+    # Создаем .env шаблон, если надо
     if not os.path.exists('.env') and not os.getenv('RENDER'):
         logger.warning("Файл .env не найден...")
         try:
-            with open('.env', 'w') as f:
-                f.write(f"# Впиши сюда свои реальные ключи!\n")
-                f.write(f"TELEGRAM_BOT_TOKEN=Бэбра\n")
-                f.write(f"GEMINI_API_KEY=Бэбручо\n")
+            with open('.env', 'w') as f: f.write(f"TELEGRAM_BOT_TOKEN=...\nIO_NET_API_KEY=...\nMONGO_DB_URL=...\n# MIR_CARD_NUMBER=...\n# TON_WALLET_ADDRESS=...\n# USDC_WALLET_ADDRESS=...\n# USDC_NETWORK=TRC20\n")
             logger.warning("Создан ШАБЛОН файла .env...")
-        except Exception as e:
-            logger.error(f"Не удалось создать шаблон .env файла: {e}")
+        except Exception as e: logger.error(f"Не удалось создать шаблон .env: {e}")
+    # Проверка ключей
+    if not TELEGRAM_BOT_TOKEN or not IO_NET_API_KEY or not MONGO_DB_URL: logger.critical("ОТСУТСТВУЮТ КЛЮЧЕВЫЕ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ!"); exit(1)
+    # Запуск
+    try: logger.info("Запускаю asyncio.run(main())..."); asyncio.run(main()); logger.info("asyncio.run(main()) завершен.")
+    except Exception as e: logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА: {e}", exc_info=True); exit(1)
+    finally: logger.info("Скрипт bot.py завершает работу.")
 
-    # Проверяем ключи (остается как было)
-    if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
-        logger.critical("ОТСУТСТВУЮТ КЛЮЧИ TELEGRAM_BOT_TOKEN или GEMINI_API_KEY. Не могу запуститься.")
-        exit(1)
-
-    # Запускаем всю эту АСИНХРОННУЮ хуйню через asyncio.run()
-    try:
-        logger.info("Запускаю asyncio.run(main())...")
-        # asyncio.run() автоматически обрабатывает Ctrl+C (SIGINT)
-        asyncio.run(main())
-        logger.info("asyncio.run(main()) завершен.")
-    # Явный перехват KeyboardInterrupt больше не нужен, т.к. asyncio.run и idle() его обрабатывают
-    # except KeyboardInterrupt:
-    #     logger.info("Получен KeyboardInterrupt (Ctrl+C). Завершаю работу...")
-    except Exception as e:
-        # Ловим любые другие ошибки на самом верхнем уровне
-        logger.critical(f"КРИТИЧЕСКАЯ ОШИБКА на верхнем уровне выполнения: {e}", exc_info=True)
-        exit(1) # Выходим с кодом ошибки
-    finally:
-         logger.info("Скрипт bot.py завершает работу.")
-
-# --- КОНЕЦ ПОЛНОГО КОДА BOT.PY (ВЕРСИЯ С ASYNCIO + HYPERCORN) ---
+# --- КОНЕЦ АБСОЛЮТНО ПОЛНОГО КОДА BOT.PY (AI.IO.NET ВЕРСИЯ - ФИНАЛ v2) ---
