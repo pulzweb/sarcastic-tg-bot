@@ -835,7 +835,16 @@ async def main() -> None:
     help_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(ты кто|кто ты|что умеешь|хелп|помощь|справка|команды).*'
     application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Прямой вызов
 
-     # --->>> ПРОВЕРЬ ЭТИ ТРИ СТРОКИ!!! <<<---
+
+    # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
+    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
+
+    # Обработчики для сохранения истории (В САМОМ КОНЦЕ!)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message)) # Текст, не пойманный выше
+    # Ловим разные типы для заглушек
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Sticker | filters.VIDEO | filters.VOICE, store_message))
+
+    # --->>> ПРОВЕРЬ ЭТИ ТРИ СТРОКИ!!! <<<---
     # Обработчики для сохранения истории (В КОНЦЕ!)
     # 1. Только для ТЕКСТА (без команд)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
@@ -847,14 +856,6 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.VIDEO, store_message))
     application.add_handler(MessageHandler(filters.VOICE, store_message))
     # --->>> КОНЕЦ ПРОВЕРКИ <<<---
-
-    # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
-    application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
-
-    # Обработчики для сохранения истории (В САМОМ КОНЦЕ!)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message)) # Текст, не пойманный выше
-    # Ловим разные типы для заглушек
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Sticker | filters.VIDEO | filters.VOICE, store_message))
 
     logger.info("Обработчики Telegram добавлены.")
 
