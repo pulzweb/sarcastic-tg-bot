@@ -560,8 +560,18 @@ async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, 
         target_mention = target_user.mention_html() if target_user and target_user.username else f"<b>{target_name}</b>"
         final_text = f"Прожарка для {target_mention}:\n\n{roast_text}"
 
-        MAX_MESSAGE_LENGTH = 4096;
-        if len(final_text) > MAX_MESSAGE_LENGTH: final_text = f"Прожарка для {target_mention}:\n\n{roast_text[:MAX_MESSAGE_LENGTH - len(f'Прожарка для {target_mention}:\n\n') - 3]}..."
+        MAX_MESSAGE_LENGTH = 4096
+        if len(final_text) > MAX_MESSAGE_LENGTH:
+            logger.warning(f"Роаст слишком длинный ({len(final_text)} символов), обрезаем!")
+            # Сначала формируем префикс
+            prefix = f"Прожарка для {target_mention}:\n\n"
+            # Считаем максимально допустимую длину для самого роаста
+            max_roast_len = MAX_MESSAGE_LENGTH - len(prefix) - 3 # -3 для "..."
+            if max_roast_len < 0: max_roast_len = 0 # На случай, если даже префикс не влезает
+            # Обрезаем сам текст роаста
+            truncated_roast = roast_text[:max_roast_len] + "..."
+            # Собираем итоговый текст
+            final_text = prefix + truncated_roast
         sent_message = await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
         logger.info(f"Отправлен роаст для {target_name}.")
         if sent_message: # Запись для /retry
