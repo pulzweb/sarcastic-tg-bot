@@ -73,7 +73,7 @@ except Exception as e:
      raise SystemExit(f"Не удалось настроить клиента ai.io.net: {e}")
 
 # --- ВЫБОР МОДЕЛЕЙ AI.IO.NET (ПРОВЕРЬ ДОСТУПНОСТЬ!) ---
-IONET_TEXT_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B" # Твоя модель для текста
+IONET_TEXT_MODEL_ID = "deepseek-ai/DeepSeek-R1" # Твоя модель для текста
 IONET_VISION_MODEL_ID = "meta-llama/Llama-3.2-90B-Vision-Instruct" # Для картинок
 logger.info(f"Текстовая модель ai.io.net: {IONET_TEXT_MODEL_ID}")
 logger.info(f"Vision модель ai.io.net: {IONET_VISION_MODEL_ID}")
