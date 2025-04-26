@@ -519,49 +519,92 @@ async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e: logger.error(f"ПИЗДЕЦ при генерации предсказания для {user_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мой шар треснул. Ошибка: `{type(e).__name__}`.")
 
 async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.from_user: return
-    chat_id = update.message.chat_id; user = update.message.from_user; user_name = user.first_name or "Казанова хуев"
+    """Генерирует ебанутый подкат через ai.io.net."""
+    # Проверка на наличие сообщения и пользователя
+    if not update.message or not update.message.from_user:
+        logger.warning("get_pickup_line вызвана без update.message или from_user")
+        return
+
+    chat_id = update.message.chat_id
+    user = update.message.from_user
+    user_name = user.first_name or "Казанова хуев" # Кто запросил
+
     logger.info(f"Пользователь '{user_name}' запросил подкат в чате {chat_id}")
+
+    # --- ПРОМПТ ДЛЯ ЕБАНУТЫХ ПОДКАТОВ ---
     pickup_prompt = (
         f"Ты - генератор самых АБСУРДНЫХ, КРИНЖОВЫХ, НЕОЖИДАННЫХ и тупых подкатов (pickup lines). Твоя задача - придумать ОДНУ короткую (1-2 предложения) фразу для знакомства, которая нарушает все законы логики, здравого смысла и хорошего вкуса. Она должна быть настолько нелепой, что вызовет смех или полный ахуй. Можно использовать немного мата для колорита.\n\n"
+        # Убрали инструкцию про имя цели
         f"ВАЖНО: Максимум абсурда и кринжа! Забудь про романтику и стандартные фразы. НЕ ПИШИ вступлений. СРАЗУ выдавай подкат.\n\n"
-        f"Примеры:\n"
-        f"- Девушка, а вы верите в любовь с первого взгляда, или мне зайти еще раз, но уже с перфоратором?\n"
-        f"- У вас случайно нет изоленты? А то у меня от вашей красоты крыша поехала, надо бы примотать.\n"
-        f"- Простите, вы уронили... Мою самооценку. Она теперь где-то возле ваших ног.\n"
-        f"- Ваши глаза как два озера... в которых я хочу утопить свою бывшую.\n"
-        f"- У вас очень красивые ноги. А вторая?\n"
-        f"- Я потерял свой номер телефона... Можно одолжить ваш?\n"
-        f"- Вы так прекрасны, что я забыл, какую тупую фразу хотел сказать.\n"
-        f"- Я, конечно, не гинеколог, но посмотреть могу.\n\n" # Добавим чуть жести
-        f"Выдай ОДИН подобный АБСУРДНЫЙ/КРИНЖОВЫЙ подкат:"
+        f"Примеры такого пиздеца:\n"
+        f"- Вашей маме зять не нужен? А то моя жена заебала.\n"
+        f"- Девушка, у вас красивое лицо! Но что, блядь, случилось со всем остальным?\n"
+        f"- У тебя такие глаза... В них хочется утонуть. И не выплывать. Никогда.\n"
+        f"- Ты случайно не мой ночной кошмар? Просто выглядишь пиздец знакомо.\n"
+        f"- А ты всегда такая страшная или сегодня просто не твой день?\n"
+        f"- Давай перепихнемся? А то погода хуевая, настроение говно.\n"
+        f"- Я бы пригласил тебя на кофе, но боюсь, ты его прольешь на свою убогую кофточку.\n\n"
+        f"Выдай ОДИН подобный ЕБАНУТЫЙ подкат:"
     )
-    # --->>> КОНЕЦ НОВОГО ПРОМПТА <<<---
+    # --- КОНЕЦ ПРОМПТА ---
 
     try:
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="🗿 Ща, придумаю как подкатить так, чтоб точно в ебало дали...")
-        logger.info(f"Отправка запроса к ai.io.net для генерации подката...") # ИЗМЕНИЛ ЛОГ
-        # Вызываем _call_ionet_api (или model.generate_content_async, если ты на Gemini)
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text="🗿 Ща, подберу фразочку, чтоб точно в ебало дали...")
+        logger.info(f"Отправка запроса к ai.io.net для генерации подката...")
+
+        # Вызываем API с высокой температурой для бреда
         messages_for_api = [{"role": "user", "content": pickup_prompt}]
         pickup_line_text = await _call_ionet_api(
             messages=messages_for_api,
             model_id=IONET_TEXT_MODEL_ID, # Используем текстовую модель
-            max_tokens=100, # Передаем max_tokens
-            temperature=1.2  # Передаем температуру
-        ) or "[Подкат сдох при родах]"
-        if not pickup_line_text.startswith(("🗿", "[")): pickup_line_text = "🗿 " + pickup_line_text
+            max_tokens=100,
+            temperature=1.2  # ВЫСОКАЯ ТЕМПЕРАТУРА!
+        ) or "[Подкат сдох при родах]" # Заглушка
+
+        # Добавляем Моаи, если это не ошибка
+        if not pickup_line_text.startswith(("🗿", "[")):
+            pickup_line_text = "🗿 " + pickup_line_text
+
+        # Удаляем "Думаю..."
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
+
+        # Обрезка на всякий случай
         MAX_MESSAGE_LENGTH = 4096;
-        if len(pickup_line_text) > MAX_MESSAGE_LENGTH: pickup_line_text = pickup_line_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        if len(pickup_line_text) > MAX_MESSAGE_LENGTH:
+            pickup_line_text = pickup_line_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+
+        # Отправляем подкат
         sent_message = await context.bot.send_message(chat_id=chat_id, text=pickup_line_text)
         logger.info(f"Отправлен подкат.")
-        # Запись для /retry
+
+        # Запись для /retry (БЕЗ target_name)
         if sent_message:
-             reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "pickup", "timestamp": datetime.datetime.now(datetime.timezone.utc) } # Добавили тип
-             try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
-             except Exception as e: logger.error(f"Ошибка записи /retry (pickup) в MongoDB: {e}")
-    except Exception as e: logger.error(f"ПИЗДЕЦ при генерации подката: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, пикап-мастер сломался. Ошибка: `{type(e).__name__}`.")
+             reply_doc = {
+                 "chat_id": chat_id,
+                 "message_id": sent_message.message_id,
+                 "analysis_type": "pickup", # Тип для /retry
+                 "timestamp": datetime.datetime.now(datetime.timezone.utc)
+             }
+             try:
+                 loop = asyncio.get_running_loop()
+                 await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+                 logger.debug(f"Сохранен ID ({sent_message.message_id}, pickup) для /retry чата {chat_id}.")
+             except Exception as e:
+                 logger.error(f"Ошибка записи /retry (pickup) в MongoDB: {e}")
+
+    except Exception as e:
+        # Обработка общих ошибок
+        logger.error(f"ПИЗДЕЦ при генерации подката: {e}", exc_info=True)
+        try:
+            # Пытаемся удалить "Думаю..." даже при ошибке
+            if 'thinking_message' in locals():
+                 await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+        # Отправляем сообщение об ошибке
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, пикап-мастер сломался. Ошибка: `{type(e).__name__}`.")
+
+# --- КОНЕЦ ПОЛНОЙ ИСПРАВЛЕННОЙ ФУНКЦИИ ДЛЯ ПОДКАТОВ ---
 
 
 # --- МОДИФИЦИРОВАННАЯ roast_user (для /retry ЗАГЛУШКИ) ---
