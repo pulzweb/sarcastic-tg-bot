@@ -839,23 +839,18 @@ async def main() -> None:
     # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
 
-    # Обработчики для сохранения истории (В САМОМ КОНЦЕ!)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message)) # Текст, не пойманный выше
-    # Ловим разные типы для заглушек
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Sticker | filters.VIDEO | filters.VOICE, store_message))
-
-    # --->>> ПРОВЕРЬ ЭТИ ТРИ СТРОКИ!!! <<<---
-    # Обработчики для сохранения истории (В КОНЦЕ!)
+    # --->>> ВОТ ЭТИ ПЯТЬ СТРОК НУЖНЫ <<<---
     # 1. Только для ТЕКСТА (без команд)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
-    # 2. Только для ФОТО (используем объект filters.PHOTO)
+    # 2. Только для ФОТО
     application.add_handler(MessageHandler(filters.PHOTO, store_message))
-    # 3. Только для СТИКЕРОВ (используем объект filters.Sticker.ALL или просто filters.Sticker)
-    application.add_handler(MessageHandler(filters.Sticker.ALL, store_message)) # Можно и filters.Sticker
-    # 4. МОЖНО ДОБАВИТЬ ДЛЯ ВИДЕО И ГОЛОСА ТАК ЖЕ ОТДЕЛЬНО:
+    # 3. Только для СТИКЕРОВ
+    application.add_handler(MessageHandler(filters.Sticker.ALL, store_message))
+    # 4. Только для ВИДЕО
     application.add_handler(MessageHandler(filters.VIDEO, store_message))
+    # 5. Только для ГОЛОСА
     application.add_handler(MessageHandler(filters.VOICE, store_message))
-    # --->>> КОНЕЦ ПРОВЕРКИ <<<---
+    # --->>> КОНЕЦ <<<---
 
     logger.info("Обработчики Telegram добавлены.")
 
