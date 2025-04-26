@@ -540,13 +540,15 @@ async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     try:
         thinking_message = await context.bot.send_message(chat_id=chat_id, text="🗿 Ща, придумаю как подкатить так, чтоб точно в ебало дали...")
-        # --->>> УВЕЛИЧИМ ТЕМПЕРАТУРУ ДЛЯ БОЛЬШЕГО БРЕДА <<<---
-        generation_config = genai.types.GenerationConfig(max_output_tokens=100, temperature=1.2) # <--- Температура ВЫШЕ!
-        safety_settings={'HARM_CATEGORY_HARASSMENT': 'block_none', 'HATE_SPEECH': 'block_none', 'SEXUALLY_EXPLICIT': 'block_none', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'block_none'}
-
+        logger.info(f"Отправка запроса к ai.io.net для генерации подката...") # ИЗМЕНИЛ ЛОГ
         # Вызываем _call_ionet_api (или model.generate_content_async, если ты на Gemini)
         messages_for_api = [{"role": "user", "content": pickup_prompt}]
-        pickup_line_text = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 100, 1.2) or "[Подкат сдох]" # Передаем новую температуру!
+        pickup_line_text = await _call_ionet_api(
+            messages=messages_for_api,
+            model_id=IONET_TEXT_MODEL_ID, # Используем текстовую модель
+            max_tokens=100, # Передаем max_tokens
+            temperature=1.2  # Передаем температуру
+        ) or "[Подкат сдох при родах]"
         if not pickup_line_text.startswith(("🗿", "[")): pickup_line_text = "🗿 " + pickup_line_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
