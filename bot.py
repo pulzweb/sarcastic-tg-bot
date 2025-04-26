@@ -156,6 +156,15 @@ async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE
         ]
         thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"Так, блядь, щас подключу мозги {IONET_TEXT_MODEL_ID.split('/')[1].split('-')[0]}...")
         sarcastic_summary = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 350, 0.7) or "[Модель промолчала]"
+        # --->>> ВСТАВЛЯЕМ КОД УДАЛЕНИЯ <think> ТЕГОВ ЗДЕСЬ <<<---
+        if sarcastic_summary and "<think>" in sarcastic_summary.lower() and "</think>" in sarcastic_summary.lower(): # Ищем регистронезависимо
+            logger.info("Обнаружены теги <think>, удаляем...")
+            # Удаляем все между <think> и </think> включительно, плюс возможные пробелы после
+            # re.DOTALL заставляет точку '.' совпадать и с символом переноса строки
+            # re.IGNORECASE делает поиск тегов регистронезависимым
+            sarcastic_summary = re.sub(r"<think>.*?</think>\s*", "", sarcastic_summary, flags=re.DOTALL | re.IGNORECASE).strip()
+            logger.info(f"Текст после удаления <think>: '{sarcastic_summary[:50]}...'")
+        # --->>> КОНЕЦ ВСТАВКИ <<<---
         if not sarcastic_summary.startswith("🗿") and not sarcastic_summary.startswith("["): sarcastic_summary = "🗿 " + sarcastic_summary
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
