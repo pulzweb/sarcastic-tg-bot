@@ -835,6 +835,19 @@ async def main() -> None:
     help_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(ты кто|кто ты|что умеешь|хелп|помощь|справка|команды).*'
     application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Прямой вызов
 
+     # --->>> ПРОВЕРЬ ЭТИ ТРИ СТРОКИ!!! <<<---
+    # Обработчики для сохранения истории (В КОНЦЕ!)
+    # 1. Только для ТЕКСТА (без команд)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
+    # 2. Только для ФОТО (используем объект filters.PHOTO)
+    application.add_handler(MessageHandler(filters.PHOTO, store_message))
+    # 3. Только для СТИКЕРОВ (используем объект filters.Sticker.ALL или просто filters.Sticker)
+    application.add_handler(MessageHandler(filters.Sticker.ALL, store_message)) # Можно и filters.Sticker
+    # 4. МОЖНО ДОБАВИТЬ ДЛЯ ВИДЕО И ГОЛОСА ТАК ЖЕ ОТДЕЛЬНО:
+    application.add_handler(MessageHandler(filters.VIDEO, store_message))
+    application.add_handler(MessageHandler(filters.VOICE, store_message))
+    # --->>> КОНЕЦ ПРОВЕРКИ <<<---
+
     # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
 
