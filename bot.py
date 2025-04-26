@@ -120,68 +120,121 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await loop.run_in_executor(None, lambda: chat_activity_collection.update_one({"chat_id": chat_id}, activity_update_doc, upsert=True))
         except Exception as e: logger.error(f"Ошибка записи в MongoDB чата {chat_id}: {e}", exc_info=True)
 
-# --- ОБРАБОТЧИК КОМАНДЫ /analyze ---
+import re # Убедись, что есть этот импорт в начале bot.py
+# Другие нужные импорты (Update, User, ContextTypes, pymongo, asyncio, datetime, logger, _call_ionet_api, IONET_TEXT_MODEL_ID, MAX_MESSAGES_TO_ANALYZE, history_collection, last_reply_collection)
+
+# --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С УЛУЧШЕННЫМ УДАЛЕНИЕМ <think>) ---
 async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None) -> None:
-    if update and update.message: chat_id = update.message.chat_id; user = update.message.from_user
-    elif direct_chat_id and direct_user: chat_id = direct_chat_id; user = direct_user
-    else: logger.error("analyze_chat вызвана некорректно!"); return
-    user_name = user.first_name if user else "Хуй Пойми Кто"
+    # Получаем chat_id и user либо из Update, либо из прямых аргументов
+    if update and update.message:
+        chat_id = update.message.chat_id
+        user = update.message.from_user
+        user_name = user.first_name if user else "Хуй Пойми Кто"
+    elif direct_chat_id and direct_user:
+        chat_id = direct_chat_id
+        user = direct_user
+        user_name = user.first_name or "Переделкин" # Имя для retry
+    else:
+        logger.error("analyze_chat вызвана некорректно!")
+        return
+
     logger.info(f"Пользователь '{user_name}' запросил анализ текста в чате {chat_id} через {IONET_TEXT_MODEL_ID}")
+
+    # --- ЧТЕНИЕ ИСТОРИИ ИЗ MONGODB ---
     messages_from_db = []
-    try: # Чтение из БД
-        limit = MAX_MESSAGES_TO_ANALYZE; query = {"chat_id": chat_id}; sort_order = [("timestamp", pymongo.DESCENDING)]
-        loop = asyncio.get_running_loop(); history_cursor = await loop.run_in_executor(None, lambda: history_collection.find(query).sort(sort_order).limit(limit))
-        messages_from_db = list(history_cursor)[::-1]; history_len = len(messages_from_db)
+    try:
+        logger.debug(f"Запрос истории для чата {chat_id} из MongoDB...")
+        limit = MAX_MESSAGES_TO_ANALYZE
+        query = {"chat_id": chat_id}
+        sort_order = [("timestamp", pymongo.DESCENDING)]
+        loop = asyncio.get_running_loop()
+        history_cursor = await loop.run_in_executor(
+            None, lambda: history_collection.find(query).sort(sort_order).limit(limit)
+        )
+        messages_from_db = list(history_cursor)[::-1] # Переворачиваем
+        history_len = len(messages_from_db)
         logger.info(f"Из MongoDB для чата {chat_id} загружено {history_len} сообщений.")
-    except Exception as e: logger.error(f"Ошибка чтения истории MongoDB: {e}"); await context.bot.send_message(chat_id=chat_id, text="Бля, не смог прочитать историю из БД."); return
+    except Exception as e:
+        logger.error(f"Ошибка чтения истории MongoDB: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="Бля, не смог прочитать историю из БД.")
+        return
+
+    # Проверяем, достаточно ли сообщений
     min_msgs = 10
-    if history_len < min_msgs: await context.bot.send_message(chat_id=chat_id, text=f"Слышь, {user_name}, надо {min_msgs} сообщений, а в БД {history_len}."); return
+    if history_len < min_msgs:
+        logger.info(f"В чате {chat_id} слишком мало сообщений в БД ({history_len}/{min_msgs}).")
+        await context.bot.send_message(chat_id=chat_id, text=f"Слышь, {user_name}, надо {min_msgs} сообщений, а в БД {history_len}.")
+        return
+
+    # Формируем текст для ИИ
     conversation_lines = [f"{msg.get('user_name', '?')}: {msg.get('text', '')}" for msg in messages_from_db]
     conversation_text = "\n".join(conversation_lines)
     logger.info(f"Начинаю анализ {len(messages_from_db)} сообщений через {IONET_TEXT_MODEL_ID}...")
-    try: # Вызов ИИ
+
+    # Вызов ИИ
+    try:
+        # Промпт (оставляем тот, что с сутью и панчлайном, но с запретом мета)
         system_prompt = (
-            "Проанализируй диалог ниже. Выдели 1-3 самых интересных или тупых момента. Для каждого момента кратко (1-2 предложения) опиши суть, УКАЗАВ ИМЕНА участников. Используй МАТ и САРКАЗМ. Начинай каждый комментарий с '🗿 '. Если ничего интересного нет - напиши '🗿 Унылое болото.'.\n"
-            "ВАЖНО: НЕ пиши никаких вступлений, объяснений или рассуждений о том, как ты будешь выполнять задание. СРАЗУ ПИШИ ТОЛЬКО РЕЗУЛЬТАТ АНАЛИЗА в указанном формате.\n\n"
-            "Пример результата:\n"
-            "🗿 Васян доказывал Пете преимущества диеты на воде. — Пиздец гений.\n"
-            "🗿 Катя и Лена обсуждали цвет трусов. — Высокие материи.\n\n"
-            "Вот диалог для анализа:"
-            # Заметь: conversation_text передается ОТДЕЛЬНО в user-сообщении!
-            # Промпт Gemini мы делали как одну строку, а для OpenAI-стиля лучше разделить.
+            f"Ты - въедливый и язвительный сплетник-летописец Telegram-чата. Проанализируй диалог ниже и выдели 1-3 самых интересных/тупых момента, УКАЗАВ КТО (по именам/никам) что сказал/сделал. "
+            f"Для каждого момента: СНАЧАЛА кратко опиши суть (1 предложение), ПОТОМ добавь КОРОТКИЙ (3-7 слов) саркастичный МАТЕРНЫЙ панчлайн. "
+            f"Начинай каждый блок с '🗿 '. Если ничего нет - напиши '🗿 Унылое болото.'.\n"
+            f"ВАЖНО: НЕ пиши никаких вступлений, объяснений, рассуждений о задании или тегов типа <think>. СРАЗУ ПИШИ ТОЛЬКО РЕЗУЛЬТАТ АНАЛИЗА в указанном формате (🗿 Суть. - Панчлайн.).\n\n" # Усилили запрет
+            f"Пример результата:\n"
+            f"🗿 Васян доказывал Пете преимущества диеты на воде.\n— Пиздец гений.\n" # Пример с переносом строки для панчлайна
+            f"🗿 Катя и Лена обсуждали цвет трусов.\n— Высокие материи, блядь.\n\n"
+            f"Вот диалог для анализа:"
         )
         messages_for_api = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Проанализируй этот диалог:\n```\n{conversation_text}\n```"} # Передаем текст как сообщение юзера
+            # Передаем сам диалог как сообщение пользователя
+            {"role": "user", "content": f"Проанализируй этот диалог:\n```\n{conversation_text}\n```"}
         ]
+
         thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"Так, блядь, щас подключу мозги {IONET_TEXT_MODEL_ID.split('/')[1].split('-')[0]}...")
+
+        # Вызываем вспомогательную функцию
         sarcastic_summary = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 350, 0.7) or "[Модель промолчала]"
-        # --->>> ВСТАВЛЯЕМ КОД УДАЛЕНИЯ <think> ТЕГОВ ЗДЕСЬ <<<---
-        if sarcastic_summary and "<think>" in sarcastic_summary.lower() and "</think>" in sarcastic_summary.lower(): # Ищем регистронезависимо
+
+        # --->>> УЛУЧШЕННОЕ УДАЛЕНИЕ <think> ТЕГОВ <<<---
+        # Компилируем регулярку один раз для эффективности (хотя тут не критично)
+        think_pattern = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+        if sarcastic_summary and think_pattern.search(sarcastic_summary):
             logger.info("Обнаружены теги <think>, удаляем...")
-            # Удаляем все между <think> и </think> включительно, плюс возможные пробелы после
-            # re.DOTALL заставляет точку '.' совпадать и с символом переноса строки
-            # re.IGNORECASE делает поиск тегов регистронезависимым
-            sarcastic_summary = re.sub(r"<think>.*?</think>\s*", "", sarcastic_summary, flags=re.DOTALL | re.IGNORECASE).strip()
+            # Заменяем найденное на пустую строку и убираем лишние пробелы по краям
+            sarcastic_summary = think_pattern.sub("", sarcastic_summary).strip()
             logger.info(f"Текст после удаления <think>: '{sarcastic_summary[:50]}...'")
-        # --->>> КОНЕЦ ВСТАВКИ <<<---
-        if not sarcastic_summary.startswith("🗿") and not sarcastic_summary.startswith("["): sarcastic_summary = "🗿 " + sarcastic_summary
+        # --->>> КОНЕЦ УЛУЧШЕНИЯ <<<---
+
+        # Добавляем Моаи, если его нет и это не ошибка
+        if not sarcastic_summary.startswith("🗿") and not sarcastic_summary.startswith("["):
+            sarcastic_summary = "🗿 " + sarcastic_summary
+
+        # Удаляем "Думаю..."
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        MAX_MESSAGE_LENGTH = 4096; # Обрезка
+
+        # Страховочная обрезка и отправка
+        MAX_MESSAGE_LENGTH = 4096;
         if len(sarcastic_summary) > MAX_MESSAGE_LENGTH: sarcastic_summary = sarcastic_summary[:MAX_MESSAGE_LENGTH - 3] + "..."
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_summary)
-        logger.info(f"Отправил результат анализа '{sarcastic_summary[:50]}...'")
-        if sent_message: # Запись для /retry
+        logger.info(f"Отправил результат анализа ai.io.net '{sarcastic_summary[:50]}...'")
+
+        # Запись для /retry
+        if sent_message:
              reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "text", "timestamp": datetime.datetime.now(datetime.timezone.utc) }
-             try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+             try:
+                 loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+                 logger.debug(f"Сохранен/обновлен ID ({sent_message.message_id}, text) для /retry чата {chat_id}.")
              except Exception as e: logger.error(f"Ошибка записи /retry (text) в MongoDB: {e}")
-    except Exception as e: # Общая ошибка
+
+    except Exception as e: # Общая ошибка самого analyze_chat
         logger.error(f"ПИЗДЕЦ в analyze_chat (после чтения БД): {e}", exc_info=True)
         try:
             if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
         await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, я обосрался при анализе чата. Ошибка: `{type(e).__name__}`.")
+
+# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ analyze_chat ---
 
 # --- ОБРАБОТЧИК КОМАНДЫ /analyze_pic (ПЕРЕПИСАН ПОД VISION МОДЕЛЬ) ---
 async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_file_id: str | None = None) -> None:
@@ -212,7 +265,7 @@ async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE,
         photo_bytes = bytes(photo_bytes_io)
         if not photo_bytes: raise ValueError("Скачаны пустые байты картинки")
         logger.info(f"Картинка скачана, размер: {len(photo_bytes)} байт.")
-        iimage_prompt_text = ( # Текстовая часть для мультимодального запроса
+        image_prompt_text = ( # Текстовая часть для мультимодального запроса
             "Ты - МАКСИМАЛЬНО циничный и токсичный уебок с черным юмором. Посмотри на КАРТИНКУ и ОБОСРИ то, что на ней происходит (СЮЖЕТ, ДЕЙСТВИЕ, ПРЕДМЕТЫ), максимально смешно, жестко, цинично и с МАТОМ в 1-3 предложениях. Стебись над СМЫСЛОМ, ПЕРСОНАЖАМИ, СИТУАЦИЕЙ. Начинай высер с '🗿 '.\n"
             "ВАЖНО: НЕ ПИШИ ВСТУПЛЕНИЙ! СРАЗУ ВЫДАЙ ТОЛЬКО КОММЕНТАРИЙ К КАРТИНКЕ.\n\n"
             "Пример (кот в коробке): '🗿 О, блядь, кошачий долбоеб нашел ВИП-ложе...'\n"
