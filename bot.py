@@ -33,40 +33,6 @@ IO_NET_API_KEY = os.getenv("IO_NET_API_KEY")
 MONGO_DB_URL = os.getenv("MONGO_DB_URL")
 MAX_MESSAGES_TO_ANALYZE = 200 # Оптимальное значение
 
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0")) # Читаем ID админа, 0 - если не задан
-if ADMIN_USER_ID == 0:
-    logger.warning("ADMIN_USER_ID не задан! Команды техработ будут недоступны.")
-
-# --- Функции для работы с режимом техработ ---
-async def is_maintenance_active(loop: asyncio.AbstractEventLoop) -> bool:
-    """Проверяет в MongoDB, активен ли режим техработ."""
-    try:
-        status_doc = await loop.run_in_executor(
-            None,
-            lambda: bot_status_collection.find_one({"_id": "maintenance_status"})
-        )
-        return status_doc.get("active", False) if status_doc else False
-    except Exception as e:
-        logger.error(f"Ошибка чтения статуса техработ из MongoDB: {e}")
-        return False # По умолчанию считаем, что не активен, если ошибка
-
-async def set_maintenance_mode(active: bool, loop: asyncio.AbstractEventLoop) -> bool:
-    """Включает или выключает режим техработ в MongoDB."""
-    try:
-        await loop.run_in_executor(
-            None,
-            lambda: bot_status_collection.update_one(
-                {"_id": "maintenance_status"},
-                {"$set": {"active": active, "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
-                upsert=True
-            )
-        )
-        logger.info(f"Режим техработ {'ВКЛЮЧЕН' if active else 'ВЫКЛЮЧЕН'}.")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка записи статуса техработ в MongoDB: {e}")
-        return False
-# --- Конец функций ---
 
 # Проверка ключей
 if not TELEGRAM_BOT_TOKEN: raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
@@ -137,6 +103,30 @@ async def _call_ionet_api(messages: list, model_id: str, max_tokens: int, temper
     except Exception as e:
         logger.error(f"ПИЗДЕЦ при вызове ai.io.net API ({model_id}): {e}", exc_info=True)
         return f"🗿 Ошибка API: `{type(e).__name__}`"
+    
+    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+    if ADMIN_USER_ID == 0: logger.warning("ADMIN_USER_ID не задан!")
+
+# --->>> ВОТ ЭТИ ДВЕ ФУНКЦИИ НУЖНЫ ЗДЕСЬ <<<---
+async def is_maintenance_mode(loop: asyncio.AbstractEventLoop) -> bool:
+    """Проверяет в MongoDB, активен ли режим техработ."""
+    try:
+        status_doc = await loop.run_in_executor(None, lambda: bot_status_collection.find_one({"_id": "maintenance_status"}))
+        return status_doc.get("active", False) if status_doc else False
+    except Exception as e:
+        logger.error(f"Ошибка чтения статуса техработ из MongoDB: {e}")
+        return False
+
+async def set_maintenance_mode(active: bool, loop: asyncio.AbstractEventLoop) -> bool:
+    """Включает или выключает режим техработ в MongoDB."""
+    try:
+        await loop.run_in_executor(None, lambda: bot_status_collection.update_one({"_id": "maintenance_status"},{"$set": {"active": active, "updated_at": datetime.datetime.now(datetime.timezone.utc)} }, upsert=True))
+        logger.info(f"Режим техработ {'ВКЛЮЧЕН' if active else 'ВЫКЛЮЧЕН'}.")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка записи статуса техработ в MongoDB: {e}")
+        return False
+# --->>> КОНЕЦ ФУНКЦИЙ ДЛЯ ТЕХРАБОТ <<<---
 
 # --- ОБРАБОТЧИК СООБЩЕНИЙ (ЗАПИСЬ В БД) ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,22 +152,31 @@ import re # Убедись, что есть этот импорт в начал�
 
 # --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С УЛУЧШЕННЫМ УДАЛЕНИЕМ <think>) ---
 async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+     # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда analyze отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     # Получаем chat_id и user либо из Update, либо из прямых аргументов
     if update and update.message:
         chat_id = update.message.chat_id
@@ -291,22 +290,31 @@ async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE
 
 # --- ОБРАБОТЧИК КОМАНДЫ /analyze_pic (ПЕРЕПИСАН ПОД VISION МОДЕЛЬ) ---
 async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_file_id: str | None = None) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+     # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда analyze_pic отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     # Получаем chat_id, user, user_name, image_file_id (из update или аргументов)
     image_file_id = None; chat_id = None; user = None; user_name = "Фотограф хуев"
     retry_key = f'retry_pic_{direct_chat_id or (update.message.chat_id if update and update.message else None)}'
@@ -375,22 +383,31 @@ async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE,
 
 # --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /retry (ВЕРСИЯ ДЛЯ БД, БЕЗ FAKE UPDATE) ---
 async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда retry отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Повторяет последний анализ (текста, картинки, стиха и т.д.), читая данные из MongoDB и вызывая нужную функцию напрямую."""
     if not update.message or not update.message.reply_to_message:
         await context.bot.send_message(chat_id=update.message.chat_id, text="Надо ответить этой командой на тот МОЙ высер, который ты хочешь переделать.")
@@ -496,22 +513,31 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ /retry ---
 
 async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда poem отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Генерирует саркастичный стишок про указанное имя."""
     # --->>> ЗАМЕНЯЕМ КОММЕНТАРИЙ НА РЕАЛЬНЫЙ КОД <<<---
     chat_id = None
@@ -589,22 +615,31 @@ async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e: logger.error(f"ПИЗДЕЦ при генерации стиха про {target_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу сочинить про '{target_name}'. Ошибка: `{type(e).__name__}`.")
 
 async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда prediction отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     if not update.message or not update.message.from_user: return
     chat_id = update.message.chat_id; user = update.message.from_user; user_name = user.first_name or "Любопытная Варвара"
     logger.info(f"Пользователь '{user_name}' запросил предсказание в чате {chat_id}")
@@ -637,22 +672,31 @@ async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e: logger.error(f"ПИЗДЕЦ при генерации предсказания для {user_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мой шар треснул. Ошибка: `{type(e).__name__}`.")
 
 async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда pickup отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Генерирует ебанутый подкат через ai.io.net."""
     # Проверка на наличие сообщения и пользователя
     if not update.message or not update.message.from_user:
@@ -743,22 +787,31 @@ async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # --- МОДИФИЦИРОВАННАЯ roast_user (для /retry ЗАГЛУШКИ) ---
 async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_gender_hint: str | None = None) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда roast отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     target_user = None; target_name = "это хуйло"; gender_hint = "неизвестен"; chat_id = None; user = None; user_name = "Заказчик"
     is_retry = False # Флаг, что это вызов из retry
 
@@ -957,22 +1010,31 @@ async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- ФУНКЦИЯ ДЛЯ /help ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
-    # Определяем реальный chat_id и user_id
-    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
-    real_user_id = (direct_user.id if direct_user else
-                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
-    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
 
-    if real_chat_id and real_user_id: # Только если у нас есть данные
-        loop = asyncio.get_running_loop()
-        maintenance = await is_maintenance_mode(loop)
-        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
-        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-            logger.info(f"Команда help отклонена из-за режима техработ в чате {real_chat_id}")
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
             await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            return # ВЫХОДИМ ИЗ ФУНКЦИИ
-    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Отправляет сообщение со справкой о возможностях бота и реквизитами для доната."""
     user_name = update.message.from_user.first_name or "щедрый ты мой"
     logger.info(f"Пользователь '{user_name}' запросил справку (/help)")
@@ -1115,6 +1177,17 @@ async def main() -> None:
     application.add_handler(CommandHandler("roast", roast_user))
     application.add_handler(CommandHandler("retry", retry_analysis))
     application.add_handler(CommandHandler("help", help_command))
+
+    # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ТЕХРАБОТ <<<---
+    # Regex для ВКЛючения техработ
+    maint_on_pattern = r'(?i).*(?:бот|попиздяка).*(?:техработ|ремонт|на ремонт|обслуживание|админ вкл).*'
+    # Ловим ТОЛЬКО текст, БЕЗ команд, в ЛЮБОМ чате (проверка админа и ЛС будет ВНУТРИ функции)
+    application.add_handler(MessageHandler(filters.Regex(maint_on_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_on)) # Вызываем ту же функцию!
+
+    # Regex для ВЫКЛючения техработ
+    maint_off_pattern = r'(?i).*(?:бот|попиздяка).*(?:работай|работать|кончил|закончил|ремонт окончен|админ выкл).*'
+    application.add_handler(MessageHandler(filters.Regex(maint_off_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_off)) # Вызываем ту же функцию!
+    # --->>> КОНЕЦ ДОБАВЛЕНИЙ <<<---
 
     # Добавляем обработчики русских фраз (вызывают ТЕ ЖЕ функции)
     # Можно добавить больше синонимов
