@@ -32,6 +32,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IO_NET_API_KEY = os.getenv("IO_NET_API_KEY")
 MONGO_DB_URL = os.getenv("MONGO_DB_URL")
 MAX_MESSAGES_TO_ANALYZE = 200 # Оптимальное значение
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+if ADMIN_USER_ID == 0: logger.warning("ADMIN_USER_ID не задан!")
 
 
 # Проверка ключей
