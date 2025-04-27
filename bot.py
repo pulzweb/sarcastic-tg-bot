@@ -33,6 +33,41 @@ IO_NET_API_KEY = os.getenv("IO_NET_API_KEY")
 MONGO_DB_URL = os.getenv("MONGO_DB_URL")
 MAX_MESSAGES_TO_ANALYZE = 200 # Оптимальное значение
 
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0")) # Читаем ID админа, 0 - если не задан
+if ADMIN_USER_ID == 0:
+    logger.warning("ADMIN_USER_ID не задан! Команды техработ будут недоступны.")
+
+# --- Функции для работы с режимом техработ ---
+async def is_maintenance_active(loop: asyncio.AbstractEventLoop) -> bool:
+    """Проверяет в MongoDB, активен ли режим техработ."""
+    try:
+        status_doc = await loop.run_in_executor(
+            None,
+            lambda: bot_status_collection.find_one({"_id": "maintenance_status"})
+        )
+        return status_doc.get("active", False) if status_doc else False
+    except Exception as e:
+        logger.error(f"Ошибка чтения статуса техработ из MongoDB: {e}")
+        return False # По умолчанию считаем, что не активен, если ошибка
+
+async def set_maintenance_mode(active: bool, loop: asyncio.AbstractEventLoop) -> bool:
+    """Включает или выключает режим техработ в MongoDB."""
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: bot_status_collection.update_one(
+                {"_id": "maintenance_status"},
+                {"$set": {"active": active, "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
+                upsert=True
+            )
+        )
+        logger.info(f"Режим техработ {'ВКЛЮЧЕН' if active else 'ВЫКЛЮЧЕН'}.")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка записи статуса техработ в MongoDB: {e}")
+        return False
+# --- Конец функций ---
+
 # Проверка ключей
 if not TELEGRAM_BOT_TOKEN: raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
 if not IO_NET_API_KEY: raise ValueError("НЕ НАЙДЕН IO_NET_API_KEY!")
@@ -57,6 +92,8 @@ try:
     chat_activity_collection = db['chat_activity']
     chat_activity_collection.create_index("chat_id", unique=True)
     logger.info("Коллекции MongoDB готовы.")
+    bot_status_collection = db['bot_status']
+    logger.info("Коллекция bot_status готова.")
 except Exception as e:
     logger.critical(f"ПИЗДЕЦ при настройке MongoDB: {e}", exc_info=True)
     raise SystemExit(f"Ошибка настройки MongoDB: {e}")
@@ -125,6 +162,22 @@ import re # Убедись, что есть этот импорт в начал�
 
 # --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С УЛУЧШЕННЫМ УДАЛЕНИЕМ <think>) ---
 async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда analyze отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     # Получаем chat_id и user либо из Update, либо из прямых аргументов
     if update and update.message:
         chat_id = update.message.chat_id
@@ -238,6 +291,22 @@ async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE
 
 # --- ОБРАБОТЧИК КОМАНДЫ /analyze_pic (ПЕРЕПИСАН ПОД VISION МОДЕЛЬ) ---
 async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_file_id: str | None = None) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда analyze_pic отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     # Получаем chat_id, user, user_name, image_file_id (из update или аргументов)
     image_file_id = None; chat_id = None; user = None; user_name = "Фотограф хуев"
     retry_key = f'retry_pic_{direct_chat_id or (update.message.chat_id if update and update.message else None)}'
@@ -306,6 +375,22 @@ async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE,
 
 # --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /retry (ВЕРСИЯ ДЛЯ БД, БЕЗ FAKE UPDATE) ---
 async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда retry отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Повторяет последний анализ (текста, картинки, стиха и т.д.), читая данные из MongoDB и вызывая нужную функцию напрямую."""
     if not update.message or not update.message.reply_to_message:
         await context.bot.send_message(chat_id=update.message.chat_id, text="Надо ответить этой командой на тот МОЙ высер, который ты хочешь переделать.")
@@ -411,6 +496,22 @@ async def retry_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ /retry ---
 
 async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда poem отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Генерирует саркастичный стишок про указанное имя."""
     # --->>> ЗАМЕНЯЕМ КОММЕНТАРИЙ НА РЕАЛЬНЫЙ КОД <<<---
     chat_id = None
@@ -488,6 +589,22 @@ async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e: logger.error(f"ПИЗДЕЦ при генерации стиха про {target_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу сочинить про '{target_name}'. Ошибка: `{type(e).__name__}`.")
 
 async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда prediction отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     if not update.message or not update.message.from_user: return
     chat_id = update.message.chat_id; user = update.message.from_user; user_name = user.first_name or "Любопытная Варвара"
     logger.info(f"Пользователь '{user_name}' запросил предсказание в чате {chat_id}")
@@ -520,6 +637,22 @@ async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e: logger.error(f"ПИЗДЕЦ при генерации предсказания для {user_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мой шар треснул. Ошибка: `{type(e).__name__}`.")
 
 async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда pickup отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Генерирует ебанутый подкат через ai.io.net."""
     # Проверка на наличие сообщения и пользователя
     if not update.message or not update.message.from_user:
@@ -610,6 +743,22 @@ async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # --- МОДИФИЦИРОВАННАЯ roast_user (для /retry ЗАГЛУШКИ) ---
 async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_gender_hint: str | None = None) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда roast отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     target_user = None; target_name = "это хуйло"; gender_hint = "неизвестен"; chat_id = None; user = None; user_name = "Заказчик"
     is_retry = False # Флаг, что это вызов из retry
 
@@ -808,6 +957,22 @@ async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- ФУНКЦИЯ ДЛЯ /help ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # Определяем реальный chat_id и user_id
+    real_chat_id = direct_chat_id or (update.message.chat_id if update and update.message else None)
+    real_user_id = (direct_user.id if direct_user else
+                    (update.message.from_user.id if update and update.message and update.message.from_user else None))
+    real_chat_type = update.message.chat.type if update and update.message else 'private' # Предполагаем private для retry
+
+    if real_chat_id and real_user_id: # Только если у нас есть данные
+        loop = asyncio.get_running_loop()
+        maintenance = await is_maintenance_mode(loop)
+        # Блокируем, если техработы ВКЛЮЧЕНЫ и команда вызвана НЕ админом ИЛИ НЕ в ЛС
+        if maintenance and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+            logger.info(f"Команда help отклонена из-за режима техработ в чате {real_chat_id}")
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            return # ВЫХОДИМ ИЗ ФУНКЦИИ
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     """Отправляет сообщение со справкой о возможностях бота и реквизитами для доната."""
     user_name = update.message.from_user.first_name or "щедрый ты мой"
     logger.info(f"Пользователь '{user_name}' запросил справку (/help)")
@@ -902,6 +1067,31 @@ async def run_bot_async(application: Application) -> None: # Запускает 
         if application.updater and application.updater.is_running: await application.updater.stop(); logger.info("Updater stopped.")
         await application.shutdown(); logger.info("Bot stopped.")
 
+# --- ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ ТЕХРАБОТАМИ (ТОЛЬКО АДМИН В ЛС) ---
+async def maintenance_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Включает режим техработ (только админ в ЛС)."""
+    user_id = update.message.from_user.id
+    chat_type = update.message.chat.type
+    if user_id == ADMIN_USER_ID and chat_type == 'private':
+        loop = asyncio.get_running_loop()
+        success = await set_maintenance_mode(True, loop)
+        await update.message.reply_text(f"🔧 Режим техработ {'УСПЕШНО ВКЛЮЧЕН' if success else 'НЕ УДАЛОСЬ ВКЛЮЧИТЬ (ошибка БД)'}.")
+    else:
+        await update.message.reply_text("Эта команда доступна только админу в личной переписке.")
+
+async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Выключает режим техработ (только админ в ЛС)."""
+    user_id = update.message.from_user.id
+    chat_type = update.message.chat.type
+    if user_id == ADMIN_USER_ID and chat_type == 'private':
+        loop = asyncio.get_running_loop()
+        success = await set_maintenance_mode(False, loop)
+        await update.message.reply_text(f"✅ Режим техработ {'УСПЕШНО ВЫКЛЮЧЕН' if success else 'НЕ УДАЛОСЬ ВЫКЛЮЧИТЬ (ошибка БД)'}.")
+    else:
+        await update.message.reply_text("Эта команда доступна только админу в личной переписке.")
+
+# --- КОНЕЦ ФУНКЦИЙ ТЕХРАБОТ ---
+
 async def main() -> None:
     logger.info("Starting main()...")
     logger.info("Building Application...")
@@ -914,6 +1104,8 @@ async def main() -> None:
     else: logger.warning("No job_queue found, background task not started!")
 
     # Добавляем обработчики команд
+    application.add_handler(CommandHandler("maintenance_on", maintenance_on))
+    application.add_handler(CommandHandler("maintenance_off", maintenance_off))
     application.add_handler(CommandHandler("analyze", analyze_chat))
     application.add_handler(CommandHandler("analyze_pic", analyze_pic))
     application.add_handler(CommandHandler("poem", generate_poem))
