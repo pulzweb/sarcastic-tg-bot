@@ -931,104 +931,125 @@ import asyncio # Убедись, что импортирован
 # Убедись, что logger, chat_activity_collection, _call_ionet_api, IONET_TEXT_MODEL_ID определены ВЫШЕ
 
 # --- ПРАВИЛЬНАЯ reply_to_bot_handler (С ДЕТЕКТОРОМ СПАМА/БАЙТА и вызовом ai.io.net) ---
+# --- ФИНАЛЬНАЯ reply_to_bot_handler (КОНТЕКСТ + СПАМ + ТЕХРАБОТЫ + AI.IO.NET) ---
 async def reply_to_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Реагирует на ответ боту: огрызается через ai.io.net или отвечает на спам/байт."""
-    # Проверки
-    if (not update.message or not update.message.reply_to_message or not update.message.reply_to_message.from_user or
+    """Анализирует ответ на сообщение бота с учетом контекста юзера, детектит спам, отвечает через ИИ."""
+
+    # --->>> 1. ПРОВЕРКА ТЕХРАБОТ (В САМОМ НАЧАЛЕ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+         logger.warning("reply_to_bot_handler: нет данных в update для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан!")
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"reply_to_bot_handler отклонен из-за техработ в чате {real_chat_id}")
+        # Тихо выходим, не отвечаем на ответ во время техработ (кроме админа в ЛС)
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+
+    # 2. Базовые проверки сообщения (ответ боту, есть текст, не команда и т.д.)
+    if (not update.message.reply_to_message or not update.message.reply_to_message.from_user or
             update.message.reply_to_message.from_user.id != context.bot.id or not update.message.text or
-            update.message.text.startswith('/') or len(update.message.text) > 100): # Лимит для спама
+            update.message.text.startswith('/') or len(update.message.text) > 500): # Оставим лимит 500
         return
 
+    # 3. Собираем инфу
     chat_id = update.message.chat_id
     user_id = update.message.from_user.id
-    user_text_input = update.message.text.strip() # Убираем пробелы
-    user_name = update.message.from_user.first_name or "Спамер Хуев"
+    user_text_input = update.message.text.strip()
+    user_name = update.message.from_user.first_name or "Умник Дохуя"
     bot_original_message_text = update.message.reply_to_message.text or "[мой старый высер]"
     bot_original_short = bot_original_message_text[:150] + ('...' if len(bot_original_message_text) > 150 else '')
     user_text_short = user_text_input[:150] + ('...' if len(user_text_input) > 150 else '')
 
     logger.info(f"Пользователь {user_name} ({user_id}) ответил ('{user_text_short}...') на сообщение бота в чате {chat_id}.")
 
-    # --->>> ПРОВЕРКА НА СПАМ/БАЙТ <<<---
+    # 4. Детектор спама/байта (читаем прошлый ответ, проверяем, обновляем текущий)
     last_user_reply = None
     is_spam = False
     try:
-        loop = asyncio.get_running_loop()
         activity_doc = await loop.run_in_executor(None, lambda: chat_activity_collection.find_one({"chat_id": chat_id}))
-        # Используем str(user_id) как ключ словаря в MongoDB
         if activity_doc and "last_user_replies" in activity_doc and str(user_id) in activity_doc["last_user_replies"]:
              last_user_reply = activity_doc["last_user_replies"][str(user_id)]
-
-        # Считаем спамом, если текущий ответ КОРОТКИЙ (<= 2 слова) и СОВПАДАЕТ с предыдущим (без учета регистра)
         if last_user_reply and len(user_text_input.split()) <= 2 and user_text_input.lower() == last_user_reply.lower():
-            is_spam = True
-            logger.info(f"Обнаружен спам/байт от {user_name}: повтор фразы '{user_text_input}'.")
-
-        # ОБНОВЛЯЕМ последний ответ пользователя в любом случае
-        update_field = f"last_user_replies.{user_id}" # Правильный путь для обновления вложенного поля
-        await loop.run_in_executor(
-            None,
-            lambda: chat_activity_collection.update_one(
-                {"chat_id": chat_id},
-                {"$set": {update_field: user_text_input}}, # Сохраняем оригинальный текст ответа
-                upsert=True # Создаем документ чата и словарь last_user_replies, если их нет
-            )
-        )
+            is_spam = True; logger.info(f"Обнаружен спам/байт от {user_name}.")
+        # Обновляем В ЛЮБОМ СЛУЧАЕ
+        update_field = f"last_user_replies.{user_id}"; await loop.run_in_executor( None, lambda: chat_activity_collection.update_one( {"chat_id": chat_id}, {"$set": {update_field: user_text_input}}, upsert=True ) )
         logger.debug(f"Обновлен последний ответ для user {user_id} в чате {chat_id}")
+    except Exception as e: logger.error(f"Ошибка MongoDB в spam check для чата {chat_id}: {e}")
 
-    except Exception as e:
-        logger.error(f"Ошибка работы с MongoDB в reply_to_bot_handler для чата {chat_id}: {e}")
-        # Не критично, просто не сможем определить спам, продолжим как обычно
-
-    # --->>> КОНЕЦ ПРОВЕРКИ <<<---
-
-    # Если это спам/байт - отвечаем коротко и рандомно
+    # Если спам - отвечаем коротко и выходим
     if is_spam:
-        comeback_text = random.choice([
-            "🗿 Ок.", "🗿 Понятно.", "🗿 И чо?", "🗿 Да.", "🗿 Нет.",
-            "🗿 Заебал.", "🗿 Сам такой.", "🗿 Ага.", "🗿 ЛОЛ.", "🗿 Кек.",
-            "🗿 Пффф.", "🗿 Мда.", "🗿 .", "🗿 ))"
-        ])
-        try:
-            await update.message.reply_text(text=comeback_text)
-            logger.info(f"Отправлен короткий ответ на спам/байт в чате {chat_id}")
-        except Exception as e:
-            logger.error(f"Ошибка при отправке ответа на спам: {e}")
-        return # ВЫХОДИМ, ИИ не вызываем
+        comeback_text = random.choice(["🗿 Ок.", "🗿 И чо?", "🗿 Заебал.", "🗿 Сам такой."])
+        try: await update.message.reply_text(text=comeback_text); logger.info(f"Отправлен короткий ответ на спам.")
+        except Exception as e: logger.error(f"Ошибка при отправке ответа на спам: {e}")
+        return
 
-    # --- ЕСЛИ НЕ СПАМ - Генерируем "умный" ответ через ai.io.net ---
-    logger.info(f"Генерируем умный ответ на ответ боту...")
-    # Промпт для определения намерения и ответа
+    # --- 5. ЕСЛИ НЕ СПАМ - ПОЛУЧАЕМ КОНТЕКСТ ЮЗЕРА ИЗ БД ---
+    user_context = "[Не найдено недавних сообщений этого пользователя]"
+    USER_CONTEXT_LIMIT_REPLY = 5 # Сколько последних сообщений юзера брать
+    try:
+        query = {"chat_id": chat_id, "user_id": user_id} # Ищем по юзеру и чату
+        sort_order = [("timestamp", pymongo.DESCENDING)]
+        user_hist_cursor = await loop.run_in_executor(
+            None, lambda: history_collection.find(query).sort(sort_order).limit(USER_CONTEXT_LIMIT_REPLY)
+        )
+        user_messages = list(user_hist_cursor)[::-1] # Переворачиваем
+        if user_messages:
+            context_lines = [f"- {msg.get('text', '[пусто]')}" for msg in user_messages] # Форматируем контекст
+            user_context = "\n".join(context_lines)
+            logger.info(f"Найден контекст ({len(user_messages)} сообщ.) для {user_name}.")
+        else:
+             logger.info(f"Контекст для {user_name} не найден.")
+    except Exception as db_e:
+        logger.error(f"Ошибка чтения контекста юзера из MongoDB: {db_e}")
+    # --- КОНЕЦ ПОЛУЧЕНИЯ КОНТЕКСТА ---
+
+
+    # --- 6. Генерируем "умный" ответ через ai.io.net С УЧЕТОМ КОНТЕКСТА ---
+    logger.info(f"Генерируем КОНТЕКСТНЫЙ ответ на ответ боту...")
+
+    # --->>> НОВЫЙ ПРОМПТ С КОНТЕКСТОМ <<<---
     comeback_prompt = (
-        f"Ты - Попиздяка, саркастичный и матерный телеграм-бот. Пользователь '{user_name}' только что ответил на твое сообщение «{bot_original_short}» своей фразой: «{user_text_input}».\n\n"
-        f"Твоя задача:\n1. Определи намерение пользователя: наезд/тупость ИЛИ осмысленный запрос/вопрос?\n2. Если наезд/тупость: Придумай КОРОТКОЕ (1-2 предложения) дерзкое ОГРЫЗАНИЕ с матом.\n3. Если запрос: Попробуй ВЫПОЛНИТЬ его в своей саркастичной манере ИЛИ остроумно ОТКАЖИ.\n4. Ответ должен быть КОРОТКИМ (1-3 предложения). Начинай с `🗿 `.\n\n"
-        f"Твой ответ на фразу «{user_text_input}»:" # Упростил промпт немного
+        f"Ты - Попиздяка, саркастичный и матерный телеграм-бот. Пользователь '{user_name}' только что ответил на твое сообщение «{bot_original_short}» своей фразой: «{user_text_input}».\n"
+        f"Вот что этот пользователь писал В ЭТОМ ЧАТЕ незадолго до этого (для контекста):\n"
+        f"```\n{user_context}\n```\n\n"
+        f"Твоя задача:\n"
+        f"1.  Проанализируй фразу пользователя «{user_text_input}» С УЧЕТОМ контекста его предыдущих сообщений.\n"
+        f"2.  Определи намерение: это наезд/тупость ИЛИ осмысленный запрос/вопрос?\n"
+        f"3.  Если наезд/тупость: Придумай КОРОТКОЕ дерзкое ОГРЫЗАНИЕ, возможно, ССЫЛАЯСЬ на его предыдущие сообщения из контекста для усиления стеба.\n"
+        f"4.  Если запрос: Попробуй ВЫПОЛНИТЬ его (или саркастично ОТКАЖИ), также можешь тонко СЪЯЗВИТЬ, используя контекст его прошлых сообщений.\n"
+        f"5.  Ответ должен быть КОРОТКИМ (1-3 предложения). Начинай с `🗿 `.\n\n"
+        f"Пример (Контекст: 'Как же заебала работа'; Ответ юзера: 'бот тупой'): '🗿 Тебя работа заебала, а виноват я? Иди проспись, работяга хуев.'\n"
+        f"Пример (Контекст: 'Хочу в отпуск'; Ответ юзера: 'расскажи анекдот'): '🗿 Тебе анекдот или билет нахуй с этой работы? Могу только первое, но он будет про таких же неудачников, как ты.'\n\n"
+        f"Твой КОНТЕКСТНО-ЗАВИСИМЫЙ ответ на фразу «{user_text_input}» (начиная с 🗿):"
     )
+    # --->>> КОНЕЦ НОВОГО ПРОМПТА <<<---
 
     try:
         await asyncio.sleep(random.uniform(0.5, 1.5))
         messages_for_api = [{"role": "user", "content": comeback_prompt}]
-        # --->>> ВЫЗОВ AI.IO.NET API (ТУТ ВСЕ ПРАВИЛЬНО БЫЛО) <<<---
+        # Вызов _call_ionet_api (или аналога Gemini)
         response_text = await _call_ionet_api(
-            messages=messages_for_api,
-            model_id=IONET_TEXT_MODEL_ID, # Твоя текстовая модель
-            max_tokens=200,
-            temperature=0.8
+            messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=200, temperature=0.8
         ) or f"[Не смог обработать твой ответ, {user_name}]"
-        # --->>> КОНЕЦ ВЫЗОВА <<<---
 
         if not response_text.startswith(("🗿", "[")): response_text = "🗿 " + response_text
         MAX_MESSAGE_LENGTH = 4096;
         if len(response_text) > MAX_MESSAGE_LENGTH: response_text = response_text[:MAX_MESSAGE_LENGTH - 3] + "..."
         await update.message.reply_text(text=response_text)
-        logger.info(f"Отправлен умный ответ на ответ боту в чате {chat_id}")
+        logger.info(f"Отправлен контекстный ответ на ответ боту в чате {chat_id}")
 
     except Exception as e:
-        logger.error(f"ПИЗДЕЦ при генерации огрызания (не спам): {e}", exc_info=True)
-        try: await update.message.reply_text(random.choice(["🗿 Ошибка. Нахуй иди.", "🗿 Заебал.", "🗿 Не отвечу."]))
+        logger.error(f"ПИЗДЕЦ при генерации контекстного огрызания: {e}", exc_info=True)
+        try: await update.message.reply_text("🗿 Ошибка. Мозги плавятся от вашего контекста.")
         except Exception: pass
 
-# --- КОНЕЦ ПРАВИЛЬНОЙ reply_to_bot_handler (С ДЕТЕКТОРОМ СПАМА) ---
+# --- КОНЕЦ ФИНАЛЬНОЙ reply_to_bot_handler ---
 # --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ (ГЕНЕРАЦИЯ ФАКТОВ) ---
 
 # --- ИЗМЕНЕННАЯ check_inactivity_and_shitpost (ФАКТ ИЛИ ПОХВАЛА) ---
