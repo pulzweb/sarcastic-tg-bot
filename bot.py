@@ -23,6 +23,7 @@ import httpx
 # Импорты Telegram
 from telegram import Update, Bot, User
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
+import telegram # --->>> ВОТ ЭТА СТРОКА НУЖНА <<<---
 
 from dotenv import load_dotenv
 
