@@ -155,7 +155,7 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     elif update.message.video: message_text = "[ОТПРАВИЛ(А) ВИДЕО]"
     elif update.message.voice: message_text = "[ОТПРАВИЛ(А) ГОЛОСОВОЕ]"
     if message_text:
-        message_doc = {"chat_id": chat_id, "user_name": user_name, "text": message_text, "timestamp": timestamp, "message_id": update.message.message_id}
+        message_doc = {"chat_id": chat_id, "user_id": update.message.from_user.id, "user_name": user_name, "text": message_text, "timestamp": timestamp, "message_id": update.message.message_id}
         activity_update_doc = {"$set": {"last_message_time": timestamp}, "$setOnInsert": {"last_bot_shitpost_time": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "chat_id": chat_id}}
         try:
             loop = asyncio.get_running_loop()
@@ -801,9 +801,9 @@ async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # --- КОНЕЦ ПОЛНОЙ ИСПРАВЛЕННОЙ ФУНКЦИИ ДЛЯ ПОДКАТОВ ---
 
 
-# --- МОДИФИЦИРОВАННАЯ roast_user (для /retry ЗАГЛУШКИ) ---
+# --- ПЕРЕПИСАННАЯ roast_user (С КОНТЕКСТОМ ИЗ БД) ---
 async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None, direct_gender_hint: str | None = None) -> None:
-         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+    # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
 # Проверяем наличие update и message - без них проверка невозможна
     if not update or not update.message or not update.message.from_user or not update.message.chat:
         logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
@@ -829,93 +829,102 @@ async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, 
         return # ВЫХОДИМ ИЗ ФУНКЦИИ
 # --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
     target_user = None; target_name = "это хуйло"; gender_hint = "неизвестен"; chat_id = None; user = None; user_name = "Заказчик"
-    is_retry = False # Флаг, что это вызов из retry
+    is_retry = False # Пока не трогаем retry для roast
 
-    if direct_chat_id and direct_user: # Вызов из /roastme или /retry
-        chat_id = direct_chat_id; user = direct_user;
-        user_name = user.first_name or user_name
-        if direct_gender_hint: gender_hint = direct_gender_hint
-        # Пытаемся получить target_user из контекста, если это НЕ retry
-        # В retry мы target_user не передаем!
-        if update and update.message and update.message.reply_to_message:
-             target_user = update.message.reply_to_message.from_user
-             target_name = target_user.first_name or target_user.username or target_name
-        else: # Это либо /roastme, либо /retry для /roast
-             target_user = direct_user # Для /roastme жарим самого себя
-             target_name = target_user.first_name or target_user.username or target_name
-             # Если это retry для roast, target_user будет НЕ ТОТ!
-             # Поэтому пока просто заглушим retry для roast
-             is_retry = True # Предполагаем, что если update=None, то это retry
-             # await context.bot.send_message(chat_id=chat_id, text="Retry для Roast пока не работает")
-             # return # <--- РАСКОММЕНТИРУЙ ЭТО, ЕСЛИ НЕ ХОЧЕШЬ ЗАГЛУШКУ В RETRY
-
+    # Определяем chat_id, user (кто заказал), target_user (кого жарим)
+    if direct_chat_id and direct_user: # Вызов из /roastme (жарим себя)
+        chat_id = direct_chat_id; user = direct_user; target_user = user # Жарить будем себя
+        user_name = user.first_name or user_name; target_name = target_user.first_name or target_user.username or target_name
     elif update and update.message and update.message.reply_to_message and update.message.reply_to_message.from_user: # Обычный вызов /roast
         chat_id = update.message.chat_id; user = update.message.from_user; target_user = update.message.reply_to_message.from_user
         user_name = user.first_name or user_name; target_name = target_user.first_name or target_user.username or target_name
-        if update.message.text: # Угадываем пол из текста
+        # Угадываем пол
+        if update.message.text:
             user_command_text = update.message.text.lower()
             if "его" in user_command_text or "этого" in user_command_text: gender_hint = "мужской"
-            elif "ее" in user_command_text or "её" in user_command_text or "эту" in user_command_text: gender_hint = "женский"
+            elif "ее" in user_command_text or "эё" in user_command_text or "эту" in user_command_text: gender_hint = "женский"
     else: logger.error("roast_user вызвана некорректно!"); return
 
     if target_user.id == context.bot.id: await context.bot.send_message(chat_id=chat_id, text="🗿 Себя жарить не буду."); return
 
-    # Если это retry для roast - ставим заглушку (пока не придумали лучше)
-    if is_retry:
-         logger.warning(f"Попытка /retry для roast пользователя {target_name}. Функция пока не реализована полностью.")
-         await context.bot.send_message(chat_id=chat_id, text=f"🗿 Пережарка для <b>{target_name}</b> пока не работает нормально. Хуй тебе.", parse_mode='HTML')
-         return
+    logger.info(f"Пользователь '{user_name}' запросил прожарку для '{target_name}' (ID: {target_user.id}). Ищем контекст...")
 
-    logger.info(f"Пользователь '{user_name}' запросил прожарку для '{target_name}' (Пол: {gender_hint})")
-    roast_prompt = (
-        f"Ты - мастер стендапа в жанре 'roast', циничный, злой, но пиздецки остроумный уебок с черным юмором. Тебе заказали прожарку человека по имени **{target_name}** (заказал пользователь '{user_name}').\n"
-        f"Твоя задача: **СФАНТАЗИРУЙ** какой-нибудь типичный забавный или раздражающий косяк, привычку, черту характера или ситуацию, которая МОГЛА БЫ быть связана с человеком по имени {target_name} (основывайся не только на реальных данных, МОЖЕШЬ ПРОСТО ПРИДУМАТЬ!). И напиши **КОРОТКИЙ (3-5 предложений), СМЕШНОЙ, ЖЕСТКИЙ И МАТЕРНЫЙ** роаст, высмеивающий именно эту ПРИДУМАННУЮ тобой деталь.\n\n"
-        f"Инструкции:\n"
-        f"1.  Сначала придумай, над чем будешь стебаться (например: вечно ноет, умничает не по делу, странное хобби, тупит в очевидном, постоянно опаздывает, постит хуйню и т.д.).\n"
-        f"2.  Потом напиши роаст, используя **гиперболы, абсурдные сравнения, черный юмор и мат**. Цель - РАЗЪЕБАТЬ смешно, а не просто назвать мудаком.\n"
-        f"3.  Упомяни имя **{target_name}** в тексте.\n"
-        f"4.  **ИСПОЛЬЗУЙ ПРАВИЛЬНЫЙ РОД**, соответствующий подсказке о поле ({gender_hint}).\n"
-        f"5.  Начинай ответ с `🗿 `.\n\n"
-        f"Пример (для Васи, фантазируем, что он вечно умничает): '🗿 А вот и Васян, наш местный гений мысли! Говорят, он даже в туалет ходит с умным ебалом, цитируя Ницше. Вась, ты бы хоть иногда мозг проветривал, а то от твоей 'мудрости' уже мухи дохнут, блядь.'\n"
-        f"Пример (для Лены, фантазируем, что она постит хуйню): '🗿 Лена, звезда моих кошмаров! Каждый ее пост в соцсетях - это шедевр кринжа и безвкусия. Лен, ты когда очередную фотку своей жопы на фоне ковра выкладываешь, ты реально думаешь, что это кому-то интересно, кроме извращенцев и твоей мамки?'\n"
-        f"Пример (для Димы, фантазируем, что он тормоз): '🗿 Димаааа... Пока он додумается открыть дверь, человечество уже колонизирует Марс. Скорость реакции - как у дохлой черепахи под транквилизаторами. Пиздец ты тормоз, Димас.'\n\n"
-        f"Придумай подобный СМЕШНОЙ и ЗЛОЙ роаст про **{target_name}**, сфокусировавшись на какой-то ВЫДУМАННОЙ херне:"
-    )
+    # --- ЧТЕНИЕ КОНТЕКСТА (ПОСЛЕДНИХ СООБЩЕНИЙ ЦЕЛИ) ИЗ БД ---
+    user_context = "[Недавних сообщений не найдено]"
+    USER_CONTEXT_LIMIT = 5 # Сколько последних сообщений цели брать
     try:
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Окей, щас подберем пару ласковых для '{target_name}'...")
+        loop = asyncio.get_running_loop()
+        # Ищем сообщения ИМЕННО ЭТОГО ЮЗЕРА (target_user.id) в ЭТОМ ЧАТЕ
+        query = {"chat_id": chat_id, "user_id": target_user.id}
+        sort_order = [("timestamp", pymongo.DESCENDING)]
+        user_hist_cursor = await loop.run_in_executor(
+            None, lambda: history_collection.find(query).sort(sort_order).limit(USER_CONTEXT_LIMIT)
+        )
+        user_messages = list(user_hist_cursor)[::-1] # Переворачиваем для хронологии
+        if user_messages:
+            # Формируем контекст как текст
+            context_lines = [msg.get('text', '[пустое сообщение]') for msg in user_messages]
+            user_context = "\n".join(context_lines)
+            logger.info(f"Найден контекст ({len(user_messages)} сообщ.) для {target_name}.")
+        else:
+             logger.info(f"Контекст для {target_name} не найден.")
+
+    except Exception as db_e:
+        logger.error(f"Ошибка чтения контекста для роаста из MongoDB: {db_e}")
+        # Продолжим без контекста
+    # --- КОНЕЦ ЧТЕНИЯ КОНТЕКСТА ---
+
+    logger.info(f"Генерация роаста для '{target_name}' с учетом контекста (или без)...")
+
+    # --->>> НОВЫЙ ПРОМПТ ДЛЯ РОАСТА С КОНТЕКСТОМ <<<---
+    roast_prompt = (
+        f"Ты - мастер стендапа в жанре 'roast', циничный, злой, но остроумный уебок с черным юмором. Тебе заказали прожарку человека по имени **{target_name}** (пол: {gender_hint}).\n"
+        f"Вот ПОСЛЕДНИЕ НЕСКОЛЬКО СООБЩЕНИЙ этого человека (если есть):\n"
+        f"```\n{user_context}\n```\n\n"
+        f"Твоя задача: Сочини **КОРОТКИЙ (3-5 предложений), СМЕШНОЙ, ЖЕСТКИЙ И МАТЕРНЫЙ** роаст для {target_name}. "
+        f"Постарайся **ИСПОЛЬЗОВАТЬ ЧТО-ТО ИЗ ЕГО НЕДАВНИХ СООБЩЕНИЙ** (если они есть и там есть за что зацепиться) для стеба. Если в его сообщениях хуйня или их нет - ПРОСТО ПРИДУМАЙ роаст, основываясь на имени **{target_name}** и подсказке о поле ({gender_hint}), как ты делал раньше (фантазируй про его тупость, привычки и т.д.).\n\n"
+        f"Инструкции:\n"
+        f"1.  Используй гиперболы, абсурд, черный юмор, мат.\n"
+        f"2.  Цель - РАЗЪЕБАТЬ смешно.\n"
+        f"3.  Упомяни имя {target_name}.\n"
+        f"4.  Начинай ответ с `🗿 `.\n\n"
+        f"Пример (если в контексте было 'люблю котиков'): '🗿 О, {target_name}, любитель котиков! Наверное, единственный, кто тебя терпит - это твои 40 кошек. И то потому, что ты их кормишь, а не потому что ты охуенный.'\n"
+        f"Пример (если контекста нет или он тупой): '🗿 {target_name}... Звучит как имя для персонажа из дешевого фэнтези, который сдохнет на второй странице. Уверен, в жизни ты такой же статист.'\n\n"
+        f"Сочини роаст для **{target_name}**, ИСПОЛЬЗУЯ КОНТЕКСТ (если можешь) или просто фантазируй:"
+    )
+    # --->>> КОНЕЦ НОВОГО ПРОМПТА <<<---
+
+    try:
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Изучаю под микроскопом высеры '{target_name}'... Ща будет прожарка.")
         messages_for_api = [{"role": "user", "content": roast_prompt}]
-        roast_text = await _call_ionet_api(messages_for_api, IONET_TEXT_MODEL_ID, 150, 0.85) or f"[Роаст для {target_name} не удался]"
+        # Используем твой вызов ИИ (_call_ionet_api или model.generate_content_async)
+        roast_text = await _call_ionet_api( # ИЛИ model.generate_content_async
+            messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=150, temperature=0.85
+        ) or f"[Роаст для {target_name} не удался]"
         if not roast_text.startswith(("🗿", "[")): roast_text = "🗿 " + roast_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        # Используем mention_html ТОЛЬКО если target_user НЕ None (т.е. не из retry)
-        target_mention = target_user.mention_html() if target_user and target_user.username else f"<b>{target_name}</b>"
+        # Отправка и запись для /retry (оставляем ЗАГЛУШКУ для retry)
+        target_mention = f"<b>{target_name}</b>" # НЕ делаем mention_html, т.к. target_user может быть не тот в retry
         final_text = f"Прожарка для {target_mention}:\n\n{roast_text}"
-
-        MAX_MESSAGE_LENGTH = 4096
-        if len(final_text) > MAX_MESSAGE_LENGTH:
-            logger.warning(f"Роаст слишком длинный ({len(final_text)} символов), обрезаем!")
-            # Сначала формируем префикс
-            prefix = f"Прожарка для {target_mention}:\n\n"
-            # Считаем максимально допустимую длину для самого роаста
-            max_roast_len = MAX_MESSAGE_LENGTH - len(prefix) - 3 # -3 для "..."
-            if max_roast_len < 0: max_roast_len = 0 # На случай, если даже префикс не влезает
-            # Обрезаем сам текст роаста
-            truncated_roast = roast_text[:max_roast_len] + "..."
-            # Собираем итоговый текст
-            final_text = prefix + truncated_roast
+        MAX_MESSAGE_LENGTH = 4096 # Обрезка
+        if len(final_text) > MAX_MESSAGE_LENGTH: final_text = final_text[:MAX_MESSAGE_LENGTH-3] + "..." # Упрощенная обрезка
         sent_message = await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
         logger.info(f"Отправлен роаст для {target_name}.")
-        if sent_message: # Запись для /retry
-             # ЗАПИСЫВАЕМ ДАННЫЕ ИЗ ОРИГИНАЛЬНОГО ВЫЗОВА (если был)
-             if target_user: # Только если это не retry / roastme где target_user = direct_user
-                 reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "roast", "target_name": target_name, "target_id": target_user.id, "gender_hint": gender_hint, "timestamp": datetime.datetime.now(datetime.timezone.utc) }
-                 try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
-                 except Exception as e: logger.error(f"Ошибка записи /retry (roast) в MongoDB: {e}")
-    except Exception as e: logger.error(f"ПИЗДЕЦ при генерации роаста для {target_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не смог прожарить '{target_name}'. Ошибка: `{type(e).__name__}`.")
+        if sent_message: # Запись для /retry (теперь с target_id и gender_hint!)
+             reply_doc = { "chat_id": chat_id, "message_id": sent_message.message_id, "analysis_type": "roast", "target_name": target_name, "target_id": target_user.id, "gender_hint": gender_hint, "timestamp": datetime.datetime.now(datetime.timezone.utc) }
+             try: loop = asyncio.get_running_loop(); await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
+             except Exception as e: logger.error(f"Ошибка записи /retry (roast) в MongoDB: {e}")
 
-# --- КОНЕЦ МОДИФИЦИРОВАННОЙ roast_user ---
+    except Exception as e:
+        logger.error(f"ПИЗДЕЦ при генерации роаста для {target_name}: {e}", exc_info=True)
+        try:
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не смог прожарить '{target_name}'. Ошибка: `{type(e).__name__}`.")
+
+# --- КОНЕЦ ПЕРЕПИСАННОЙ roast_user ---
 
 import random # Убедись, что импортирован
 import asyncio # Убедись, что импортирован
@@ -1500,7 +1509,7 @@ async def main() -> None:
 
         # --->>> ЗАПУСК ЗАДАЧИ НОВОСТЕЙ <<<---
         if GNEWS_API_KEY: # Запускаем, только если есть ключ
-            application.job_queue.run_repeating(post_news_job, interval=NEWS_POST_INTERVAL, first=120) # Например, каждые 6 часов, первый раз через 2 мин
+            application.job_queue.run_repeating(post_news_job, interval=60 * 60 * 6, first=60 * 60 * 6) # Например, каждые 6 часов, первый раз через 2 мин
             logger.info(f"Фоновая задача постинга новостей запущена (каждые {NEWS_POST_INTERVAL/3600} ч).")
         else:
             logger.warning("Задача постинга новостей НЕ запущена (нет NEWSAPI_KEY).")
