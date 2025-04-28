@@ -4,6 +4,8 @@ import os
 import asyncio
 import re
 import datetime
+import requests # Нужен для NewsAPI
+import json # Для обработки ответа
 import random
 import base64
 from collections import deque
@@ -34,6 +36,16 @@ MONGO_DB_URL = os.getenv("MONGO_DB_URL")
 MAX_MESSAGES_TO_ANALYZE = 200 # Оптимальное значение
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 if ADMIN_USER_ID == 0: logger.warning("ADMIN_USER_ID не задан!")
+
+# --- НАСТРОЙКИ НОВОСТЕЙ ---
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+NEWS_COUNTRY = "ru" # Страна для новостей (можно 'us', 'gb' или не указывать для мира)
+NEWS_COUNT = 3 # Сколько новостей брать за раз
+NEWS_POST_INTERVAL = 60 * 60 * 6 # Интервал постинга новостей (6 часов)
+NEWS_JOB_NAME = "post_news_job" # Имя для JobQueue
+
+if not NEWSAPI_KEY:
+    logger.warning("NEWSAPI_KEY не найден! Новостная функция будет отключена.")
 
 
 # Проверка ключей
@@ -1125,6 +1137,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 *Переделать высер:*
 Ответь <code>/retry</code> или "<code>Бот переделай</code>" на МОЙ последний ответ от анализа/стиха/прожарки/предсказания/подката/картинки.
 
+*Новости (Автопостинг):*
+Раз в несколько часов я буду постить подборку свежих новостей со своими охуенными комментариями. Не нравится - жалуйся админам.
+
 *Эта справка:*
 Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
 
@@ -1204,6 +1219,153 @@ async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # --- КОНЕЦ ФУНКЦИЙ ТЕХРАБОТ ---
 
+# --- ФУНКЦИЯ ПОЛУЧЕНИЯ И КОММЕНТИРОВАНИЯ НОВОСТЕЙ ---
+async def fetch_and_comment_news(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, str, str | None]]:
+    """Запрашивает новости с NewsAPI и генерирует комменты через ИИ."""
+    if not NEWSAPI_KEY: return [] # Не работаем без ключа
+
+    news_list_with_comments = []
+    headers = {'Authorization': NEWSAPI_KEY}
+    # Запрашиваем главные новости для страны
+    news_url = f"https://newsapi.org/v2/top-headlines?country={NEWS_COUNTRY}&pageSize={NEWS_COUNT * 2}&apiKey={NEWSAPI_KEY}" # Запросим чуть больше на случай фильтрации
+
+    try:
+        logger.info(f"Запрос новостей с NewsAPI: {news_url.replace(NEWSAPI_KEY, '***')}")
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, lambda: requests.get(news_url, headers=headers, timeout=10))
+        response.raise_for_status() # Проверка на HTTP ошибки
+        news_data = response.json()
+        articles = news_data.get('articles', [])
+        logger.info(f"Получено {len(articles)} новостей с NewsAPI.")
+
+        if not articles: return []
+
+        # Отбираем N новостей и генерируем комменты
+        count = 0
+        for article in articles:
+            if count >= NEWS_COUNT: break
+            title = article.get('title', 'Без заголовка')
+            url = article.get('url', '#')
+            # Убираем название источника из заголовка типа " - РБК"
+            title_parts = title.rsplit(' - ', 1)
+            clean_title = title_parts[0] if len(title_parts) > 1 else title
+
+            # Пропускаем новости без нормального заголовка
+            if not clean_title or clean_title == '[Removed]': continue
+
+            # --- Генерируем комментарий через ИИ ---
+            comment_prompt = (
+                 f"Ты - Попиздяка, циничный и матерный комментатор новостей. Тебе дали заголовок новости: «{clean_title}». "
+                 f"Напиши ОДНО КОРОТКОЕ (1 предложение) максимально едкое, саркастичное или черно-юморное мнение об этой новости. Используй мат. Не пиши вступлений. Начинай с `🗿`."
+                 f"\nПример на 'ВВП вырос на 0.1%': `🗿 Охуеть достижение! Можно смело пропивать остатки страны.`"
+                 f"\nПример на 'Ученые открыли новый вид тараканов': `🗿 Пиздец, старых мало было? Теперь еще и эти будут по кухне ползать.`"
+                 f"\nТвой комментарий к новости «{clean_title}»:"
+            )
+            messages_for_api = [{"role": "user", "content": comment_prompt}]
+            # Используем ТЕКСТОВУЮ модель (io.net или Gemini)
+            comment_text = await _call_ionet_api( # ЗАМЕНИ НА ВЫЗОВ GEMINI, ЕСЛИ ТЫ НА НЕМ!
+                messages=messages_for_api,
+                model_id=IONET_TEXT_MODEL_ID, # Твоя текстовая модель
+                max_tokens=50,
+                temperature=0.8
+            ) or "[Комментарий потерялся]"
+            # Добавляем префикс, если не ошибка
+            if not comment_text.startswith(("🗿", "[")): comment_text = "🗿 " + comment_text
+            # --->>> КОНЕЦ ГЕНЕРАЦИИ КОММЕНТАРИЯ <<<---
+
+            news_list_with_comments.append((clean_title, url, comment_text))
+            count += 1
+            await asyncio.sleep(0.5) # Небольшая пауза между запросами к ИИ
+
+        return news_list_with_comments
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ошибка запроса к NewsAPI: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка при получении/обработке новостей: {e}", exc_info=True)
+        return []
+
+# --- ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ ПОСТИНГА НОВОСТЕЙ ---
+async def post_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Получает новости с комментами и постит их во все активные чаты."""
+    if not NEWSAPI_KEY: return # Не работаем без ключа
+
+    logger.info("Запуск задачи постинга новостей...")
+    news_to_post = await fetch_and_comment_news(context)
+
+    if not news_to_post:
+        logger.info("Нет новостей для постинга.")
+        return
+
+    # Формируем сообщение
+    message_parts = ["🗿 **Свежие высеры из мира новостей (и мое мнение):**\n"] # Заголовок
+    for title, url, comment in news_to_post:
+        # Экранируем символы для MarkdownV2 или используем HTML
+        # Для HTML:
+        safe_title = title.replace('<', '<').replace('>', '>').replace('&', '&')
+        safe_comment = comment.replace('<', '<').replace('>', '>').replace('&', '&')
+        message_parts.append(f"\n- <a href='{url}'>{safe_title}</a>\n  {safe_comment}")
+
+    final_message = "\n".join(message_parts)
+
+    # Обрезаем, если вдруг ОЧЕНЬ длинно
+    MAX_MESSAGE_LENGTH = 4096
+    if len(final_message) > MAX_MESSAGE_LENGTH:
+        final_message = final_message[:MAX_MESSAGE_LENGTH - 3] + "..."
+
+    # --- ПОЛУЧАЕМ СПИСОК АКТИВНЫХ ЧАТОВ ИЗ БД ---
+    active_chat_ids = []
+    try:
+        loop = asyncio.get_running_loop()
+        # Просто берем все chat_id из коллекции активности
+        # Можно добавить фильтр по времени активности, если надо
+        chat_docs = await loop.run_in_executor(
+            None,
+            lambda: list(chat_activity_collection.find({}, {"chat_id": 1, "_id": 0}))
+        )
+        active_chat_ids = [doc["chat_id"] for doc in chat_docs]
+        logger.info(f"Найдено {len(active_chat_ids)} активных чатов для постинга новостей.")
+    except Exception as e:
+        logger.error(f"Ошибка получения списка чатов из MongoDB: {e}", exc_info=True)
+        return # Не можем постить без списка чатов
+
+    # --- ОТПРАВЛЯЕМ НОВОСТИ В КАЖДЫЙ ЧАТ ---
+    for chat_id in active_chat_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=final_message,
+                parse_mode='HTML', # Используем HTML для ссылок и жирного шрифта
+                disable_web_page_preview=True # Отключаем превью ссылок, чтобы не засорять
+            )
+            logger.info(f"Новости успешно отправлены в чат {chat_id}")
+            await asyncio.sleep(1) # Пауза между отправками в разные чаты
+        except (telegram.error.Forbidden, telegram.error.BadRequest) as e:
+             logger.warning(f"Не удалось отправить новости в чат {chat_id}: {e}. Возможно, бот кикнут.")
+             # TODO: По-хорошему, надо удалять такие чаты из chat_activity_collection
+        except Exception as e:
+             logger.error(f"Неизвестная ошибка при отправке новостей в чат {chat_id}: {e}", exc_info=True)
+
+# --- ФУНКЦИЯ ДЛЯ КОМАНДЫ ПРИНУДИТЕЛЬНОГО ПОСТИНГА НОВОСТЕЙ (ТОЛЬКО АДМИН В ЛС) ---
+async def force_post_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Принудительно запускает постинг новостей (только админ в ЛС)."""
+    # Проверка на админа и ЛС
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if update.message.from_user.id != admin_id or update.message.chat.type != 'private':
+        await update.message.reply_text("Только админ может форсить новости в ЛС.")
+        return
+    if not NEWSAPI_KEY:
+         await update.message.reply_text("Ключ NewsAPI не настроен, не могу постить новости.")
+         return
+
+    logger.info("Админ запросил принудительный постинг новостей.")
+    await update.message.reply_text("Окей, запускаю сбор и постинг новостей сейчас...")
+    # Просто вызываем ту же функцию, что и планировщик
+    await post_news_job(context)
+    await update.message.reply_text("Попытка постинга новостей завершена. Смотри логи.")
+
 async def main() -> None:
     logger.info("Starting main()...")
     logger.info("Building Application...")
@@ -1211,9 +1373,19 @@ async def main() -> None:
 
     # Запуск фоновой задачи
     if application.job_queue:
-        application.job_queue.run_repeating(check_inactivity_and_shitpost, interval=900, first=60) # Каждые 15 мин
-        logger.info("Background check_inactivity task scheduled.")
-    else: logger.warning("No job_queue found, background task not started!")
+        # Задача для рандомных высеров в тишине
+        application.job_queue.run_repeating(check_inactivity_and_shitpost, interval=900, first=60)
+        logger.info("Фоновая задача проверки неактивности запущена.")
+
+        # --->>> ЗАПУСК ЗАДАЧИ НОВОСТЕЙ <<<---
+        if NEWSAPI_KEY: # Запускаем, только если есть ключ
+            application.job_queue.run_repeating(post_news_job, interval=NEWS_POST_INTERVAL, first=120) # Например, каждые 6 часов, первый раз через 2 мин
+            logger.info(f"Фоновая задача постинга новостей запущена (каждые {NEWS_POST_INTERVAL/3600} ч).")
+        else:
+            logger.warning("Задача постинга новостей НЕ запущена (нет NEWSAPI_KEY).")
+            # --->>> КОНЕЦ ЗАПУСКА ЗАДАЧИ НОВОСТЕЙ <<<---
+    else:
+        logger.warning("Не удалось получить job_queue, фоновые задачи не запущены!")
 
     # Добавляем обработчики команд
     application.add_handler(CommandHandler("maintenance_on", maintenance_on))
@@ -1227,6 +1399,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("roast", roast_user))
     application.add_handler(CommandHandler("retry", retry_analysis))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("post_news", force_post_news))
 
     # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ТЕХРАБОТ <<<---
     # Regex для ВКЛючения техработ
@@ -1265,6 +1438,8 @@ async def main() -> None:
     help_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(ты кто|кто ты|что умеешь|хелп|помощь|справка|команды).*'
     application.add_handler(MessageHandler(filters.Regex(help_pattern) & filters.TEXT & ~filters.COMMAND, help_command)) # Прямой вызов
 
+    news_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(новости|че там|мир).*'
+    application.add_handler(MessageHandler(filters.Regex(news_pattern) & filters.TEXT & ~filters.COMMAND, force_post_news)) # Прямой вызов
 
     # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
