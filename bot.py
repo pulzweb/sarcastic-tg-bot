@@ -37,15 +37,16 @@ MAX_MESSAGES_TO_ANALYZE = 200 # Оптимальное значение
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 if ADMIN_USER_ID == 0: logger.warning("ADMIN_USER_ID не задан!")
 
-# --- НАСТРОЙКИ НОВОСТЕЙ ---
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
-NEWS_COUNTRY = "ru" # Страна для новостей (можно 'us', 'gb' или не указывать для мира)
-NEWS_COUNT = 3 # Сколько новостей брать за раз
-NEWS_POST_INTERVAL = 60 * 60 * 6 # Интервал постинга новостей (6 часов)
-NEWS_JOB_NAME = "post_news_job" # Имя для JobQueue
+# --- НАСТРОЙКИ НОВОСТЕЙ (GNEWS) ---
+GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
+NEWS_COUNTRY = "ru" # Страна
+NEWS_LANG = "ru"    # Язык новостей
+NEWS_COUNT = 3      # Сколько новостей брать
+NEWS_POST_INTERVAL = 60 * 60 * 6 # Интервал постинга (6 часов)
+NEWS_JOB_NAME = "post_news_job"
 
-if not NEWSAPI_KEY:
-    logger.warning("NEWSAPI_KEY не найден! Новостная функция будет отключена.")
+if not GNEWS_API_KEY:
+    logger.warning("GNEWS_API_KEY не найден! Новостная функция будет отключена.")
 
 
 # Проверка ключей
@@ -1219,24 +1220,25 @@ async def maintenance_off(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # --- КОНЕЦ ФУНКЦИЙ ТЕХРАБОТ ---
 
-# --- ФУНКЦИЯ ПОЛУЧЕНИЯ И КОММЕНТИРОВАНИЯ НОВОСТЕЙ ---
+# --- ФУНКЦИЯ ПОЛУЧЕНИЯ И КОММЕНТИРОВАНИЯ НОВОСТЕЙ (GNEWS) ---
 async def fetch_and_comment_news(context: ContextTypes.DEFAULT_TYPE) -> list[tuple[str, str, str | None]]:
-    """Запрашивает новости с NewsAPI и генерирует комменты через ИИ."""
-    if not NEWSAPI_KEY: return [] # Не работаем без ключа
+    """Запрашивает новости с GNews.io и генерирует комменты через ИИ."""
+    if not GNEWS_API_KEY: return []
 
     news_list_with_comments = []
-    headers = {'Authorization': NEWSAPI_KEY}
-    # Запрашиваем главные новости для страны
-    news_url = f"https://newsapi.org/v2/top-headlines?country={NEWS_COUNTRY}&pageSize={NEWS_COUNT * 2}&apiKey={NEWSAPI_KEY}" # Запросим чуть больше на случай фильтрации
+    # Формируем URL для GNews API (смотри их документацию для точных параметров!)
+    # Пример для top-headlines:
+    news_url = f"https://gnews.io/api/v4/top-headlines?category=general&lang={NEWS_LANG}&country={NEWS_COUNTRY}&max={NEWS_COUNT * 2}&apikey={GNEWS_API_KEY}"
 
     try:
-        logger.info(f"Запрос новостей с NewsAPI: {news_url.replace(NEWSAPI_KEY, '***')}")
+        logger.info(f"Запрос новостей с GNews.io: {news_url.replace(GNEWS_API_KEY, '***')}")
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: requests.get(news_url, headers=headers, timeout=10))
-        response.raise_for_status() # Проверка на HTTP ошибки
+        # Используем requests внутри executor'а
+        response = await loop.run_in_executor(None, lambda: requests.get(news_url, timeout=15)) # Увеличим таймаут
+        response.raise_for_status()
         news_data = response.json()
         articles = news_data.get('articles', [])
-        logger.info(f"Получено {len(articles)} новостей с NewsAPI.")
+        logger.info(f"Получено {len(articles)} новостей с GNews.io.")
 
         if not articles: return []
 
@@ -1246,50 +1248,57 @@ async def fetch_and_comment_news(context: ContextTypes.DEFAULT_TYPE) -> list[tup
             if count >= NEWS_COUNT: break
             title = article.get('title', 'Без заголовка')
             url = article.get('url', '#')
-            # Убираем название источника из заголовка типа " - РБК"
-            title_parts = title.rsplit(' - ', 1)
-            clean_title = title_parts[0] if len(title_parts) > 1 else title
+            # Описание может быть полезно для комментария ИИ
+            description = article.get('description', '')
+            # Источник
+            source_name = article.get('source', {}).get('name', 'Неизвестный источник')
 
-            # Пропускаем новости без нормального заголовка
-            if not clean_title or clean_title == '[Removed]': continue
+            # Убираем имя источника из заголовка, если оно там есть в конце
+            if title.endswith(f" - {source_name}"):
+                 title = title[:-len(f" - {source_name}")].strip()
+
+            # Пропускаем новости без заголовка
+            if not title or title == '[Removed]': continue
 
             # --- Генерируем комментарий через ИИ ---
+            # Промпт можно сделать чуть лучше, дав краткое описание новости
             comment_prompt = (
-                 f"Ты - Попиздяка, циничный и матерный комментатор новостей. Тебе дали заголовок новости: «{clean_title}». "
+                 f"Ты - Попиздяка, циничный и матерный комментатор новостей. Тебе дали новость от '{source_name}':\n"
+                 f"Заголовок: «{title}»\n"
+                 f"Описание: «{description[:200]}...»\n\n" # Дадим краткое описание для контекста
                  f"Напиши ОДНО КОРОТКОЕ (1 предложение) максимально едкое, саркастичное или черно-юморное мнение об этой новости. Используй мат. Не пиши вступлений. Начинай с `🗿`."
-                 f"\nПример на 'ВВП вырос на 0.1%': `🗿 Охуеть достижение! Можно смело пропивать остатки страны.`"
-                 f"\nПример на 'Ученые открыли новый вид тараканов': `🗿 Пиздец, старых мало было? Теперь еще и эти будут по кухне ползать.`"
-                 f"\nТвой комментарий к новости «{clean_title}»:"
+                 f"\nТвой комментарий к новости «{title}»:"
             )
             messages_for_api = [{"role": "user", "content": comment_prompt}]
             # Используем ТЕКСТОВУЮ модель (io.net или Gemini)
-            comment_text = await _call_ionet_api( # ЗАМЕНИ НА ВЫЗОВ GEMINI, ЕСЛИ ТЫ НА НЕМ!
+            comment_text = await _call_ionet_api( # ИЛИ model.generate_content_async
                 messages=messages_for_api,
                 model_id=IONET_TEXT_MODEL_ID, # Твоя текстовая модель
                 max_tokens=50,
                 temperature=0.8
-            ) or "[Комментарий потерялся]"
-            # Добавляем префикс, если не ошибка
+            ) or "[Комментарий не родился]"
             if not comment_text.startswith(("🗿", "[")): comment_text = "🗿 " + comment_text
             # --->>> КОНЕЦ ГЕНЕРАЦИИ КОММЕНТАРИЯ <<<---
 
-            news_list_with_comments.append((clean_title, url, comment_text))
+            news_list_with_comments.append((title, url, comment_text))
             count += 1
-            await asyncio.sleep(0.5) # Небольшая пауза между запросами к ИИ
+            await asyncio.sleep(0.5) # Пауза
 
         return news_list_with_comments
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка запроса к NewsAPI: {e}")
+        logger.error(f"Ошибка запроса к GNews.io: {e}")
         return []
     except Exception as e:
-        logger.error(f"Ошибка при получении/обработке новостей: {e}", exc_info=True)
+        logger.error(f"Ошибка при получении/обработке новостей GNews: {e}", exc_info=True)
         return []
+
+# --- КОНЕЦ ПЕРЕПИСАННОЙ ФУНКЦИИ ---
 
 # --- ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ ПОСТИНГА НОВОСТЕЙ ---
 async def post_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Получает новости с комментами и постит их во все активные чаты."""
-    if not NEWSAPI_KEY: return # Не работаем без ключа
+    if not GNEWS_API_KEY: return # Не работаем без ключа
 
     logger.info("Запуск задачи постинга новостей...")
     news_to_post = await fetch_and_comment_news(context)
@@ -1356,7 +1365,7 @@ async def force_post_news(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if update.message.from_user.id != admin_id or update.message.chat.type != 'private':
         await update.message.reply_text("Только админ может форсить новости в ЛС.")
         return
-    if not NEWSAPI_KEY:
+    if not GNEWS_API_KEY:
          await update.message.reply_text("Ключ NewsAPI не настроен, не могу постить новости.")
          return
 
@@ -1378,7 +1387,7 @@ async def main() -> None:
         logger.info("Фоновая задача проверки неактивности запущена.")
 
         # --->>> ЗАПУСК ЗАДАЧИ НОВОСТЕЙ <<<---
-        if NEWSAPI_KEY: # Запускаем, только если есть ключ
+        if GNEWS_API_KEY: # Запускаем, только если есть ключ
             application.job_queue.run_repeating(post_news_job, interval=NEWS_POST_INTERVAL, first=120) # Например, каждые 6 часов, первый раз через 2 мин
             logger.info(f"Фоновая задача постинга новостей запущена (каждые {NEWS_POST_INTERVAL/3600} ч).")
         else:
