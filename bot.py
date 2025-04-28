@@ -1275,7 +1275,7 @@ async def fetch_and_comment_news(context: ContextTypes.DEFAULT_TYPE) -> list[tup
             comment_text = await _call_ionet_api( # ИЛИ model.generate_content_async
                 messages=messages_for_api,
                 model_id=IONET_TEXT_MODEL_ID, # Твоя текстовая модель
-                max_tokens=50,
+                max_tokens=300,
                 temperature=0.8
             ) or "[Комментарий не родился]"
             if not comment_text.startswith(("🗿", "[")): comment_text = "🗿 " + comment_text
@@ -1296,66 +1296,75 @@ async def fetch_and_comment_news(context: ContextTypes.DEFAULT_TYPE) -> list[tup
 
 # --- КОНЕЦ ПЕРЕПИСАННОЙ ФУНКЦИИ ---
 
-# --- ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ ПОСТИНГА НОВОСТЕЙ ---
+# --- ПЕРЕДЕЛАННАЯ post_news_job (С ПРОВЕРКОЙ ТЕХРАБОТ) ---
 async def post_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Получает новости с комментами и постит их во все активные чаты."""
-    if not GNEWS_API_KEY: return # Не работаем без ключа
+    """Получает новости с комментами и постит их (с учетом техработ)."""
+    if not GNEWS_API_KEY: return # Используй GNEWS_API_KEY, если ты на GNews!
 
     logger.info("Запуск задачи постинга новостей...")
     news_to_post = await fetch_and_comment_news(context)
 
     if not news_to_post:
-        logger.info("Нет новостей для постинга.")
-        return
+        logger.info("Нет новостей для постинга."); return
 
-    # Формируем сообщение
-    message_parts = ["🗿 **Свежие высеры из мира новостей (и мое мнение):**\n"] # Заголовок
+    # Формируем сообщение (как было)
+    message_parts = ["🗿 **Свежие высеры из мира новостей (и мое мнение):**\n"];
     for title, url, comment in news_to_post:
-        # Экранируем символы для MarkdownV2 или используем HTML
-        # Для HTML:
         safe_title = title.replace('<', '<').replace('>', '>').replace('&', '&')
         safe_comment = comment.replace('<', '<').replace('>', '>').replace('&', '&')
         message_parts.append(f"\n- <a href='{url}'>{safe_title}</a>\n  {safe_comment}")
-
     final_message = "\n".join(message_parts)
-
-    # Обрезаем, если вдруг ОЧЕНЬ длинно
     MAX_MESSAGE_LENGTH = 4096
-    if len(final_message) > MAX_MESSAGE_LENGTH:
-        final_message = final_message[:MAX_MESSAGE_LENGTH - 3] + "..."
+    if len(final_message) > MAX_MESSAGE_LENGTH: final_message = final_message[:MAX_MESSAGE_LENGTH - 3] + "..."
 
-    # --- ПОЛУЧАЕМ СПИСОК АКТИВНЫХ ЧАТОВ ИЗ БД ---
+    # Получаем список ВСЕХ активных чатов из БД
     active_chat_ids = []
     try:
-        loop = asyncio.get_running_loop()
-        # Просто берем все chat_id из коллекции активности
-        # Можно добавить фильтр по времени активности, если надо
-        chat_docs = await loop.run_in_executor(
-            None,
-            lambda: list(chat_activity_collection.find({}, {"chat_id": 1, "_id": 0}))
-        )
+        loop = asyncio.get_running_loop(); chat_docs = await loop.run_in_executor(None, lambda: list(chat_activity_collection.find({}, {"chat_id": 1, "_id": 0})))
         active_chat_ids = [doc["chat_id"] for doc in chat_docs]
-        logger.info(f"Найдено {len(active_chat_ids)} активных чатов для постинга новостей.")
-    except Exception as e:
-        logger.error(f"Ошибка получения списка чатов из MongoDB: {e}", exc_info=True)
-        return # Не можем постить без списка чатов
+        logger.info(f"Найдено {len(active_chat_ids)} активных чатов для возможного постинга.")
+    except Exception as e: logger.error(f"Ошибка получения списка чатов из MongoDB: {e}"); return
 
-    # --- ОТПРАВЛЯЕМ НОВОСТИ В КАЖДЫЙ ЧАТ ---
-    for chat_id in active_chat_ids:
+    if not active_chat_ids: logger.info("Нет активных чатов в БД."); return
+
+    # --->>> ПРОВЕРКА РЕЖИМА ТЕХРАБОТ <<<---
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop)
+    target_chat_ids_to_post = [] # Список ID, куда будем реально постить
+
+    if maintenance_active:
+        logger.warning("РЕЖИМ ТЕХРАБОТ АКТИВЕН! Новости будут отправлены только админу в ЛС (если он есть в активных чатах).")
+        try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+        except ValueError: admin_id = 0
+
+        if admin_id in active_chat_ids: # Проверяем, есть ли админ в списке чатов, где бот активен
+             target_chat_ids_to_post.append(admin_id) # Добавляем только ID админа
+             logger.info(f"Админ ID {admin_id} найден в активных чатах, отправляем новость ему в ЛС.")
+        else:
+             logger.warning(f"Админ ID {admin_id} НЕ найден в активных чатах ИЛИ не задан. Новости НЕ будут отправлены НИКУДА.")
+
+    else: # Если техработы не активны - постим во все активные чаты
+        logger.info("Режим техработ не активен. Постим новости во все активные чаты.")
+        target_chat_ids_to_post = active_chat_ids
+    # --->>> КОНЕЦ ПРОВЕРКИ РЕЖИМА ТЕХРАБОТ <<<---
+
+    # --- ОТПРАВЛЯЕМ НОВОСТИ В ЦЕЛЕВЫЕ ЧАТЫ ---
+    if not target_chat_ids_to_post:
+        logger.info("Нет целевых чатов для постинга новостей после проверки техработ.")
+        return
+
+    logger.info(f"Начинаем отправку новостей в {len(target_chat_ids_to_post)} чатов...")
+    for chat_id in target_chat_ids_to_post: # Итерируемся по ОТФИЛЬТРОВАННОМУ списку
         try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=final_message,
-                parse_mode='HTML', # Используем HTML для ссылок и жирного шрифта
-                disable_web_page_preview=True # Отключаем превью ссылок, чтобы не засорять
-            )
+            await context.bot.send_message(chat_id=chat_id, text=final_message, parse_mode='HTML', disable_web_page_preview=True)
             logger.info(f"Новости успешно отправлены в чат {chat_id}")
-            await asyncio.sleep(1) # Пауза между отправками в разные чаты
+            await asyncio.sleep(1) # Пауза
         except (telegram.error.Forbidden, telegram.error.BadRequest) as e:
-             logger.warning(f"Не удалось отправить новости в чат {chat_id}: {e}. Возможно, бот кикнут.")
-             # TODO: По-хорошему, надо удалять такие чаты из chat_activity_collection
+             logger.warning(f"Не удалось отправить новости в чат {chat_id}: {e}.")
         except Exception as e:
              logger.error(f"Неизвестная ошибка при отправке новостей в чат {chat_id}: {e}", exc_info=True)
+
+# --- КОНЕЦ ПЕРЕДЕЛАННОЙ post_news_job ---
 
 # --- ФУНКЦИЯ ДЛЯ КОМАНДЫ ПРИНУДИТЕЛЬНОГО ПОСТИНГА НОВОСТЕЙ (ТОЛЬКО АДМИН В ЛС) ---
 async def force_post_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
