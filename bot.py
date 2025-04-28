@@ -992,85 +992,93 @@ async def reply_to_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- КОНЕЦ ПЕРЕДЕЛАННОЙ reply_to_bot_handler ---
 # --- ПОЛНАЯ ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ (ГЕНЕРАЦИЯ ФАКТОВ) ---
+
+# --- ИЗМЕНЕННАЯ check_inactivity_and_shitpost (ФАКТ ИЛИ ПОХВАЛА) ---
 async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Проверяет неактивные чаты и постит рандомный ебанутый факт от ai.io.net."""
-    logger.info("Запуск фоновой проверки неактивности чатов для постинга факта...")
-    # Пороги времени в секундах
-    INACTIVITY_THRESHOLD = 60 * 60 * 2 # 2 часа тишины
-    MIN_TIME_BETWEEN_SHITPOSTS = 60 * 60 * 4 # Не чаще раза в 4 часа
+    # ... (начало функции, определение порогов, получение inactive_chat_ids - как было) ...
+    logger.info("Запуск фоновой проверки неактивности чатов...")
+    # ... (код получения inactive_chat_ids) ...
+    if not inactive_chat_ids: logger.info("Нет неактивных чатов."); return
+    logger.info(f"Найдено {len(inactive_chat_ids)} неактивных чатов. Выбираем один...")
+    target_chat_id = random.choice(inactive_chat_ids)
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    inactive_threshold_time = now - datetime.timedelta(seconds=INACTIVITY_THRESHOLD)
-    shitpost_threshold_time = now - datetime.timedelta(seconds=MIN_TIME_BETWEEN_SHITPOSTS)
+    # --->>> ВЫБОР ДЕЙСТВИЯ: ФАКТ ИЛИ ПОХВАЛА? <<<---
+    action_choice = random.random() # Число от 0 до 1
+    ACTION_PRAISE_CHANCE = 0.4 # Шанс похвалить = 40%, иначе - факт (60%)
 
-    try:
-        loop = asyncio.get_running_loop()
-        # Ищем чаты, где последнее сообщение было давно И последний высер бота был еще давнее
-        query = {
-            "last_message_time": {"$lt": inactive_threshold_time},
-            "last_bot_shitpost_time": {"$lt": shitpost_threshold_time}
-        }
-        inactive_chat_docs = await loop.run_in_executor(
-            None,
-            lambda: list(chat_activity_collection.find(query, {"chat_id": 1, "_id": 0}))
-        )
-        inactive_chat_ids = [doc["chat_id"] for doc in inactive_chat_docs]
+    final_text_to_send = None # Здесь будет итоговый текст
 
-        if not inactive_chat_ids:
-            logger.info("Не найдено подходящих неактивных чатов для факта.")
-            return
+    if action_choice < ACTION_PRAISE_CHANCE:
+        # --- ДЕЙСТВИЕ: ПОХВАЛА СЛУЧАЙНОГО ЮЗЕРА ---
+        logger.info(f"Выбрано действие: ПОХВАЛА для чата {target_chat_id}")
+        try:
+            # Ищем недавних активных юзеров в этом чате
+            loop = asyncio.get_running_loop()
+            # Возьмем, например, последних 20 сообщений из истории
+            hist_cursor = await loop.run_in_executor( None, lambda: history_collection.find({"chat_id": target_chat_id}).sort([("timestamp", pymongo.DESCENDING)]).limit(20) )
+            recent_users = {msg.get('user_name') for msg in hist_cursor if msg.get('user_name')} # Собираем уникальные имена
 
-        logger.info(f"Найдены неактивные чаты ({len(inactive_chat_ids)}). Выбираем один для постинга факта...")
-        target_chat_id = random.choice(inactive_chat_ids) # Берем один случайный чат
+            if recent_users:
+                target_praise_name = random.choice(list(recent_users)) # Выбираем случайное имя
+                logger.info(f"Выбрано имя для похвалы: {target_praise_name}")
 
-        # --->>> ГЕНЕРАЦИЯ ФАКТА ЧЕРЕЗ _call_ionet_api <<<---
-        fact_prompt = (
-            "Придумай ОДИН короткий (1-2 предложения) совершенно ЕБАНУТЫЙ, АБСУРДНЫЙ, ЛЖИВЫЙ, но НАУКООБРАЗНЫЙ 'факт'. "
-            "Он должен звучать максимально бредово, но подаваться с серьезным ебалом. Можно с матом. "
-            "НЕ ПИШИ никаких вступлений. СРАЗУ выдавай сам 'факт'."
-            "\nПример: Квантовые флуктуации в жопе у хомяка могут спонтанно генерировать миниатюрные черные дыры."
-            "\nПример: Пингвины тайно управляют мировым рынком анчоусов."
-            "\nПридумай ПОДОБНЫЙ бред:"
-        )
-        logger.info(f"Отправка запроса к ai.io.net для генерации ебанутого факта для чата {target_chat_id}...")
+                praise_prompt = ( # Промпт такой же, как в /praise
+                     f"Ты - Попиздяка... Придумай подобную САРКАСТИЧНУЮ ПОХВАЛУ для **{target_praise_name}**:"
+                 )
+                messages_for_api = [{"role": "user", "content": praise_prompt}]
+                praise_text = await _call_ionet_api( # ИЛИ model.generate_content_async
+                     messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=100, temperature=0.85
+                 ) or f"[Похвала для {target_praise_name} не придумалась]"
+                if not praise_text.startswith(("🗿", "[")): praise_text = "🗿 " + praise_text
+                final_text_to_send = praise_text # Запоминаем текст для отправки
+            else:
+                logger.warning(f"Не найдено недавних юзеров в чате {target_chat_id} для похвалы.")
+                # Если юзеров нет, можно сгенерить факт вместо похвалы
+                action_choice = 1 # Форсируем генерацию факта
 
-        # Используем _call_ionet_api с текстовой моделью
-        fact_text = await _call_ionet_api(
-            messages=[{"role": "user", "content": fact_prompt}],
-            model_id=IONET_TEXT_MODEL_ID, # Используем текстовую модель
-            max_tokens=150,
-            temperature=1.1
-        ) or "[Генератор бреда сломался или вернул хуйню]" # Заглушка на случай None
+        except Exception as praise_e:
+             logger.error(f"Ошибка при генерации похвалы в фоне: {praise_e}", exc_info=True)
+             action_choice = 1 # Форсируем генерацию факта при ошибке
 
-        # Добавляем префикс, если ответ не ошибка
-        if not fact_text.startswith(("🗿", "[")):
-            fact_text = "🗿 " + fact_text
-        # --->>> КОНЕЦ ГЕНЕРАЦИИ ФАКТА <<<---
+    if action_choice >= ACTION_PRAISE_CHANCE: # Если не похвала (или она не удалась)
+        # --- ДЕЙСТВИЕ: ГЕНЕРАЦИЯ ФАКТА ---
+        logger.info(f"Выбрано действие: ФАКТ для чата {target_chat_id}")
+        try:
+            fact_prompt = ( "Придумай ОДИН короткий... ебанутый факт..." ) # Полный промпт факта
+            messages_for_api = [{"role": "user", "content": fact_prompt}]
+            fact_text = await _call_ionet_api( # ИЛИ model.generate_content_async
+                 messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=150, temperature=1.1
+             ) or "[Генератор бреда сломался]"
+            if not fact_text.startswith(("🗿", "[")): fact_text = "🗿 " + fact_text
+            final_text_to_send = fact_text # Запоминаем текст для отправки
+        except Exception as fact_e:
+             logger.error(f"Ошибка при генерации факта в фоне: {fact_e}", exc_info=True)
+             final_text_to_send = "🗿 Ошибка генератора бреда. Сегодня без высеров."
+    # --->>> КОНЕЦ ВЫБОРА ДЕЙСТВИЯ <<<---
 
+    # Если есть что отправить
+    if final_text_to_send:
         # Обрезаем, если надо
         MAX_MESSAGE_LENGTH = 4096
-        if len(fact_text) > MAX_MESSAGE_LENGTH:
-            fact_text = fact_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        if len(final_text_to_send) > MAX_MESSAGE_LENGTH:
+            final_text_to_send = final_text_to_send[:MAX_MESSAGE_LENGTH - 3] + "..."
 
-        # Отправляем факт
-        await context.bot.send_message(chat_id=target_chat_id, text=fact_text)
-        logger.info(f"Отправлен рандомный факт в НЕАКТИВНЫЙ чат {target_chat_id}")
+        # Отправляем
+        try:
+            await context.bot.send_message(chat_id=target_chat_id, text=final_text_to_send)
+            logger.info(f"Отправлен рандомный высер ('{('похвала' if action_choice < ACTION_PRAISE_CHANCE else 'факт')}') в НЕАКТИВНЫЙ чат {target_chat_id}")
+            # ОБНОВЛЯЕМ ВРЕМЯ ПОСЛЕДНЕГО ВЫСЕРА БОТА в БД
+            await loop.run_in_executor( None, lambda: chat_activity_collection.update_one( {"chat_id": target_chat_id}, {"$set": {"last_bot_shitpost_time": now}} ) )
+            logger.info(f"Обновлено время последнего высера для чата {target_chat_id}")
+        except (telegram.error.Forbidden, telegram.error.BadRequest) as e:
+             logger.warning(f"Не удалось отправить высер в чат {target_chat_id}: {e}.")
+        except Exception as send_e:
+             logger.error(f"Неизвестная ошибка при отправке высера в чат {target_chat_id}: {send_e}", exc_info=True)
 
-        # ОБНОВЛЯЕМ ВРЕМЯ ПОСЛЕДНЕГО ВЫСЕРА БОТА в БД
-        await loop.run_in_executor(
-            None,
-            lambda: chat_activity_collection.update_one(
-                {"chat_id": target_chat_id},
-                {"$set": {"last_bot_shitpost_time": now}} # Ставим текущее время
-            )
-        )
-        logger.info(f"Обновлено время последнего высера для чата {target_chat_id}")
+# except Exception as e: # Внешний try...except остается
+#     logger.error(f"Ошибка в фоновой задаче check_inactivity_and_shitpost: {e}", exc_info=True)
 
-    except Exception as e:
-        # Ловим ошибки внутри всей функции, а не только API
-        logger.error(f"Ошибка в фоновой задаче check_inactivity_and_shitpost: {e}", exc_info=True)
-
-# --- КОНЕЦ ПОЛНОЙ ФУНКЦИИ ДЛЯ ФОНОВОЙ ЗАДАЧИ ---
+# --- КОНЕЦ ИЗМЕНЕННОЙ check_inactivity_and_shitpost ---
 
 # --- ФУНКЦИЯ ДЛЯ /help ---
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1142,13 +1150,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 *Новости (Автопостинг):*
 Раз в несколько часов я буду постить подборку свежих новостей со своими охуенными комментариями. Не нравится - жалуйся админам.
 
+*Похвала (Саркастичная):*
+Ответь на сообщение человека <code>/praise</code> или "<code>Бот похвали его/ее</code>".
+Я попробую выдать неоднозначный "комплимент".
+
 *Эта справка:*
 Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
 
 *Важно:*
 - Дайте <b>админку</b>, чтобы я видел весь ваш пиздеж.
 - Иногда я несу хуйню - я работаю на нейросетях.
-- Иногда, если в чате долго тишина, я могу сам вкинуть какой-нибудь ебанутый "факт".
+- Иногда, если в чате тихо, я могу ВНЕЗАПНО кого-то похвалить (в своем стиле) или выдать ебанутый "факт".
 
 *💰 Подкинуть на пиво Попиздяке:*
 Если тебе нравится мой бред, можешь закинуть копеечку:
@@ -1385,6 +1397,67 @@ async def force_post_news(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await post_news_job(context)
     await update.message.reply_text("Попытка постинга новостей завершена. Смотри логи.")
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ ПОХВАЛЫ (/praise) ---
+async def praise_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Генерирует саркастическую 'похвалу' пользователю, на сообщение которого ответили."""
+    # Проверка на reply и на то, что ответили не боту
+    if (not update.message or not update.message.reply_to_message or
+            not update.message.reply_to_message.from_user or
+            update.message.reply_to_message.from_user.id == context.bot.id):
+        await context.bot.send_message(chat_id=update.message.chat_id, text="Ответь этой командой на сообщение того, кого хочешь ПОХВАЛИТЬ (но не меня!).")
+        return
+
+    target_user = update.message.reply_to_message.from_user
+    target_name = target_user.first_name or target_user.username or "этот достойный муж (или баба)"
+    chat_id = update.message.chat_id
+    user_name = update.message.from_user.first_name or "Главный Подхалим"
+
+    logger.info(f"Пользователь '{user_name}' запросил похвалу для '{target_name}' (ID: {target_user.id}) в чате {chat_id}")
+
+    # --- ПРОМПТ ДЛЯ ГЕНЕРАЦИИ "ПОХВАЛЫ" ---
+    praise_prompt = (
+        f"Ты - Попиздяка, саркастичный бот. Тебя попросили ПОХВАЛИТЬ пользователя по имени **{target_name}**. "
+        f"Придумай **КОРОТКУЮ (1-3 предложения) НЕОДНОЗНАЧНУЮ 'ПОХВАЛУ'**. Она должна звучать формально положительно, но с явным подтекстом сарказма, иронии или скрытого стеба. Можно использовать немного мата для колорита. "
+        f"Сделай так, чтобы человек не понял, похвалили его или обосрали.\n\n"
+        f"ВАЖНО: Это должна быть именно кривая ПОХВАЛА, а не оскорбление. Начинай ответ с `🗿`.\n\n"
+        f"Пример (для Васи): '🗿 О, Васян! Ты, блядь, существуешь! Это уже достижение, я считаю. Продолжай в том же духе (нет).'\n"
+        f"Пример (для Лены): '🗿 Лена сегодня превзошла саму себя! Ее молчание в чате было просто божественным. Побольше бы так.'\n"
+        f"Пример (для Димы): '🗿 Дима, твоя способность не понимать очевидные вещи просто поражает! Это редкий дар, береги его.'\n\n"
+        f"Придумай подобную САРКАСТИЧНУЮ ПОХВАЛУ для **{target_name}**:"
+    )
+    # --- КОНЕЦ ПРОМПТА ---
+
+    try:
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Ща попробую найти, за что похвалить этого вашего '{target_name}'...")
+        # Используем текстовую модель (io.net или Gemini)
+        messages_for_api = [{"role": "user", "content": praise_prompt}]
+        praise_text = await _call_ionet_api( # ИЛИ model.generate_content_async
+            messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=100, temperature=0.85
+        ) or f"[Похвала для {target_name} не придумалась]"
+        if not praise_text.startswith(("🗿", "[")): praise_text = "🗿 " + praise_text
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+
+        MAX_MESSAGE_LENGTH = 4096; # Обрезка
+        if len(praise_text) > MAX_MESSAGE_LENGTH: praise_text = praise_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+
+        # Отправляем как ответ на команду, но упоминаем цель
+        target_mention = target_user.mention_html() if target_user.username else f"<b>{target_name}</b>"
+        final_text = f"Типа похвала для {target_mention}:\n\n{praise_text}"
+        await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
+        logger.info(f"Отправлена похвала для {target_name}.")
+        # Запись для /retry (если нужна)
+        # ... (можно добавить запись с type='praise')
+
+    except Exception as e:
+        logger.error(f"ПИЗДЕЦ при генерации похвалы для {target_name}: {e}", exc_info=True)
+        try:
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+        except Exception: pass
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу похвалить '{target_name}'. Он слишком идеален (нет). Ошибка: `{type(e).__name__}`.")
+
+# --- КОНЕЦ ФУНКЦИИ /praise ---    
+
 async def main() -> None:
     logger.info("Starting main()...")
     logger.info("Building Application...")
@@ -1419,6 +1492,13 @@ async def main() -> None:
     application.add_handler(CommandHandler("retry", retry_analysis))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("post_news", force_post_news))
+    # --->>> ДОБАВЛЯЕМ ПОХВАЛУ <<<---
+    application.add_handler(CommandHandler("praise", praise_user)) # Команда /praise (в ответе)
+    praise_pattern = r'(?i).*(?:бот|попиздяка).*(?:похвали|молодец|красавчик)\s+(?:его|ее|этого|эту).*'
+    # Ловим ТОЛЬКО как ответ!
+    application.add_handler(MessageHandler(filters.Regex(praise_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, praise_user))
+    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПОХВАЛЫ <<<---
+
 
     # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ТЕХРАБОТ <<<---
     # Regex для ВКЛючения техработ
