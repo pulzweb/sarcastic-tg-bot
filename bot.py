@@ -687,118 +687,105 @@ async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Запись для /retry не делаем для предсказаний, т.к. оно рандомное
     except Exception as e: logger.error(f"ПИЗДЕЦ при генерации предсказания для {user_name}: {e}", exc_info=True); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, мой шар треснул. Ошибка: `{type(e).__name__}`.")
 
+# --- ПЕРЕДЕЛАННАЯ get_pickup_line (С КОНТЕКСТОМ И ОТВЕТОМ НА СООБЩЕНИЕ) ---
 async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-         # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
-# Проверяем наличие update и message - без них проверка невозможна
+    """Генерирует кринжовый подкат к пользователю, на сообщение которого ответили, с учетом контекста."""
+
+    # 1. Проверка техработ (ОБЯЗАТЕЛЬНО!)
     if not update or not update.message or not update.message.from_user or not update.message.chat:
-        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
-        # Если это важная команда, можно тут вернуть ошибку пользователю
-        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
-        return # Или просто выйти
-
-    real_chat_id = update.message.chat.id
-    real_user_id = update.message.from_user.id
-    real_chat_type = update.message.chat.type
-
-    loop = asyncio.get_running_loop()
-    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
-
-    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
-    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
-        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
-        try: # Пытаемся ответить и удалить команду
-            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
-            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
-        except Exception as e:
-            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
-        return # ВЫХОДИМ ИЗ ФУНКЦИИ
-# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
-    """Генерирует ебанутый подкат через ai.io.net."""
-    # Проверка на наличие сообщения и пользователя
-    if not update.message or not update.message.from_user:
-        logger.warning("get_pickup_line вызвана без update.message или from_user")
+         logger.warning("get_pickup_line: нет данных для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан!")
+    loop = asyncio.get_running_loop(); maintenance_active = await is_maintenance_mode(loop)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"Команда pickup отклонена из-за техработ в чате {real_chat_id}")
+        try: await context.bot.send_message(chat_id=real_chat_id, text="🔧 Техработы. Не до подкатов сейчас.")
+        except Exception: pass
+        # Удалим команду, если можем
+        try: await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception: pass
         return
 
-    chat_id = update.message.chat_id
-    user = update.message.from_user
-    user_name = user.first_name or "Казанова хуев" # Кто запросил
+    # 2. Проверка, что это ответ на сообщение и не на бота
+    if (not update.message.reply_to_message or
+            not update.message.reply_to_message.from_user or
+            update.message.reply_to_message.from_user.id == context.bot.id):
+        await context.bot.send_message(chat_id=chat_id, text="Ответь этой командой на сообщение того/той, к кому хочешь подкатить (но не ко мне!).")
+        return
 
-    logger.info(f"Пользователь '{user_name}' запросил подкат в чате {chat_id}")
+    # 3. Собираем инфу
+    target_user = update.message.reply_to_message.from_user # К кому катим
+    target_name = target_user.first_name or target_user.username or "прекрасная незнакомка/незнакомец"
+    chat_id = update.message.chat.id
+    user = update.message.from_user # Кто катит
+    user_name = user.first_name or "Пикап-мастер"
 
-    # --- ПРОМПТ ДЛЯ ЕБАНУТЫХ ПОДКАТОВ ---
+    logger.info(f"Пользователь '{user_name}' запросил подкат к '{target_name}' (ID: {target_user.id}). Ищем контекст...")
+
+    # 4. Читаем контекст цели из БД (как в roast_user)
+    user_context = "[Недавно ничего не писал(а)]"
+    USER_CONTEXT_LIMIT_PICKUP = 3 # Достаточно пары последних фраз
+    try:
+        query = {"chat_id": chat_id, "user_id": target_user.id}
+        sort_order = [("timestamp", pymongo.DESCENDING)]
+        user_hist_cursor = await loop.run_in_executor(None, lambda: history_collection.find(query).sort(sort_order).limit(USER_CONTEXT_LIMIT_PICKUP))
+        user_messages = list(user_hist_cursor)[::-1]
+        if user_messages:
+            context_lines = [msg.get('text', '[...]') for msg in user_messages]
+            user_context = "\n".join(context_lines)
+            logger.info(f"Найден контекст ({len(user_messages)} сообщ.) для {target_name}.")
+        else: logger.info(f"Контекст для {target_name} не найден.")
+    except Exception as db_e: logger.error(f"Ошибка чтения контекста для подката из MongoDB: {db_e}")
+
+    # 5. Формируем промпт для Gemini/io.net
+    logger.info(f"Генерация подката к '{target_name}' с учетом контекста...")
+
+    # --->>> НОВЫЙ ПРОМПТ ДЛЯ КОНТЕКСТНОГО ПОДКАТА <<<---
     pickup_prompt = (
-        f"Ты - генератор самых АБСУРДНЫХ, КРИНЖОВЫХ, НЕОЖИДАННЫХ и тупых подкатов (pickup lines). Твоя задача - придумать ОДНУ короткую (1-2 предложения) фразу для знакомства, которая нарушает все законы логики, здравого смысла и хорошего вкуса. Она должна быть настолько нелепой, что вызовет смех или полный ахуй. Можно использовать немного мата для колорита.\n\n"
-        # Убрали инструкцию про имя цели
-        f"ВАЖНО: Максимум абсурда и кринжа! Забудь про романтику и стандартные фразы. НЕ ПИШИ вступлений. СРАЗУ выдавай подкат.\n\n"
-        f"Примеры такого пиздеца:\n"
-        f"- Вашей маме зять не нужен? А то моя жена заебала.\n"
-        f"- Девушка, у вас красивое лицо! Но что, блядь, случилось со всем остальным?\n"
-        f"- У тебя такие глаза... В них хочется утонуть. И не выплывать. Никогда.\n"
-        f"- Ты случайно не мой ночной кошмар? Просто выглядишь пиздец знакомо.\n"
-        f"- А ты всегда такая страшная или сегодня просто не твой день?\n"
-        f"- Давай перепихнемся? А то погода хуевая, настроение говно.\n"
-        f"- Я бы пригласил тебя на кофе, но боюсь, ты его прольешь на свою убогую кофточку.\n\n"
-        f"Выдай ОДИН подобный ЕБАНУТЫЙ подкат:"
+        f"Ты - Попиздяка, бот с ОЧЕНЬ СПЕЦИФИЧЕСКИМ чувством юмора, немного пошлый и саркастичный. Тебе нужно придумать **ОДНУ КОРОТКУЮ (1-2 предложения) фразу для ПОДКАТА (pickup line)** к пользователю по имени **{target_name}**. "
+        f"Вот последние несколько сообщений этого пользователя (если есть):\n"
+        f"```\n{user_context}\n```\n"
+        f"Твоя задача: Придумай подкат, который будет **СМЕШНО или НЕОЖИДАННО обыгрывать что-то из его/ее НЕДАВНИХ СООБЩЕНИЙ** (если они есть и информативны) ИЛИ просто его/ее **ИМЯ**. Подкат должен быть **КРИНЖОВЫМ, НЕУКЛЮЖИМ, САРКАСТИЧНЫМ или ЧУТЬ ПОШЛЫМ**, но НЕ откровенно оскорбительным (ты пытаешься типа 'подкатить', а не прожарить). Используй немного мата для стиля. Начинай ответ с `🗿 `.\n\n"
+        f"Пример (Контекст: 'Обожаю пиццу'; Имя: Лена): '🗿 Лена, ты такая же горячая и желанная, как последний кусок пиццы... только от тебя жопа не слипнется (наверное).'\n"
+        f"Пример (Контекст: 'Устал как собака'; Имя: Макс): '🗿 Макс, вижу ты устал... Может, приляжешь? Желательно на меня. 😉 (Блядь, хуйню сморозил, прости)'\n"
+        f"Пример (Контекста нет; Имя: Оля): '🗿 Оля, у тебя красивое имя. Почти такое же красивое, как мои намерения затащить тебя в постель (или хотя бы в канаву).'\n\n"
+        f"Придумай ОДИН такой КРИНЖОВЫЙ подкат для **{target_name}**, по возможности используя контекст:"
     )
-    # --- КОНЕЦ ПРОМПТА ---
+    # --->>> КОНЕЦ НОВОГО ПРОМПТА <<<---
 
     try:
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text="🗿 Ща, подберу фразочку, чтоб точно в ебало дали...")
-        logger.info(f"Отправка запроса к ai.io.net для генерации подката...")
-
-        # Вызываем API с высокой температурой для бреда
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Подбираю ключи к сердцу (или ширинке) '{target_name}'...")
         messages_for_api = [{"role": "user", "content": pickup_prompt}]
-        pickup_line_text = await _call_ionet_api(
-            messages=messages_for_api,
-            model_id=IONET_TEXT_MODEL_ID, # Используем текстовую модель
-            max_tokens=100,
-            temperature=1.2  # ВЫСОКАЯ ТЕМПЕРАТУРА!
-        ) or "[Подкат сдох при родах]" # Заглушка
-
-        # Добавляем Моаи, если это не ошибка
-        if not pickup_line_text.startswith(("🗿", "[")):
-            pickup_line_text = "🗿 " + pickup_line_text
-
-        # Удаляем "Думаю..."
+        # Вызов ИИ (_call_ionet_api или model.generate_content_async)
+        pickup_line_text = await _call_ionet_api( # ИЛИ model.generate_content_async
+            messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=100, temperature=1.0 # Высокая температура для креатива
+        ) or f"[Подкат к {target_name} провалился]"
+        if not pickup_line_text.startswith(("🗿", "[")): pickup_line_text = "🗿 " + pickup_line_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        # Обрезка на всякий случай
-        MAX_MESSAGE_LENGTH = 4096;
-        if len(pickup_line_text) > MAX_MESSAGE_LENGTH:
-            pickup_line_text = pickup_line_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        MAX_MESSAGE_LENGTH = 4096; # Обрезка
+        if len(pickup_line_text) > MAX_MESSAGE_LENGTH: pickup_line_text = pickup_line_text[:MAX_MESSAGE_LENGTH - 3] + "..."
 
-        # Отправляем подкат
-        sent_message = await context.bot.send_message(chat_id=chat_id, text=pickup_line_text)
-        logger.info(f"Отправлен подкат.")
-
-        # Запись для /retry (БЕЗ target_name)
-        if sent_message:
-             reply_doc = {
-                 "chat_id": chat_id,
-                 "message_id": sent_message.message_id,
-                 "analysis_type": "pickup", # Тип для /retry
-                 "timestamp": datetime.datetime.now(datetime.timezone.utc)
-             }
-             try:
-                 loop = asyncio.get_running_loop()
-                 await loop.run_in_executor(None, lambda: last_reply_collection.update_one({"chat_id": chat_id}, {"$set": reply_doc}, upsert=True))
-                 logger.debug(f"Сохранен ID ({sent_message.message_id}, pickup) для /retry чата {chat_id}.")
-             except Exception as e:
-                 logger.error(f"Ошибка записи /retry (pickup) в MongoDB: {e}")
+        # Отправляем подкат (НЕ как ответ, а просто в чат, упоминая цель)
+        target_mention = target_user.mention_html() if target_user.username else f"<b>{target_name}</b>"
+        final_text = f"Подкат для {target_mention} от {user.mention_html()}:\n\n{pickup_line_text}"
+        await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
+        logger.info(f"Отправлен подкат к {target_name}.")
+        # Запись для /retry (если нужна, с type='pickup', target_id, target_name)
+        # ...
 
     except Exception as e:
-        # Обработка общих ошибок
-        logger.error(f"ПИЗДЕЦ при генерации подката: {e}", exc_info=True)
+        logger.error(f"ПИЗДЕЦ при генерации подката к {target_name}: {e}", exc_info=True)
         try:
-            # Пытаемся удалить "Думаю..." даже при ошибке
-            if 'thinking_message' in locals():
-                 await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
+            if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        # Отправляем сообщение об ошибке
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, пикап-мастер сломался. Ошибка: `{type(e).__name__}`.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не смог подкатить к '{target_name}'. Видимо, он(а) слишком хорош(а) для такого говна, как я. Ошибка: `{type(e).__name__}`.")
 
-# --- КОНЕЦ ПОЛНОЙ ИСПРАВЛЕННОЙ ФУНКЦИИ ДЛЯ ПОДКАТОВ ---
+# --- КОНЕЦ ПЕРЕДЕЛАННОЙ get_pickup_line ---
 
 
 # --- ПЕРЕПИСАННАЯ roast_user (С КОНТЕКСТОМ ИЗ БД) ---
@@ -1456,40 +1443,88 @@ async def force_post_news(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await post_news_job(context)
     await update.message.reply_text("Попытка постинга новостей завершена. Смотри логи.")
 
-# --- НОВАЯ ФУНКЦИЯ ДЛЯ ПОХВАЛЫ (/praise) ---
+# --- ПЕРЕДЕЛАННАЯ praise_user (С КОНТЕКСТОМ И ОТВЕТОМ НА СООБЩЕНИЕ) ---
 async def praise_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Генерирует саркастическую 'похвалу' пользователю, на сообщение которого ответили."""
-    # Проверка на reply и на то, что ответили не боту
+    """Генерирует саркастическую 'похвалу' пользователю (на кого ответили) с учетом контекста."""
+
+    # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+# Проверяем наличие update и message - без них проверка невозможна
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"Не могу проверить техработы - нет данных в update ({__name__})") # Логгируем имя текущей функции
+        # Если это важная команда, можно тут вернуть ошибку пользователю
+        # await context.bot.send_message(chat_id=update.effective_chat.id, text="Ошибка проверки данных.")
+        return # Или просто выйти
+
+    real_chat_id = update.message.chat.id
+    real_user_id = update.message.from_user.id
+    real_chat_type = update.message.chat.type
+
+    loop = asyncio.get_running_loop()
+    maintenance_active = await is_maintenance_mode(loop) # Вызываем функцию проверки
+
+    # Блокируем, если техработы ВКЛЮЧЕНЫ и это НЕ админ в ЛС
+    if maintenance_active and (real_user_id != ADMIN_USER_ID or real_chat_type != 'private'):
+        logger.info(f"Команда отклонена из-за режима техработ в чате {real_chat_id}")
+        try: # Пытаемся ответить и удалить команду
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e:
+            logger.warning(f"Не удалось ответить/удалить сообщение о техработах: {e}")
+        return # ВЫХОДИМ ИЗ ФУНКЦИИ
+# --->>> КОНЕЦ НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
+
+    # 2. Проверка, что это ответ на сообщение и не на бота
     if (not update.message or not update.message.reply_to_message or
             not update.message.reply_to_message.from_user or
             update.message.reply_to_message.from_user.id == context.bot.id):
-        await context.bot.send_message(chat_id=update.message.chat_id, text="Ответь этой командой на сообщение того, кого хочешь ПОХВАЛИТЬ (но не меня!).")
+        await context.bot.send_message(chat_id=update.message.chat_id, text="Ответь этой командой на сообщение того, кого хочешь 'похвалить'.")
         return
 
-    target_user = update.message.reply_to_message.from_user
-    target_name = target_user.first_name or target_user.username or "этот достойный муж (или баба)"
-    chat_id = update.message.chat_id
-    user_name = update.message.from_user.first_name or "Главный Подхалим"
+    # 3. Собираем инфу
+    target_user = update.message.reply_to_message.from_user # Кого хвалим
+    target_name = target_user.first_name or target_user.username or "этот уникум"
+    chat_id = update.message.chat.id
+    user = update.message.from_user # Кто хвалит
+    user_name = user.first_name or "Главный Льстец"
 
-    logger.info(f"Пользователь '{user_name}' запросил похвалу для '{target_name}' (ID: {target_user.id}) в чате {chat_id}")
+    logger.info(f"Пользователь '{user_name}' запросил похвалу для '{target_name}' (ID: {target_user.id}). Ищем контекст...")
 
-    # --- ПРОМПТ ДЛЯ ГЕНЕРАЦИИ "ПОХВАЛЫ" ---
+    # 4. Читаем контекст цели из БД (как в roast_user)
+    user_context = "[Недавних сообщений не найдено]"
+    USER_CONTEXT_LIMIT_PRAISE = 3 # Хватит 3 сообщений
+    try:
+        loop = asyncio.get_running_loop()
+        query = {"chat_id": chat_id, "user_id": target_user.id}
+        sort_order = [("timestamp", pymongo.DESCENDING)]
+        user_hist_cursor = await loop.run_in_executor(None, lambda: history_collection.find(query).sort(sort_order).limit(USER_CONTEXT_LIMIT_PRAISE))
+        user_messages = list(user_hist_cursor)[::-1]
+        if user_messages:
+            context_lines = [msg.get('text', '[...]') for msg in user_messages]
+            user_context = "\n".join(context_lines)
+            logger.info(f"Найден контекст ({len(user_messages)} сообщ.) для {target_name}.")
+        else: logger.info(f"Контекст для {target_name} не найден.")
+    except Exception as db_e: logger.error(f"Ошибка чтения контекста для похвалы из MongoDB: {db_e}")
+
+    # 5. Формируем промпт для ИИ
+    logger.info(f"Генерация похвалы для '{target_name}' с учетом контекста...")
+
+    # --->>> НОВЫЙ ПРОМПТ ДЛЯ КОНТЕКСТНОЙ "ПОХВАЛЫ" <<<---
     praise_prompt = (
-        f"Ты - Попиздяка, саркастичный бот. Тебя попросили ПОХВАЛИТЬ пользователя по имени **{target_name}**. "
-        f"Придумай **КОРОТКУЮ (1-3 предложения) НЕОДНОЗНАЧНУЮ 'ПОХВАЛУ'**. Она должна звучать формально положительно, но с явным подтекстом сарказма, иронии или скрытого стеба. Можно использовать немного мата для колорита. "
-        f"Сделай так, чтобы человек не понял, похвалили его или обосрали.\n\n"
-        f"ВАЖНО: Это должна быть именно кривая ПОХВАЛА, а не оскорбление. Начинай ответ с `🗿`.\n\n"
-        f"Пример (для Васи): '🗿 О, Васян! Ты, блядь, существуешь! Это уже достижение, я считаю. Продолжай в том же духе (нет).'\n"
-        f"Пример (для Лены): '🗿 Лена сегодня превзошла саму себя! Ее молчание в чате было просто божественным. Побольше бы так.'\n"
-        f"Пример (для Димы): '🗿 Дима, твоя способность не понимать очевидные вещи просто поражает! Это редкий дар, береги его.'\n\n"
-        f"Придумай подобную САРКАСТИЧНУЮ ПОХВАЛУ для **{target_name}**:"
+        f"Ты - Попиздяка, саркастичный бот, который притворяется, что хочет похвалить пользователя по имени **{target_name}**. "
+        f"Вот последние несколько сообщений этого пользователя:\n"
+        f"```\n{user_context}\n```\n\n"
+        f"Твоя задача: Придумай **КОРОТКУЮ (1-3 предложения) НЕОДНОЗНАЧНУЮ 'ПОХВАЛУ'**. Она должна звучать формально положительно или нейтрально, но содержать **СКРЫТЫЙ САРКАЗМ, ИРОНИЮ или СТЕБ**, по возможности **обыгрывая что-то из его/ее НЕДАВНИХ СООБЩЕНИЙ** или просто **ИМЯ**. Используй немного мата для стиля Попиздяки. Цель - чтобы человек не понял, похвалили его или тонко обосрали. Начинай ответ с `🗿 `.\n\n"
+        f"Пример (Контекст: 'Я сегодня пробежал 10 км!'; Имя: Вася): '🗿 Вася, 10 км! Нихуя себе ты лось! Не порвал себе очко от натуги? Молодец, блядь, продолжай в том же духе (к инфаркту).'\n"
+        f"Пример (Контекст: 'Сделала новую прическу'; Имя: Лена): '🗿 Ого, Лена, новый образ! Смело. Очень смело. Тебе... идет? Наверное. Выглядишь почти так же хуево, как обычно, но по-новому!'\n"
+        f"Пример (Контекста нет; Имя: Дима): '🗿 Дима! Само твое присутствие в этом чате - уже повод для гордости... наверное. Не каждый может так стабильно существовать.'\n\n"
+        f"Придумай подобную САРКАСТИЧНУЮ, НЕОДНОЗНАЧНУЮ ПОХВАЛУ для **{target_name}**, по возможности используя контекст:"
     )
-    # --- КОНЕЦ ПРОМПТА ---
+    # --->>> КОНЕЦ НОВОГО ПРОМПТА <<<---
 
     try:
-        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Ща попробую найти, за что похвалить этого вашего '{target_name}'...")
-        # Используем текстовую модель (io.net или Gemini)
+        thinking_message = await context.bot.send_message(chat_id=chat_id, text=f"🗿 Пытаюсь найти, за что 'похвалить' '{target_name}'...")
         messages_for_api = [{"role": "user", "content": praise_prompt}]
+        # Вызов ИИ (_call_ionet_api или model.generate_content_async)
         praise_text = await _call_ionet_api( # ИЛИ model.generate_content_async
             messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=100, temperature=0.85
         ) or f"[Похвала для {target_name} не придумалась]"
@@ -1500,22 +1535,22 @@ async def praise_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         MAX_MESSAGE_LENGTH = 4096; # Обрезка
         if len(praise_text) > MAX_MESSAGE_LENGTH: praise_text = praise_text[:MAX_MESSAGE_LENGTH - 3] + "..."
 
-        # Отправляем как ответ на команду, но упоминаем цель
+        # Отправляем "похвалу"
         target_mention = target_user.mention_html() if target_user.username else f"<b>{target_name}</b>"
-        final_text = f"Типа похвала для {target_mention}:\n\n{praise_text}"
+        final_text = f"Типа похвала для {target_mention} от {user.mention_html()}:\n\n{praise_text}"
         await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
         logger.info(f"Отправлена похвала для {target_name}.")
-        # Запись для /retry (если нужна)
-        # ... (можно добавить запись с type='praise')
+        # Запись для /retry (если нужна, с type='praise')
+        # ...
 
     except Exception as e:
         logger.error(f"ПИЗДЕЦ при генерации похвалы для {target_name}: {e}", exc_info=True)
         try:
             if 'thinking_message' in locals(): await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу похвалить '{target_name}'. Он слишком идеален (нет). Ошибка: `{type(e).__name__}`.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, не могу похвалить '{target_name}'. Видимо, не за что. Ошибка: `{type(e).__name__}`.")
 
-# --- КОНЕЦ ФУНКЦИИ /praise ---    
+# --- КОНЕЦ ПЕРЕДЕЛАННОЙ praise_user ---
 
 async def main() -> None:
     logger.info("Starting main()...")
@@ -1545,18 +1580,24 @@ async def main() -> None:
     application.add_handler(CommandHandler("analyze_pic", analyze_pic))
     application.add_handler(CommandHandler("poem", generate_poem))
     application.add_handler(CommandHandler("prediction", get_prediction))
-    application.add_handler(CommandHandler("pickup", get_pickup_line))
-    application.add_handler(CommandHandler("pickup_line", get_pickup_line))
     application.add_handler(CommandHandler("roast", roast_user))
     application.add_handler(CommandHandler("retry", retry_analysis))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("post_news", force_post_news))
-    # --->>> ДОБАВЛЯЕМ ПОХВАЛУ <<<---
-    application.add_handler(CommandHandler("praise", praise_user)) # Команда /praise (в ответе)
+
+# Добавляем НОВЫЕ обработчики, которые требуют ОТВЕТА на сообщение
+    application.add_handler(CommandHandler("pickup", get_pickup_line, filters=filters.REPLY)) # Только в ответе
+    application.add_handler(CommandHandler("pickup_line", get_pickup_line, filters=filters.REPLY)) # Только в ответе
+    pickup_pattern = r'(?i).*(?:бот|попиздяка).*(?:подкат|пикап|склей|познакомься|замути).*'
+    application.add_handler(MessageHandler(filters.Regex(pickup_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, get_pickup_line)) # Только в ответе
+    # --->>> КОНЕЦ ИЗМЕНЕНИЙ <<<---
+
+     # --->>> ИЗМЕНЯЕМ ОБРАБОТЧИКИ ПОХВАЛЫ <<<---
+    # Убираем старые CommandHandler("praise"...) и MessageHandler(praise_pattern...) если они были
+    application.add_handler(CommandHandler("praise", praise_user, filters=filters.REPLY)) # Только в ответе
     praise_pattern = r'(?i).*(?:бот|попиздяка).*(?:похвали|молодец|красавчик)\s+(?:его|ее|этого|эту).*'
-    # Ловим ТОЛЬКО как ответ!
-    application.add_handler(MessageHandler(filters.Regex(praise_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, praise_user))
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ ДЛЯ ПОХВАЛЫ <<<---
+    application.add_handler(MessageHandler(filters.Regex(praise_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, praise_user)) # Только в ответе
+    # --->>> КОНЕЦ ИЗМЕНЕНИЙ <<<---
 
 
     # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ТЕХРАБОТ <<<---
@@ -1584,8 +1625,6 @@ async def main() -> None:
     prediction_pattern = r'(?i).*(?:бот|попиздяка).*(?:предскажи|что ждет|прогноз|предсказание|напророчь).*'
     application.add_handler(MessageHandler(filters.Regex(prediction_pattern) & filters.TEXT & ~filters.COMMAND, get_prediction)) # Прямой вызов
 
-    pickup_pattern = r'(?i).*(?:бот|попиздяка).*(?:подкат|пикап|склей|познакомься|замути).*'
-    application.add_handler(MessageHandler(filters.Regex(pickup_pattern) & filters.TEXT & ~filters.COMMAND, get_pickup_line)) # Прямой вызов
 
     roast_pattern = r'(?i).*(?:бот|попиздяка).*(?:прожарь|зажарь|обосри|унизь)\s+(?:его|ее|этого|эту).*'
     application.add_handler(MessageHandler(filters.Regex(roast_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, roast_user)) # Прямой вызов
