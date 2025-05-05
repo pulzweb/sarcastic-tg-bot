@@ -30,6 +30,19 @@ from dotenv import load_dotenv
 # Загружаем секреты (.env для локального запуска)
 load_dotenv()
 
+# --->>> СИСТЕМА ЗВАНИЙ ПО СООБЩЕНИЯМ <<<---
+# Словарь: порог_сообщений: (Название звания, Сообщение о достижении)
+TITLES_BY_COUNT = {
+    10:    ("Залетный Пиздабол", "🗿 {mention}, ты настрочил аж 10 высеров! Теперь ты официально 'Залетный Пиздабол'. Хули так мало?"),
+    50:    ("Почетный Флудер", "🗿 Ого, {mention}, уже 50 сообщений! Поздравляю с почетным званием 'Флудера'. Продолжай засирать чат."),
+    100:   ("Мастер Бесполезного Трёпа", "🗿 {mention}, соточка! Ты достиг вершины - 'Мастер Бесполезного Трёпа'. Мои аплодисменты, блядь."),
+    250:   ("Кандидат в Затычки для Бочки", "🗿 250 сообщений от {mention}! Серьезная заявка на 'Кандидата в Затычки для Бочки'. Скоро переплюнешь меня."),
+    500:   ("Заслуженный Долбоеб Чата™", "🗿 ПИЗДЕЦ! {mention}, 500 высеров! Ты теперь 'Заслуженный Долбоеб Чата™'. Это почти как Нобелевка, но бесполезнее."),
+    1000:  ("Попиздякин Друг", "🗿 ЕБАТЬ! {mention}, тысяча! Ты либо мой лучший друг, либо самый главный враг. Звание: 'Попиздякин Друг'."),
+    5000:  ("Мегапиздабол", "🗿 Ахуеть! {mention}, 5к! Ты либо безработный, либо самый лютый любитель попиздеть. Звание: 'Мегапиздабол'."),
+}
+# --->>> КОНЕЦ СИСТЕМЫ ЗВАНИЙ <<<---
+
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IO_NET_API_KEY = os.getenv("IO_NET_API_KEY")
@@ -73,6 +86,9 @@ try:
     last_reply_collection = db['last_replies']
     chat_activity_collection = db['chat_activity']
     chat_activity_collection.create_index("chat_id", unique=True)
+    user_profiles_collection = db['user_profiles']
+    user_profiles_collection.create_index("user_id", unique=True)
+    logger.info("Коллекция user_profiles готова.")
     logger.info("Коллекции MongoDB готовы.")
     bot_status_collection = db['bot_status']
     logger.info("Коллекция bot_status готова.")
@@ -144,27 +160,120 @@ async def set_maintenance_mode(active: bool, loop: asyncio.AbstractEventLoop) ->
         return False
 # --->>> КОНЕЦ ФУНКЦИЙ ДЛЯ ТЕХРАБОТ <<<---
 
-# --- ОБРАБОТЧИК СООБЩЕНИЙ (ЗАПИСЬ В БД) ---
+# --- ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ store_message (v3, с профилями и званиями) ---
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Сохраняет текст/заглушки в history_collection и обновляет chat_activity_collection
-    if not update.message or not update.message.from_user: return
-    message_text = None; chat_id = update.message.chat_id; user_name = update.message.from_user.first_name or "Анон"; timestamp = update.message.date or datetime.datetime.now(datetime.timezone.utc)
+    # 1. Проверяем базовые вещи
+    if not update.message or not update.message.from_user or not update.message.chat:
+        return
+
+    user = update.message.from_user
+    chat_id = update.message.chat.id
+    timestamp = update.message.date or datetime.datetime.now(datetime.timezone.utc)
+
+    # 2. Определяем текст сообщения или заглушку
+    message_text = None
     if update.message.text: message_text = update.message.text
     elif update.message.photo: file_id = update.message.photo[-1].file_id; message_text = f"[КАРТИНКА:{file_id}]"
     elif update.message.sticker: emoji = update.message.sticker.emoji or ''; message_text = f"[СТИКЕР {emoji}]"
     elif update.message.video: message_text = "[ОТПРАВИЛ(А) ВИДЕО]"
     elif update.message.voice: message_text = "[ОТПРАВИЛ(А) ГОЛОСОВОЕ]"
-    if message_text:
-        message_doc = {"chat_id": chat_id, "user_id": update.message.from_user.id, "user_name": user_name, "text": message_text, "timestamp": timestamp, "message_id": update.message.message_id}
-        activity_update_doc = {"$set": {"last_message_time": timestamp}, "$setOnInsert": {"last_bot_shitpost_time": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "chat_id": chat_id}}
-        try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: history_collection.insert_one(message_doc))
-            await loop.run_in_executor(None, lambda: chat_activity_collection.update_one({"chat_id": chat_id}, activity_update_doc, upsert=True))
-        except Exception as e: logger.error(f"Ошибка записи в MongoDB чата {chat_id}: {e}", exc_info=True)
 
-import re # Убедись, что есть этот импорт в начале bot.py
-# Другие нужные импорты (Update, User, ContextTypes, pymongo, asyncio, datetime, logger, _call_ionet_api, IONET_TEXT_MODEL_ID, MAX_MESSAGES_TO_ANALYZE, history_collection, last_reply_collection)
+    # Если не смогли определить текст/заглушку - выходим
+    if not message_text: return
+
+    # 3. Работаем с профилем пользователя в MongoDB
+    profile = None
+    current_message_count = 0
+    current_title = None
+    custom_nickname = None
+    display_name = user.first_name or "Аноним" # Имя по умолчанию
+    profile_update_result = None
+    loop = asyncio.get_running_loop()
+
+    try:
+        # Атомарно увеличиваем счетчик сообщений и получаем обновленный профиль
+        # $inc увеличивает поле на 1
+        # $set устанавливает/обновляет поля
+        # $setOnInsert устанавливает поля только при создании нового документа
+        # return_document=pymongo.ReturnDocument.AFTER возвращает документ ПОСЛЕ обновления
+        profile_update_result = await loop.run_in_executor(
+            None,
+            lambda: user_profiles_collection.find_one_and_update(
+                {"user_id": user.id}, # Ищем по ID
+                {
+                    "$inc": {"message_count": 1}, # Увеличиваем счетчик
+                    "$set": {"tg_first_name": user.first_name, "tg_username": user.username}, # Обновляем ТГ инфу
+                    "$setOnInsert": {"user_id": user.id, "custom_nickname": None, "current_title": None} # Ставим при создании
+                },
+                projection={"message_count": 1, "custom_nickname": 1, "current_title": 1}, # Возвращаем нужные поля
+                upsert=True, # Создаем, если нет
+                return_document=pymongo.ReturnDocument.AFTER # Возвращаем обновленный
+            )
+        )
+
+        if profile_update_result:
+            profile = profile_update_result # Сохраняем результат
+            current_message_count = profile.get("message_count", 1) # Получаем новый счетчик
+            current_title = profile.get("current_title") # Текущее записанное звание
+            custom_nickname = profile.get("custom_nickname") # Кастомный ник
+            if custom_nickname:
+                 display_name = custom_nickname # Используем кастомный ник для логов/истории
+             # logger.debug(f"Обновлен счетчик для {display_name} ({user.id}): {current_message_count}")
+
+    except Exception as e:
+        logger.error(f"Ошибка обновления профиля/счетчика для user_id {user.id} в MongoDB: {e}", exc_info=True)
+        # Продолжаем выполнение, но без обновления званий
+
+    # 4. Записываем сообщение в историю (используя display_name)
+    message_doc = {
+        "chat_id": chat_id, "user_name": display_name, "text": message_text,
+        "timestamp": timestamp, "message_id": update.message.message_id, "user_id": user.id # Добавили user_id в историю
+    }
+    try:
+        await loop.run_in_executor(None, lambda: history_collection.insert_one(message_doc))
+    except Exception as e:
+        logger.error(f"Ошибка записи в history_collection: {e}")
+
+    # 5. Обновляем активность чата (как было)
+    try:
+        activity_update_doc = {"$set": {"last_message_time": timestamp}, "$setOnInsert": {"last_bot_shitpost_time": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "chat_id": chat_id}}
+        await loop.run_in_executor(None, lambda: chat_activity_collection.update_one({"chat_id": chat_id}, activity_update_doc, upsert=True))
+    except Exception as e:
+         logger.error(f"Ошибка обновления активности чата {chat_id}: {e}")
+
+    # 6. Проверяем достижение нового звания (только если смогли обновить профиль)
+    if profile:
+         new_title_achieved = None
+         new_title_message = ""
+         # Ищем самое высокое звание, которого достиг пользователь
+         for count_threshold, (title_name, achievement_message) in sorted(TITLES_BY_COUNT.items()):
+             if current_message_count >= count_threshold:
+                 new_title_achieved = title_name
+                 new_title_message = achievement_message # Запоминаем сообщение для этого звания
+             else:
+                 break # Дальше пороги выше
+
+         # Если достигнутое звание НОВОЕ (не совпадает с тем, что записано в профиле)
+         if new_title_achieved and new_title_achieved != current_title:
+             logger.info(f"Пользователь {display_name} ({user.id}) достиг нового звания: {new_title_achieved} ({current_message_count} сообщений)")
+             # Обновляем звание в БД
+             try:
+                 await loop.run_in_executor(
+                     None,
+                     lambda: user_profiles_collection.update_one(
+                         {"user_id": user.id},
+                         {"$set": {"current_title": new_title_achieved}}
+                     )
+                 )
+                 # Отправляем поздравительно-уничижительное сообщение
+                 # Используем mention_html для кликабельности
+                 mention = user.mention_html()
+                 achievement_text = new_title_message.format(mention=mention) # Подставляем упоминание в шаблон
+                 await context.bot.send_message(chat_id=chat_id, text=achievement_text, parse_mode='HTML')
+             except Exception as e:
+                 logger.error(f"Ошибка обновления звания или отправки сообщения о звании для user_id {user.id}: {e}", exc_info=True)
+
+# Конец функции store_message
 
 # --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С УЛУЧШЕННЫМ УДАЛЕНИЕМ <think>) ---
 async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None) -> None:
@@ -1207,6 +1316,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 Ответь на сообщение человека <code>/praise</code> или "<code>Бот похвали его/ее</code>".
 Я попробую выдать неоднозначный "комплимент".
 
+*Установить Никнейм:*
+Напиши <code>/set_name ТвойНик</code> или "<code>Бот меня зовут Повелитель Мух</code>".
+Я буду использовать этот ник в анализе чата вместо твоего имени из Telegram.
+
+*Кто ты, воин?:*
+Напиши <code>/whoami</code> или "<code>Бот кто я</code>".
+Я покажу твой текущий ник, количество сообщений (которое я видел) и твое почетное (или не очень) звание в банде Попиздяки.
+
 *Эта справка:*
 Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
 
@@ -1559,6 +1676,108 @@ async def praise_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # --- КОНЕЦ ПЕРЕДЕЛАННОЙ praise_user ---
 
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПОЛУЧЕНИЯ ПРОФИЛЯ ---
+async def get_user_profile(user_id: int, chat_id: int) -> dict | None:
+    """Получает профиль пользователя из MongoDB."""
+    # chat_id пока не используем, но может пригодиться для статистики по чатам
+    try:
+        loop = asyncio.get_running_loop()
+        profile = await loop.run_in_executor(
+            None,
+            lambda: user_profiles_collection.find_one({"user_id": user_id})
+        )
+        return profile
+    except Exception as e:
+        logger.error(f"Ошибка чтения профиля user_id {user_id} из MongoDB: {e}")
+        return None
+# --- КОНЕЦ ВСПОМОГАТЕЛЬНОЙ ФУНКЦИИ ---
+
+# --- ФУНКЦИЯ ДЛЯ УСТАНОВКИ НИКНЕЙМА ---
+async def set_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Устанавливает кастомный никнейм для пользователя."""
+    if not update.message or not update.message.from_user: return
+    user = update.message.from_user
+    chat_id = update.message.chat.id
+
+    # Извлекаем никнейм
+    nickname = ""
+    if update.message.text.startswith('/set_name'):
+        command_parts = update.message.text.split(maxsplit=1)
+        if len(command_parts) >= 2: nickname = command_parts[1].strip()
+    else: # Если русский аналог
+        match = re.search(r'(?i).*(?:зовут|ник|никнейм)\s+([А-Яа-яЁё\w\s\-]+)', update.message.text) # Разрешаем буквы, цифры, пробелы, дефис
+        if match: nickname = match.group(1).strip()
+
+    if not nickname:
+        await context.bot.send_message(chat_id=chat_id, text="Хуйню несешь. Напиши `/set_name Твой Крутой Ник` или 'Бот меня зовут Вася Пупкин'.")
+        return
+
+    # Ограничим длину ника
+    if len(nickname) > 32:
+        await context.bot.send_message(chat_id=chat_id, text="Ник слишком длинный, максимум 32 символа, угомонись.")
+        return
+    # Проверка на плохие символы (можно добавить)
+    # if re.search(r"[^\w\s\-]", nickname): ...
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Обновляем или создаем профиль с новым ником
+        await loop.run_in_executor(
+            None,
+            lambda: user_profiles_collection.update_one(
+                {"user_id": user.id},
+                {"$set": {"custom_nickname": nickname, "tg_first_name": user.first_name, "tg_username": user.username}, # Сохраняем и ТГ инфу
+                 "$setOnInsert": {"user_id": user.id, "message_count": 0, "current_title": None}}, # Начальные значения при создании
+                upsert=True
+            )
+        )
+        logger.info(f"Пользователь {user.id} ({user.first_name}) установил никнейм: {nickname}")
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 Записал, отныне ты будешь зваться '<b>{nickname}</b>'. Смотри не обосрись с таким погонялом.", parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Ошибка сохранения никнейма для user_id {user.id} в MongoDB: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text="Бля, не смог записать твой ник в свою память (БД). Попробуй позже.")
+
+# --- КОНЕЦ ФУНКЦИИ УСТАНОВКИ НИКНЕЙМА ---
+
+# --- ФУНКЦИЯ ДЛЯ КОМАНДЫ /whoami ---
+async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает инфу о пользователе: ник, кол-во сообщений, звание."""
+    if not update.message or not update.message.from_user: return
+    user = update.message.from_user
+    chat_id = update.message.chat.id
+
+    logger.info(f"Пользователь {user.id} ({user.first_name}) запросил /whoami")
+
+    profile = await get_user_profile(user.id, chat_id) # Используем вспомогательную функцию
+
+    nickname = profile.get("custom_nickname") if profile else None
+    display_name = nickname if nickname else user.first_name or "Безымянный Хуй"
+    message_count = profile.get("message_count", 0) if profile else 0
+    current_title = profile.get("current_title", "Новоприбывший Шкет") if profile else "Неучтенный Призрак"
+
+    # Определяем текущее звание по счетчику (даже если оно не записано в профиле)
+    calculated_title = "Школьник на подсосе" # Дефолтное звание
+    for count_threshold, (title_name, _) in sorted(TITLES_BY_COUNT.items()):
+         if message_count >= count_threshold:
+             calculated_title = title_name
+         else:
+             break # Дальше пороги выше
+
+    reply_text = f"🗿 Ты у нас кто?\n\n"
+    reply_text += f"<b>Имя/Ник:</b> {display_name}"
+    if nickname: reply_text += f" (в Telegram: {user.first_name or 'ХЗ'})"
+    reply_text += f"\n<b>ID:</b> <code>{user.id}</code>"
+    reply_text += f"\n<b>Сообщений в моих чатах (с момента появления БД):</b> {message_count}"
+    reply_text += f"\n<b>Твое погоняло в банде Попиздяки:</b> {calculated_title}"
+    if profile and profile.get("current_title") and profile.get("current_title") != calculated_title:
+         reply_text += f"\n(Кстати, твое официально присвоенное звание '{profile.get('current_title')}' уже устарело, скоро обновится!)"
+    elif not profile:
+         reply_text += f"\n(Пока не видел твоих сообщений, чтобы записать профиль)"
+
+    await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode='HTML')
+
+# --- КОНЕЦ ФУНКЦИИ /whoami ---
+
 async def main() -> None:
     logger.info("Starting main()...")
     logger.info("Building Application...")
@@ -1591,6 +1810,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("retry", retry_analysis))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("post_news", force_post_news))
+    application.add_handler(CommandHandler("set_name", set_nickname))
+    application.add_handler(CommandHandler("whoami", who_am_i))
 
 # Добавляем НОВЫЕ обработчики, которые требуют ОТВЕТА на сообщение
     application.add_handler(CommandHandler("pickup", get_pickup_line, filters=filters.REPLY)) # Только в ответе
@@ -1644,6 +1865,13 @@ async def main() -> None:
 
     news_pattern = r'(?i).*(попиздяка|попиздоний|бот).*(новости|че там|мир).*'
     application.add_handler(MessageHandler(filters.Regex(news_pattern) & filters.TEXT & ~filters.COMMAND, force_post_news)) # Прямой вызов
+
+    # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ <<<---
+    set_name_pattern = r'(?i).*(?:бот|попиздяка).*(?:меня зовут|мой ник|никнейм)\s+([А-Яа-яЁё\w\s\-]+)'
+    application.add_handler(MessageHandler(filters.Regex(set_name_pattern) & filters.TEXT & ~filters.COMMAND, set_nickname))
+    whoami_pattern = r'(?i).*(?:бот|попиздяка).*(?:кто я|мой ник|мой статус|мое звание|whoami).*'
+    application.add_handler(MessageHandler(filters.Regex(whoami_pattern) & filters.TEXT & ~filters.COMMAND, who_am_i))
+    # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
 
     # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
