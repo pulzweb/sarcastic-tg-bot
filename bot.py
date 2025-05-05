@@ -1733,6 +1733,15 @@ async def set_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         logger.info(f"Пользователь {user.id} ({user.first_name}) установил никнейм: {nickname}")
         await context.bot.send_message(chat_id=chat_id, text=f"🗿 Записал, отныне ты будешь зваться '<b>{nickname}</b>'. Смотри не обосрись с таким погонялом.", parse_mode='HTML')
+        # --->>> ВСТАВЛЯЕМ ВЫЗОВ ФОНОВОГО ОБНОВЛЕНИЯ ИСТОРИИ <<<---
+        try:
+            # Запускаем обновление истории в фоне, чтобы не ждать его завершения
+            asyncio.create_task(update_history_with_new_name(user.id, nickname, context))
+            logger.info(f"Запущена задача обновления истории для ника '{nickname}' (user_id: {user.id})")
+        except Exception as task_e:
+            # Логируем, если даже запустить задачу не удалось
+            logger.error(f"Ошибка запуска задачи update_history_with_new_name: {task_e}")
+        # --->>> КОНЕЦ ВСТАВКИ <<<---
     except Exception as e:
         logger.error(f"Ошибка сохранения никнейма для user_id {user.id} в MongoDB: {e}", exc_info=True)
         await context.bot.send_message(chat_id=chat_id, text="Бля, не смог записать твой ник в свою память (БД). Попробуй позже.")
@@ -1777,6 +1786,32 @@ async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode='HTML')
 
 # --- КОНЕЦ ФУНКЦИИ /whoami ---
+
+# Убедись, что импорты asyncio, logging и коллекция history_collection определены выше
+
+# --- ФОНОВАЯ ЗАДАЧА ОБНОВЛЕНИЯ ИМЕНИ В ИСТОРИИ ---
+async def update_history_with_new_name(user_id: int, new_nickname: str, context: ContextTypes.DEFAULT_TYPE):
+    """В фоне обновляет поле user_name в старых записях history_collection."""
+    logger.info(f"Начинаю фоновое обновление имени на '{new_nickname}' в истории для user_id {user_id}...")
+    try:
+        loop = asyncio.get_running_loop()
+        # Используем update_many для замены поля user_name во всех документах
+        # в коллекции history_collection, где user_id совпадает.
+        result = await loop.run_in_executor(
+            None, # Стандартный executor
+            lambda: history_collection.update_many(
+                {"user_id": user_id}, # Фильтр: ищем все сообщения этого юзера
+                {"$set": {"user_name": new_nickname}} # Действие: установить новое имя
+            )
+        )
+        # Логируем результат операции MongoDB
+        logger.info(f"Обновление имени в истории для user_id {user_id} завершено: Найдено совпадений={result.matched_count}, Реально обновлено={result.modified_count}")
+    except Exception as e:
+        # Логируем ошибку, если обновление не удалось
+        logger.error(f"Ошибка фонового обновления имени в истории для user_id {user_id}: {e}", exc_info=True)
+# --- КОНЕЦ ФОНОВОЙ ЗАДАЧИ ---
+
+# Дальше идет async def main() или другие функции...
 
 async def main() -> None:
     logger.info("Starting main()...")
