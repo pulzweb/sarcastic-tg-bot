@@ -1938,8 +1938,18 @@ async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     time_since_last_growth = (current_time - last_growth_time).total_seconds()
 
     if time_since_last_growth < PENIS_GROWTH_COOLDOWN_SECONDS:
-        # ... (код кулдауна как был) ...
-        await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user_name}, твой стручок еще не восстановился...")
+        remaining_time = PENIS_GROWTH_COOLDOWN_SECONDS - time_since_last_growth
+        hours = int(remaining_time // 3600)
+        minutes = int((remaining_time % 3600) // 60)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🗿 Иди нахуй, {user_name}! Не так быстро... Еще <b>{hours} ч {minutes} мин</b>...",
+                parse_mode='HTML'
+            )
+            logger.info(f"Отправлено сообщение о кулдауне для {user_name}")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения о кулдауне для {user_name}: {e}", exc_info=True)
         return
 
     growth = random.randint(1, 30)
@@ -2074,8 +2084,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("post_news", force_post_news))
     application.add_handler(CommandHandler("set_name", set_nickname))
     application.add_handler(CommandHandler("whoami", who_am_i))
-    application.add_handler(CommandHandler("grow_penis", grow_penis)) # Можно назвать /grow
-    application.add_handler(CommandHandler("my_penis", show_my_penis))  # Можно назвать /myp
+    application.add_handler(CommandHandler("grow_penis", grow_penis)) # Должен вызывать grow_penis
+    application.add_handler(CommandHandler("my_penis", show_my_penis))  # Должен вызывать show_my_penis
 
 
 
@@ -2113,13 +2123,13 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(whoami_pattern) & filters.TEXT & ~filters.COMMAND, who_am_i))
     # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
 
-# --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ПИСЬКОМЕРА <<<---
-    grow_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:писька|хуй|член|пенис|елда|стручок|агрегат|змея)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше|плюс)?.*'
-    application.add_handler(MessageHandler(filters.Regex(grow_penis_pattern) & filters.TEXT & ~filters.COMMAND, grow_penis))
+# --->>> ПРОВЕРЬ ЭТИ ДВА REGEX И ИХ ФУНКЦИИ <<<---
+    grow_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:писька|хуй|член|пенис|елда|стручок|агрегат|змея)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше)?.*'
+    application.add_handler(MessageHandler(filters.Regex(grow_penis_pattern) & filters.TEXT & ~filters.COMMAND, grow_penis)) # Должен вызывать grow_penis
 
     my_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:моя писька|мой хуй|мой член|мой пенис|какой у меня|что с моей пиписькой).*'
-    application.add_handler(MessageHandler(filters.Regex(my_penis_pattern) & filters.TEXT & ~filters.COMMAND, show_my_penis))
-    # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
+    application.add_handler(MessageHandler(filters.Regex(my_penis_pattern) & filters.TEXT & ~filters.COMMAND, show_my_penis)) # Должен вызывать show_my_penis
+    # --->>> КОНЕЦ ПРОВЕРКИ <<<---
 
 # Добавляем НОВЫЕ обработчики, которые требуют ОТВЕТА на сообщение
     application.add_handler(CommandHandler("pickup", get_pickup_line, filters=filters.REPLY)) # Только в ответе
