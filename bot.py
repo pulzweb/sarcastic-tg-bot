@@ -1855,31 +1855,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("set_name", set_nickname))
     application.add_handler(CommandHandler("whoami", who_am_i))
 
-# Добавляем НОВЫЕ обработчики, которые требуют ОТВЕТА на сообщение
-    application.add_handler(CommandHandler("pickup", get_pickup_line, filters=filters.REPLY)) # Только в ответе
-    application.add_handler(CommandHandler("pickup_line", get_pickup_line, filters=filters.REPLY)) # Только в ответе
-    pickup_pattern = r'(?i).*(?:бот|попиздяка).*(?:подкат|пикап|склей|познакомься|замути).*'
-    application.add_handler(MessageHandler(filters.Regex(pickup_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, get_pickup_line)) # Только в ответе
-    # --->>> КОНЕЦ ИЗМЕНЕНИЙ <<<---
 
-     # --->>> ИЗМЕНЯЕМ ОБРАБОТЧИКИ ПОХВАЛЫ <<<---
-    # Убираем старые CommandHandler("praise"...) и MessageHandler(praise_pattern...) если они были
-    application.add_handler(CommandHandler("praise", praise_user, filters=filters.REPLY)) # Только в ответе
-    praise_pattern = r'(?i).*(?:бот|попиздяка).*(?:похвали|молодец|красавчик)\s+(?:его|ее|этого|эту).*'
-    application.add_handler(MessageHandler(filters.Regex(praise_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, praise_user)) # Только в ответе
-    # --->>> КОНЕЦ ИЗМЕНЕНИЙ <<<---
-
-
-    # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ТЕХРАБОТ <<<---
-    # Regex для ВКЛючения техработ
-    maint_on_pattern = r'(?i).*(?:бот|попиздяка).*(?:техработ|ремонт|на ремонт|обслуживание|админ вкл).*'
-    # Ловим ТОЛЬКО текст, БЕЗ команд, в ЛЮБОМ чате (проверка админа и ЛС будет ВНУТРИ функции)
-    application.add_handler(MessageHandler(filters.Regex(maint_on_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_on)) # Вызываем ту же функцию!
-
-    # Regex для ВЫКЛючения техработ
-    maint_off_pattern = r'(?i).*(?:бот|попиздяка).*(?:работай|работать|кончил|закончил|ремонт окончен|админ выкл).*'
-    application.add_handler(MessageHandler(filters.Regex(maint_off_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_off)) # Вызываем ту же функцию!
-    # --->>> КОНЕЦ ДОБАВЛЕНИЙ <<<---
 
     # Добавляем обработчики русских фраз (вызывают ТЕ ЖЕ функции)
     # Можно добавить больше синонимов
@@ -1914,6 +1890,32 @@ async def main() -> None:
     whoami_pattern = r'(?i).*(?:бот|попиздяка).*(?:кто я|мой ник|мой статус|мое звание|whoami).*'
     application.add_handler(MessageHandler(filters.Regex(whoami_pattern) & filters.TEXT & ~filters.COMMAND, who_am_i))
     # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
+
+# Добавляем НОВЫЕ обработчики, которые требуют ОТВЕТА на сообщение
+    application.add_handler(CommandHandler("pickup", get_pickup_line, filters=filters.REPLY)) # Только в ответе
+    application.add_handler(CommandHandler("pickup_line", get_pickup_line, filters=filters.REPLY)) # Только в ответе
+    pickup_pattern = r'(?i).*(?:бот|попиздяка).*(?:подкат|пикап|склей|познакомься|замути).*'
+    application.add_handler(MessageHandler(filters.Regex(pickup_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, get_pickup_line)) # Только в ответе
+    # --->>> КОНЕЦ ИЗМЕНЕНИЙ <<<---
+
+     # --->>> ИЗМЕНЯЕМ ОБРАБОТЧИКИ ПОХВАЛЫ <<<---
+    # Убираем старые CommandHandler("praise"...) и MessageHandler(praise_pattern...) если они были
+    application.add_handler(CommandHandler("praise", praise_user, filters=filters.REPLY)) # Только в ответе
+    praise_pattern = r'(?i).*(?:бот|попиздяка).*(?:похвали|молодец|красавчик)\s+(?:его|ее|этого|эту).*'
+    application.add_handler(MessageHandler(filters.Regex(praise_pattern) & filters.TEXT & filters.REPLY & ~filters.COMMAND, praise_user)) # Только в ответе
+    # --->>> КОНЕЦ ИЗМЕНЕНИЙ <<<---
+
+
+    # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ТЕХРАБОТ <<<---
+    # Regex для ВКЛючения техработ
+    maint_on_pattern = r'(?i).*(?:бот|попиздяка).*(?:техработ|ремонт|на ремонт|обслуживание|админ вкл).*'
+    # Ловим ТОЛЬКО текст, БЕЗ команд, в ЛЮБОМ чате (проверка админа и ЛС будет ВНУТРИ функции)
+    application.add_handler(MessageHandler(filters.Regex(maint_on_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_on)) # Вызываем ту же функцию!
+
+    # Regex для ВЫКЛючения техработ
+    maint_off_pattern = r'(?i).*(?:бот|попиздяка).*(?:работай|работать|кончил|закончил|ремонт окончен|админ выкл).*'
+    application.add_handler(MessageHandler(filters.Regex(maint_off_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_off)) # Вызываем ту же функцию!
+    # --->>> КОНЕЦ ДОБАВЛЕНИЙ <<<---
 
     # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
