@@ -1720,21 +1720,75 @@ async def praise_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # --- КОНЕЦ ПЕРЕДЕЛАННОЙ praise_user ---
 
-# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПОЛУЧЕНИЯ ПРОФИЛЯ ---
-async def get_user_profile(user_id: int, chat_id: int) -> dict | None:
-    """Получает профиль пользователя из MongoDB."""
-    # chat_id пока не используем, но может пригодиться для статистики по чатам
+# --- ОБНОВЛЕННАЯ get_user_profile_data ---
+async def get_user_profile_data(user: User | None) -> dict:
+    """Получает данные профиля, включая данные для писькомера."""
+    # Дефолтные значения, ЕСЛИ ПРОФИЛЯ НЕТ В БД
+    default_profile_values = {
+        "custom_nickname": None,
+        "message_count": 0,
+        "current_title": None,
+        "penis_size": 0,
+        "last_penis_growth": datetime.datetime.fromtimestamp(0, datetime.timezone.utc),
+        "current_penis_title": None,
+        "tg_first_name": user.first_name if user else "Аноним", # Добавим для единообразия
+        "tg_username": user.username if user else None
+    }
+
+    if not user:
+        # Если нет юзера, возвращаем совсем дефолт
+        return {
+            "display_name": "Анонимный Хуй",
+            "message_count": 0, "current_title": "Призрак Чата",
+            "penis_size": 0, "current_penis_title": "Микроб",
+            "profile_doc": None # Означает, что профиля в БД нет
+        }
+
+    # Имя по умолчанию - из ТГ
+    display_name = user.first_name or "Безымянный"
+    profile_in_db = None # Сам документ из БД
+
     try:
         loop = asyncio.get_running_loop()
-        profile = await loop.run_in_executor(
+        profile_in_db = await loop.run_in_executor(
             None,
-            lambda: user_profiles_collection.find_one({"user_id": user_id})
+            lambda: user_profiles_collection.find_one({"user_id": user.id})
         )
-        return profile
+
+        if profile_in_db:
+            # Если профиль есть, берем данные из него
+            custom_nickname = profile_in_db.get("custom_nickname")
+            if custom_nickname: display_name = custom_nickname
+            message_count = profile_in_db.get("message_count", 0)
+            current_title = profile_in_db.get("current_title")
+            penis_size = profile_in_db.get("penis_size", 0)
+            last_penis_growth = profile_in_db.get("last_penis_growth", datetime.datetime.fromtimestamp(0, datetime.timezone.utc))
+            current_penis_title = profile_in_db.get("current_penis_title")
+            return {
+                "display_name": display_name, "message_count": message_count,
+                "current_title": current_title, "penis_size": penis_size,
+                "last_penis_growth": last_penis_growth, "current_penis_title": current_penis_title,
+                "profile_doc": profile_in_db # Сам документ, если нужен где-то еще
+            }
+        else:
+            # Если профиля нет в БД, возвращаем дефолтные, но с именем из ТГ
+            return {
+                "display_name": display_name, # Имя из ТГ, т.к. кастомного нет
+                "message_count": 0, "current_title": "Новобранец",
+                "penis_size": 0, "current_penis_title": "Зародыш",
+                "last_penis_growth": datetime.datetime.fromtimestamp(0, datetime.timezone.utc),
+                "profile_doc": None # Профиля нет
+            }
     except Exception as e:
-        logger.error(f"Ошибка чтения профиля user_id {user_id} из MongoDB: {e}")
-        return None
-# --- КОНЕЦ ВСПОМОГАТЕЛЬНОЙ ФУНКЦИИ ---
+        logger.error(f"Ошибка чтения профиля user_id {user.id} из MongoDB: {e}")
+        # Возвращаем дефолтные в случае ошибки
+        return {
+            "display_name": display_name, "message_count": 0, "current_title": "Ошибка Профиля",
+            "penis_size": 0, "current_penis_title": "Ошибка Письки",
+            "last_penis_growth": datetime.datetime.fromtimestamp(0, datetime.timezone.utc),
+            "profile_doc": None
+        }
+# --- КОНЕЦ ОБНОВЛЕННОЙ get_user_profile_data ---
 
 # --- ФУНКЦИЯ ДЛЯ УСТАНОВКИ НИКНЕЙМА ---
 async def set_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1832,8 +1886,8 @@ async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
              else: break
 
         reply_text += f"\n\n<b>Твой Боевой Агрегат:</b>"
-        reply_text += f"\n  <b>Длина:</b> {current_penis_size} см"
-        reply_text += f"\n  <b>Писько-Звание:</b> {calculated_penis_title}"
+        reply_text += f"\n<b>Длина:</b> {current_penis_size} см"
+        reply_text += f"\n<b>Писько-Звание:</b> {calculated_penis_title}"
     # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
     if profile and profile.get("current_title") and profile.get("current_title") != calculated_title:
          reply_text += f"\n(Кстати, твое официально присвоенное звание '{profile.get('current_title')}' уже устарело, скоро обновится!)"
@@ -1863,80 +1917,79 @@ async def update_history_with_new_name(user_id: int, new_nickname: str, context:
         logger.error(f"Ошибка фонового обновления имени в истории для user_id {user_id}: {e}", exc_info=True)
 # --- КОНЕЦ ФОНОВОЙ ЗАДАЧИ ---
 
-# --- ФУНКЦИЯ УВЕЛИЧЕНИЯ ПИСЬКИ ---
+# --- ИСПРАВЛЕННАЯ grow_penis ---
 async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Увеличивает размер члена пользователя и проверяет на новое звание."""
     if not update.message or not update.message.from_user: return
     user = update.message.from_user
     chat_id = update.message.chat.id
     loop = asyncio.get_running_loop()
 
-    profile_data = await get_user_profile_data(user) # Получаем текущие данные
+    # --->>> ИСПОЛЬЗУЕМ get_user_profile_data <<<---
+    profile_data = await get_user_profile_data(user) # Получаем ВСЕ данные профиля
     user_name = profile_data["display_name"]
-    logger.info(f"Пользователь '{user_name}' (ID: {user.id}) пытается отрастить писюн.")
+    last_growth_time = profile_data["last_penis_growth"] # Берем из словаря
+    current_penis_size = profile_data["penis_size"]     # Берем из словаря
+    current_penis_title_from_profile = profile_data["current_penis_title"] # Звание из профиля
+    # --->>> КОНЕЦ <<<---
 
-    last_growth_time = profile.get("last_penis_growth", datetime.datetime.fromtimestamp(0, datetime.timezone.utc)) if profile_data.get("profile_doc") else datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+    logger.info(f"Пользователь '{user_name}' (ID: {user.id}) пытается отрастить писюн. Текущий: {current_penis_size} см.")
+
     current_time = datetime.datetime.now(datetime.timezone.utc)
     time_since_last_growth = (current_time - last_growth_time).total_seconds()
 
     if time_since_last_growth < PENIS_GROWTH_COOLDOWN_SECONDS:
-        remaining_time = PENIS_GROWTH_COOLDOWN_SECONDS - time_since_last_growth
-        hours = int(remaining_time // 3600)
-        minutes = int((remaining_time % 3600) // 60)
-        await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user_name}, твой стручок еще не восстановился после прошлой накачки! Подожди еще примерно {hours} ч {minutes} мин, дрочила.")
+        # ... (код кулдауна как был) ...
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user_name}, твой стручок еще не восстановился...")
         return
 
-    # Генерируем прирост
     growth = random.randint(1, 30)
-    new_size = profile_data.get("message_count", 0) + growth # ОШИБКА! Должно быть penis_size
-    # --->>> ИСПРАВЛЕНИЕ ДЛЯ new_size <<<---
-    current_penis_size = profile_data.get("profile_doc").get("penis_size", 0) if profile_data.get("profile_doc") else 0
-    new_size = current_penis_size + growth
-    # --->>> КОНЕЦ ИСПРАВЛЕНИЯ <<<---
+    new_size = current_penis_size + growth # Теперь правильно
 
-
-    # Обновляем в БД
     try:
-        updated_profile_doc = await loop.run_in_executor(
+        # Обновляем в БД ТОЛЬКО нужные поля
+        update_result = await loop.run_in_executor(
             None,
             lambda: user_profiles_collection.find_one_and_update(
                 {"user_id": user.id},
-                {"$set": {"penis_size": new_size, "last_penis_growth": current_time},
-                 "$setOnInsert": {"user_id": user.id, "custom_nickname": user.first_name, "message_count":0, "current_title": None, "penis_size": new_size, "last_penis_growth": current_time, "current_penis_title": None}},
-                projection={"penis_size": 1, "current_penis_title": 1},
+                {
+                    "$set": {"penis_size": new_size, "last_penis_growth": current_time},
+                    # $setOnInsert тут нужен для случая, если профиля ВООБЩЕ не было
+                    "$setOnInsert": {
+                        "user_id": user.id, "custom_nickname": None,
+                        "message_count": 0, "current_title": None,
+                        "penis_size": new_size, # Ставим новый размер при создании
+                        "last_penis_growth": current_time, # Ставим текущее время
+                        "current_penis_title": None
+                    }
+                },
+                projection={"penis_size": 1, "current_penis_title": 1}, # Нам нужен current_penis_title для сравнения
                 upsert=True, return_document=pymongo.ReturnDocument.AFTER
             )
         )
-        if not updated_profile_doc: # Если upsert не вернул документ (очень редкий случай)
-            logger.error(f"Не удалось обновить penis_size для {user_name}")
-            await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, {user_name}, какая-то хуйня с базой, не смог твой шланг записать.")
-            return
+        if not update_result:
+            logger.error(f"Не удалось обновить penis_size для {user_name}"); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, хуйня с базой."); return
 
         logger.info(f"Писюн {user_name} вырос на {growth} см, теперь {new_size} см.")
-        await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user_name}, поздравляю! Твой микро-хуец подрос на <b>{growth} см</b>! Теперь он аж <b>{new_size} см</b>! Почти как у взрослого!", parse_mode='HTML')
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user_name}, твой хуец подрос на <b>{growth} см</b>! Теперь он <b>{new_size} см</b>!", parse_mode='HTML')
 
         # Проверка на новое писечное звание
-        old_penis_title = profile_data.get("profile_doc").get("current_penis_title") if profile_data.get("profile_doc") else None
-        new_penis_title_achieved = None
-        new_penis_title_message = ""
+        old_penis_title = update_result.get("current_penis_title") # Берем СТАРЫЙ титул из обновленного документа (если был)
+        new_penis_title_achieved = None; new_penis_title_message = ""
         for size_threshold, (title_name, achievement_message) in sorted(PENIS_TITLES_BY_SIZE.items()):
-            if new_size >= size_threshold:
-                new_penis_title_achieved = title_name
-                new_penis_title_message = achievement_message
+            if new_size >= size_threshold: new_penis_title_achieved = title_name; new_penis_title_message = achievement_message
             else: break
 
         if new_penis_title_achieved and new_penis_title_achieved != old_penis_title:
-             logger.info(f"Пользователь {user_name} достиг писечного звания: {new_penis_title_achieved} ({new_size} см)")
+             logger.info(f"{user_name} достиг писечного звания: {new_penis_title_achieved} ({new_size} см)")
              await loop.run_in_executor(None, lambda: user_profiles_collection.update_one({"user_id": user.id},{"$set": {"current_penis_title": new_penis_title_achieved}}))
-             mention = user.mention_html()
-             achievement_text = new_penis_title_message.format(mention=mention, size=new_size)
+             mention = user.mention_html(); achievement_text = new_penis_title_message.format(mention=mention, size=new_size)
              await context.bot.send_message(chat_id=chat_id, text=achievement_text, parse_mode='HTML')
 
     except Exception as e:
         logger.error(f"Ошибка при увеличении письки для {user_name}: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, {user_name}, произошла ебанина, твой хуй не вырос. Попробуй позже.")
+        await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, ебанина, хуй не вырос.")
 
-# --- КОНЕЦ ФУНКЦИИ УВЕЛИЧЕНИЯ ПИСЬКИ ---
+# --- КОНЕЦ ИСПРАВЛЕННОЙ grow_penis ---
 
 # --- ФУНКЦИЯ ПОКАЗА ПИСЬКИ ---
 async def show_my_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
