@@ -1925,16 +1925,28 @@ async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     loop = asyncio.get_running_loop()
 
     # --->>> ИСПОЛЬЗУЕМ get_user_profile_data <<<---
-    profile_data = await get_user_profile_data(user) # Получаем ВСЕ данные профиля
+    profile_data = await get_user_profile_data(user)
     user_name = profile_data["display_name"]
-    last_growth_time = profile_data["last_penis_growth"] # Берем из словаря
-    current_penis_size = profile_data["penis_size"]     # Берем из словаря
-    current_penis_title_from_profile = profile_data["current_penis_title"] # Звание из профиля
-    # --->>> КОНЕЦ <<<---
+    # --->>> ИСПРАВЛЕНИЕ ДЛЯ last_growth_time <<<---
+    _last_growth_naive = profile_data["last_penis_growth"] # Получаем из БД (может быть naive)
 
-    logger.info(f"Пользователь '{user_name}' (ID: {user.id}) пытается отрастить писюн. Текущий: {current_penis_size} см.")
+    # Если из БД пришло datetime, делаем его aware (предполагая, что в БД хранится UTC)
+    if isinstance(_last_growth_naive, datetime.datetime):
+        last_growth_time = _last_growth_naive.replace(tzinfo=datetime.timezone.utc)
+    else:
+        # Если там что-то другое (например, при первой инициализации мы ставили fromtimestamp(0, utc)),
+        # оно уже может быть aware или это ошибка, которую надо обработать.
+        # Для простоты, если это не datetime, попробуем использовать как есть или дефолтное.
+        # Но лучше убедиться, что в БД всегда datetime.
+        logger.warning(f"last_penis_growth для {user_name} не является datetime объектом: {type(_last_growth_naive)}. Используем дефолтное.")
+        last_growth_time = datetime.datetime.fromtimestamp(0, datetime.timezone.utc) # Самое безопасное - дефолт
+    # --->>> КОНЕЦ ИСПРАВЛЕНИЯ <<<---
 
-    current_time = datetime.datetime.now(datetime.timezone.utc)
+    current_penis_size = profile_data["penis_size"]
+    # ...
+
+    current_time = datetime.datetime.now(datetime.timezone.utc) # Это aware (UTC)
+    # Теперь оба должны быть aware UTC
     time_since_last_growth = (current_time - last_growth_time).total_seconds()
 
     if time_since_last_growth < PENIS_GROWTH_COOLDOWN_SECONDS:
