@@ -1374,6 +1374,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 Напиши <code>/my_penis</code> или "<code>Бот моя писька</code>", чтобы узнать текущие ТТХ и звание.
 Размер также показывается в <code>/whoami</code>.
 
+*Топ Писек Чата:*
+Напиши <code>/top_penis</code> или "<code>Бот топ писек</code>".
+Я покажу рейтинг самых выдающихся агрегатов среди всех пользователей бота в этом чате.
 
 *Эта справка:*
 Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
