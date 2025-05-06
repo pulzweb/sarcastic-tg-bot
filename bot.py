@@ -2113,6 +2113,14 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(whoami_pattern) & filters.TEXT & ~filters.COMMAND, who_am_i))
     # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
 
+# --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ПИСЬКОМЕРА <<<---
+    grow_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:писька|хуй|член|пенис|елда|стручок|агрегат|змея)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше|плюс)?.*'
+    application.add_handler(MessageHandler(filters.Regex(grow_penis_pattern) & filters.TEXT & ~filters.COMMAND, grow_penis))
+
+    my_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:моя писька|мой хуй|мой член|мой пенис|какой у меня|что с моей пиписькой).*'
+    application.add_handler(MessageHandler(filters.Regex(my_penis_pattern) & filters.TEXT & ~filters.COMMAND, show_my_penis))
+    # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
+
 # Добавляем НОВЫЕ обработчики, которые требуют ОТВЕТА на сообщение
     application.add_handler(CommandHandler("pickup", get_pickup_line, filters=filters.REPLY)) # Только в ответе
     application.add_handler(CommandHandler("pickup_line", get_pickup_line, filters=filters.REPLY)) # Только в ответе
@@ -2139,13 +2147,6 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(maint_off_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_off)) # Вызываем ту же функцию!
     # --->>> КОНЕЦ ДОБАВЛЕНИЙ <<<---
 
-    # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ПИСЬКОМЕРА <<<---
-    grow_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:писька|хуй|член|пенис|елда|стручок|агрегат|змея)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше|плюс)?.*'
-    application.add_handler(MessageHandler(filters.Regex(grow_penis_pattern) & filters.TEXT & ~filters.COMMAND, grow_penis))
-
-    my_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:моя писька|мой хуй|мой член|мой пенис|какой у меня|что с моей пиписькой).*'
-    application.add_handler(MessageHandler(filters.Regex(my_penis_pattern) & filters.TEXT & ~filters.COMMAND, show_my_penis))
-    # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
 
     # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
