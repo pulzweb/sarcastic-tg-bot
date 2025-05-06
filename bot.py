@@ -43,6 +43,24 @@ TITLES_BY_COUNT = {
 }
 # --->>> КОНЕЦ СИСТЕМЫ ЗВАНИЙ <<<---
 
+# --->>> СИСТЕМА ПИСЕЧНЫХ ЗВАНИЙ <<<---
+# Словарь: порог_длины_см: (Название звания, Сообщение о достижении)
+PENIS_TITLES_BY_SIZE = {
+    10:  ("Короткоствол", "🗿 Ого, {mention}, у тебя уже <b>{size} см</b>! Звание 'Короткоствол' твоё! Не стесняйся, это только начало... или конец, хуй знает."),
+    30:  ("Среднестатистический Хуец", "🗿 {mention}, целых <b>{size} см</b>! Поздравляю, ты теперь 'Среднестатистический Хуец'! Почти как у всех, но ты же особенный, да?"),
+    50:  ("Приличный Агрегат", "🗿 Нихуя себе, {mention}! <b>{size} см</b>! Ты дослужился до 'Приличного Агрегата'! Таким и бабу можно впечатлить... если она слепая."),
+    75:  ("Ебырь-Террорист", "🗿 Пиздец, {mention}, у тебя уже <b>{size} см</b>! Ты теперь 'Ебырь-Террорист'! Опасно, сука, опасно!"),
+    100: ("Властелин Писек", "🗿 ВАШУ МАТЬ! {mention}, <b>{size} см</b>!!! Ты теперь 'Властелин Писек Всея Чата'! Снимаю шляпу... и трусы."),
+    150: ("Мифический Елдак", "🗿 Это вообще законно, {mention}?! <b>{size} см</b>?! Ты не человек, ты 'Мифический Елдак'! Легенды будут ходить!"),
+    200: ("Членотитан", "🗿 Ебать, {mention}?! <b>{size} см</b>?! Ты не человек, ты 'Членотитан'! Битву титанов можно было завершить иначе!"),
+    300: ("Тракторист", "🗿 Сюдаааа, {mention}?! <b>{size} см</b>?! Ты достиг членосовершенства, ты 'Тракторист'! И даже бог тебе не судья!"),
+    500: ("Дед Максим", "🗿 Епт, {mention}?! <b>{size} см</b>?! Видимо легенды оживают, ты 'Дед Максим'! Ищи бабу Зину и корзину, хуле!"),
+    1000: ("Членолебедка", "🗿 Бля, {mention}?! <b>{size} см</b>?! Я хуй знает зачем тебе этот канат, но теперь ты 'Членолебедка'! Можешь смело доставать камазы из кювета!"),
+    # Добавь еще, если надо
+}
+PENIS_GROWTH_COOLDOWN_SECONDS = 6 * 60 * 60 # 6 часов
+# --->>> КОНЕЦ СИСТЕМЫ <<<---
+
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IO_NET_API_KEY = os.getenv("IO_NET_API_KEY")
@@ -203,7 +221,7 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 {
                     "$inc": {"message_count": 1}, # Увеличиваем счетчик
                     "$set": {"tg_first_name": user.first_name, "tg_username": user.username}, # Обновляем ТГ инфу
-                    "$setOnInsert": {"user_id": user.id, "custom_nickname": None, "current_title": None} # Ставим при создании
+                    "$setOnInsert": {"user_id": user.id, "custom_nickname": None, "message_count": 1, "current_title": None, "penis_size": 0, "last_penis_growth": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "current_penis_title": None} # Ставим при создании
                 },
                 projection={"message_count": 1, "custom_nickname": 1, "current_title": 1}, # Возвращаем нужные поля
                 upsert=True, # Создаем, если нет
@@ -956,7 +974,7 @@ async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, 
 
     # --- ЧТЕНИЕ КОНТЕКСТА (ПОСЛЕДНИХ СООБЩЕНИЙ ЦЕЛИ) ИЗ БД ---
     user_context = "[Недавних сообщений не найдено]"
-    USER_CONTEXT_LIMIT = 5 # Сколько последних сообщений цели брать
+    USER_CONTEXT_LIMIT = 20 # Сколько последних сообщений цели брать
     try:
         loop = asyncio.get_running_loop()
         # Ищем сообщения ИМЕННО ЭТОГО ЮЗЕРА (target_user.id) в ЭТОМ ЧАТЕ
@@ -983,20 +1001,24 @@ async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, 
 
     # --->>> НОВЫЙ ПРОМПТ ДЛЯ РОАСТА С КОНТЕКСТОМ <<<---
     roast_prompt = (
-        f"Ты - мастер стендапа в жанре 'roast', циничный, злой, но остроумный уебок с черным юмором. Тебе заказали прожарку человека по имени **{target_name}** (пол: {gender_hint}).\n"
-        f"Вот ПОСЛЕДНИЕ НЕСКОЛЬКО СООБЩЕНИЙ этого человека (если есть):\n"
-        f"```\n{user_context}\n```\n\n"
-        f"Твоя задача: Сочини **КОРОТКИЙ (3-5 предложений), СМЕШНОЙ, ЖЕСТКИЙ И МАТЕРНЫЙ** роаст для {target_name}. "
-        f"Постарайся **ИСПОЛЬЗОВАТЬ ЧТО-ТО ИЗ ЕГО НЕДАВНИХ СООБЩЕНИЙ** (если они есть и там есть за что зацепиться) для стеба. Если в его сообщениях хуйня или их нет - ПРОСТО ПРИДУМАЙ роаст, основываясь на имени **{target_name}** и подсказке о поле ({gender_hint}), как ты делал раньше (фантазируй про его тупость, привычки и т.д.).\n\n"
-        f"Инструкции:\n"
-        f"1.  Используй гиперболы, абсурд, черный юмор, мат.\n"
-        f"2.  Цель - РАЗЪЕБАТЬ смешно.\n"
-        f"3.  Упомяни имя {target_name}.\n"
-        f"4.  Начинай ответ с `🗿 `.\n\n"
-        f"Пример (если в контексте было 'люблю котиков'): '🗿 О, {target_name}, любитель котиков! Наверное, единственный, кто тебя терпит - это твои 40 кошек. И то потому, что ты их кормишь, а не потому что ты охуенный.'\n"
-        f"Пример (если контекста нет или он тупой): '🗿 {target_name}... Звучит как имя для персонажа из дешевого фэнтези, который сдохнет на второй странице. Уверен, в жизни ты такой же статист.'\n\n"
-        f"Сочини роаст для **{target_name}**, ИСПОЛЬЗУЯ КОНТЕКСТ (если можешь) или просто фантазируй:"
-    )
+            f"Ты - Попиздяка, гений черного юмора, сарказма и стендапа в жанре 'roast'. Твоя задача - **УНИЧТОЖИТЬ** человека по имени **{target_name}** (пол: {gender_hint}, если известен, иначе 'неизвестен') своим остроумием. Тебе предоставлены его/ее ПОСЛЕДНИЕ НЕСКОЛЬКО СООБЩЕНИЙ (контекст).\n\n"
+            f"Контекст от {target_name}:\n"
+            f"```\n{user_context}\n```\n\n"
+            f"Инструкции для разъеба:\n"
+            f"1.  **ВНИМАТЕЛЬНО ПРОЧИТАЙ КОНТЕКСТ.** Ищи там тупые высказывания, смешные опечатки, банальности, противоречия, высокомерие, нытье, странные интересы или просто что-то, за что можно зацепиться и обстебать.\n"
+            f"2.  Если в контексте есть что-то интересное, **ПОСТРОЙ СВОЙ РОАСТ ВОКРУГ ЭТОГО**. Процитируй (можно неточно) или перескажи его/ее мысль и потом разъеби ее своим сарказмом и матом.\n"
+            f"3.  Если контекст пустой или абсолютно неинтересный (например, одни стикеры или 'привет как дела'), ТОГДА **ПРИДУМАЙ РОАСТ ПРОСТО НА ОСНОВЕ ИМЕНИ `{target_name}`** и, возможно, подсказки о поле. Можешь пофантазировать о его/ее тупости, никчемности, странных привычках и т.д.\n"
+            f"4.  Роаст должен быть **КОРОТКИМ (2-4 предложения)**, МАКСИМАЛЬНО ЕДКИМ, СМЕШНЫМ и с ИЗОБРЕТАТЕЛЬНЫМ МАТОМ.\n"
+            f"5.  Цель - чтобы все поржали, а объект роаста пошел плакать в подушку (но втайне восхитился твоим остроумием).\n"
+            f"6.  Начинай свой ответ с `🗿 `.\n\n"
+            f"Пример (Контекст от Васи: 'Я считаю, что Земля плоская!'; Имя: Вася):\n"
+            f"🗿 Васян тут заявил, что Земля плоская. Блядь, Вася, ты когда эту хуйню придумал, у тебя что, шапочка из фольги на глаза сползла? Такой интеллект даже для амебы - позор.\n\n"
+            f"Пример (Контекст от Лены: 'Купила новые туфли, смотрите!'; Имя: Лена):\n"
+            f"🗿 Лена хвастается новыми туфлями. Охуеть достижение. Лен, ты бы лучше мозги себе купила, а то туфли есть, а ходить в них, похоже, скоро будет некуда, кроме как на панель.\n\n"
+            f"Пример (Контекста нет или он тупой; Имя: Дима):\n"
+            f"🗿 А вот и Димасик! Говорят, его единственное достижение в жизни - это то, что он до сих пор не разучился дышать самостоятельно. Хотя, судя по его ебалу, это ему дается с трудом.\n\n"
+            f"Сочини свой УНИЧТОЖАЮЩИЙ роаст для **{target_name}**, используя контекст или имя:"
+        )
     # --->>> КОНЕЦ НОВОГО ПРОМПТА <<<---
 
     try:
@@ -1004,7 +1026,7 @@ async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE, 
         messages_for_api = [{"role": "user", "content": roast_prompt}]
         # Используем твой вызов ИИ (_call_ionet_api или model.generate_content_async)
         roast_text = await _call_ionet_api( # ИЛИ model.generate_content_async
-            messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=150, temperature=0.85
+            messages=messages_for_api, model_id=IONET_TEXT_MODEL_ID, max_tokens=200, temperature=0.85
         ) or f"[Роаст для {target_name} не удался]"
         if not roast_text.startswith(("🗿", "[")): roast_text = "🗿 " + roast_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
@@ -1335,6 +1357,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 *Кто ты, воин?:*
 Напиши <code>/whoami</code> или "<code>Бот кто я</code>".
 Я покажу твой текущий ник, количество сообщений (которое я видел) и твое почетное (или не очень) звание в банде Попиздяки.
+
+
+*Писькомер от Попиздяки:*
+Напиши <code>/grow_penis</code> или "<code>Бот писька расти</code>" (можно раз в 6 часов). Твой агрегат немного подрастет.
+Напиши <code>/my_penis</code> или "<code>Бот моя писька</code>", чтобы узнать текущие ТТХ и звание.
+Размер также показывается в <code>/whoami</code>.
+
 
 *Эта справка:*
 Напиши <code>/help</code> или "<code>Попиздяка кто ты?</code>".
@@ -1737,11 +1766,11 @@ async def set_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await loop.run_in_executor(
             None,
             lambda: user_profiles_collection.update_one(
-                {"user_id": user.id},
-                {"$set": {"custom_nickname": nickname, "tg_first_name": user.first_name, "tg_username": user.username}, # Сохраняем и ТГ инфу
-                 "$setOnInsert": {"user_id": user.id, "message_count": 0, "current_title": None}}, # Начальные значения при создании
-                upsert=True
-            )
+                {"user_id": user.id}, # Фильтр
+                {"$set": {"custom_nickname": nickname, "tg_first_name": user.first_name, "tg_username": user.username},
+                 "$setOnInsert": {"user_id": user.id, "message_count": 0, "current_title": None, "penis_size": 0, "last_penis_growth": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "current_penis_title": None}},
+                upsert=True # <--- ТЕПЕРЬ ЭТА СТРОКА ВНУТРИ update_one()!
+            ) # <--- Скобка от lambda закрывается здесь
         )
         logger.info(f"Пользователь {user.id} ({user.first_name}) установил никнейм: {nickname}")
         await context.bot.send_message(chat_id=chat_id, text=f"🗿 Записал, отныне ты будешь зваться '<b>{nickname}</b>'. Смотри не обосрись с таким погонялом.", parse_mode='HTML')
@@ -1790,6 +1819,19 @@ async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply_text += f"\n<b>ID:</b> <code>{user.id}</code>"
     reply_text += f"\n<b>Сообщений в моих чатах (с момента появления БД):</b> {message_count}"
     reply_text += f"\n<b>Твое погоняло в банде Попиздяки:</b> {calculated_title}"
+    # --->>> ДОБАВЛЯЕМ ИНФУ О ПИСЬКЕ <<<---
+    if profile: # Если профиль есть
+        current_penis_size = profile.get("penis_size", 0)
+        calculated_penis_title = "Неизмеряемый отросток"
+        for size_threshold, (title_name, _) in sorted(PENIS_TITLES_BY_SIZE.items()):
+             if current_penis_size >= size_threshold:
+                 calculated_penis_title = title_name
+             else: break
+
+        reply_text += f"\n\n<b>Твой Боевой Агрегат:</b>"
+        reply_text += f"\n  <b>Длина:</b> {current_penis_size} см"
+        reply_text += f"\n  <b>Писько-Звание:</b> {calculated_penis_title}"
+    # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
     if profile and profile.get("current_title") and profile.get("current_title") != calculated_title:
          reply_text += f"\n(Кстати, твое официально присвоенное звание '{profile.get('current_title')}' уже устарело, скоро обновится!)"
     elif not profile:
@@ -1817,6 +1859,124 @@ async def update_history_with_new_name(user_id: int, new_nickname: str, context:
     except Exception as e:
         logger.error(f"Ошибка фонового обновления имени в истории для user_id {user_id}: {e}", exc_info=True)
 # --- КОНЕЦ ФОНОВОЙ ЗАДАЧИ ---
+
+# --- ФУНКЦИЯ УВЕЛИЧЕНИЯ ПИСЬКИ ---
+async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Увеличивает размер члена пользователя и проверяет на новое звание."""
+    if not update.message or not update.message.from_user: return
+    user = update.message.from_user
+    chat_id = update.message.chat.id
+    loop = asyncio.get_running_loop()
+
+    profile_data = await get_user_profile_data(user) # Получаем текущие данные
+    user_name = profile_data["display_name"]
+    logger.info(f"Пользователь '{user_name}' (ID: {user.id}) пытается отрастить писюн.")
+
+    last_growth_time = profile.get("last_penis_growth", datetime.datetime.fromtimestamp(0, datetime.timezone.utc)) if profile_data.get("profile_doc") else datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+    current_time = datetime.datetime.now(datetime.timezone.utc)
+    time_since_last_growth = (current_time - last_growth_time).total_seconds()
+
+    if time_since_last_growth < PENIS_GROWTH_COOLDOWN_SECONDS:
+        remaining_time = PENIS_GROWTH_COOLDOWN_SECONDS - time_since_last_growth
+        hours = int(remaining_time // 3600)
+        minutes = int((remaining_time % 3600) // 60)
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user_name}, твой стручок еще не восстановился после прошлой накачки! Подожди еще примерно {hours} ч {minutes} мин, дрочила.")
+        return
+
+    # Генерируем прирост
+    growth = random.randint(1, 30)
+    new_size = profile_data.get("message_count", 0) + growth # ОШИБКА! Должно быть penis_size
+    # --->>> ИСПРАВЛЕНИЕ ДЛЯ new_size <<<---
+    current_penis_size = profile_data.get("profile_doc").get("penis_size", 0) if profile_data.get("profile_doc") else 0
+    new_size = current_penis_size + growth
+    # --->>> КОНЕЦ ИСПРАВЛЕНИЯ <<<---
+
+
+    # Обновляем в БД
+    try:
+        updated_profile_doc = await loop.run_in_executor(
+            None,
+            lambda: user_profiles_collection.find_one_and_update(
+                {"user_id": user.id},
+                {"$set": {"penis_size": new_size, "last_penis_growth": current_time},
+                 "$setOnInsert": {"user_id": user.id, "custom_nickname": user.first_name, "message_count":0, "current_title": None, "penis_size": new_size, "last_penis_growth": current_time, "current_penis_title": None}},
+                projection={"penis_size": 1, "current_penis_title": 1},
+                upsert=True, return_document=pymongo.ReturnDocument.AFTER
+            )
+        )
+        if not updated_profile_doc: # Если upsert не вернул документ (очень редкий случай)
+            logger.error(f"Не удалось обновить penis_size для {user_name}")
+            await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, {user_name}, какая-то хуйня с базой, не смог твой шланг записать.")
+            return
+
+        logger.info(f"Писюн {user_name} вырос на {growth} см, теперь {new_size} см.")
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user_name}, поздравляю! Твой микро-хуец подрос на <b>{growth} см</b>! Теперь он аж <b>{new_size} см</b>! Почти как у взрослого!", parse_mode='HTML')
+
+        # Проверка на новое писечное звание
+        old_penis_title = profile_data.get("profile_doc").get("current_penis_title") if profile_data.get("profile_doc") else None
+        new_penis_title_achieved = None
+        new_penis_title_message = ""
+        for size_threshold, (title_name, achievement_message) in sorted(PENIS_TITLES_BY_SIZE.items()):
+            if new_size >= size_threshold:
+                new_penis_title_achieved = title_name
+                new_penis_title_message = achievement_message
+            else: break
+
+        if new_penis_title_achieved and new_penis_title_achieved != old_penis_title:
+             logger.info(f"Пользователь {user_name} достиг писечного звания: {new_penis_title_achieved} ({new_size} см)")
+             await loop.run_in_executor(None, lambda: user_profiles_collection.update_one({"user_id": user.id},{"$set": {"current_penis_title": new_penis_title_achieved}}))
+             mention = user.mention_html()
+             achievement_text = new_penis_title_message.format(mention=mention, size=new_size)
+             await context.bot.send_message(chat_id=chat_id, text=achievement_text, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Ошибка при увеличении письки для {user_name}: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, {user_name}, произошла ебанина, твой хуй не вырос. Попробуй позже.")
+
+# --- КОНЕЦ ФУНКЦИИ УВЕЛИЧЕНИЯ ПИСЬКИ ---
+
+# --- ФУНКЦИЯ ПОКАЗА ПИСЬКИ ---
+async def show_my_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает текущий размер члена и писечное звание."""
+    if not update.message or not update.message.from_user: return
+    user = update.message.from_user
+    chat_id = update.message.chat.id
+    loop = asyncio.get_running_loop()
+
+    profile_data = await get_user_profile_data(user)
+    user_name = profile_data["display_name"]
+    logger.info(f"Пользователь '{user_name}' (ID: {user.id}) запросил инфу о своем писюне.")
+
+    current_penis_size = 0
+    current_penis_title = "Микроскопический отросток" # Дефолтное писечное звание
+    profile_doc = profile_data.get("profile_doc")
+    if profile_doc:
+        current_penis_size = profile_doc.get("penis_size", 0)
+        # Определяем звание по текущему размеру
+        for size_threshold, (title_name, _) in sorted(PENIS_TITLES_BY_SIZE.items()):
+             if current_penis_size >= size_threshold:
+                 current_penis_title = title_name
+             else: break
+        # Можно также взять сохраненное звание, если оно актуально
+        # current_penis_title = profile_doc.get("current_penis_title") or current_penis_title
+
+
+    reply_text = f"🗿 Итак, {user_name}, твоя писяндра:\n\n"
+    reply_text += f"<b>Длина:</b> {current_penis_size} см.\n"
+    reply_text += f"<b>Звание:</b> {current_penis_title}.\n\n"
+
+    if current_penis_size == 0:
+        reply_text += "Похоже, ты его еще не растил, или он у тебя отсох. Попробуй команду 'Бот писька расти'!"
+    elif current_penis_size < 10:
+        reply_text += "Мда, с таким даже муравья не напугаешь. Работай усерднее!"
+    elif current_penis_size < 50:
+        reply_text += "Неплохо, но до мирового господства еще далеко."
+    else:
+        reply_text += "Охуеть! Таким можно гвозди забивать (или сердца разбивать, если повезет)."
+
+    await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode='HTML')
+
+# --- КОНЕЦ ФУНКЦИИ ПОКАЗА ПИСЬКИ ---
 
 # Дальше идет async def main() или другие функции...
 
@@ -1854,6 +2014,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("post_news", force_post_news))
     application.add_handler(CommandHandler("set_name", set_nickname))
     application.add_handler(CommandHandler("whoami", who_am_i))
+    application.add_handler(CommandHandler("grow_penis", grow_penis)) # Можно назвать /grow
+    application.add_handler(CommandHandler("my_penis", show_my_penis))  # Можно назвать /myp
 
 
 
@@ -1916,6 +2078,14 @@ async def main() -> None:
     maint_off_pattern = r'(?i).*(?:бот|попиздяка).*(?:работай|работать|кончил|закончил|ремонт окончен|админ выкл).*'
     application.add_handler(MessageHandler(filters.Regex(maint_off_pattern) & filters.TEXT & ~filters.COMMAND, maintenance_off)) # Вызываем ту же функцию!
     # --->>> КОНЕЦ ДОБАВЛЕНИЙ <<<---
+
+    # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ПИСЬКОМЕРА <<<---
+    grow_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:писька|хуй|член|пенис|елда|стручок|агрегат|змея)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше|плюс)?.*'
+    application.add_handler(MessageHandler(filters.Regex(grow_penis_pattern) & filters.TEXT & ~filters.COMMAND, grow_penis))
+
+    my_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:моя писька|мой хуй|мой член|мой пенис|какой у меня|что с моей пиписькой).*'
+    application.add_handler(MessageHandler(filters.Regex(my_penis_pattern) & filters.TEXT & ~filters.COMMAND, show_my_penis))
+    # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
 
     # Обработчик ответов боту (должен идти ПОСЛЕ regex для команд!)
     application.add_handler(MessageHandler(filters.TEXT & filters.REPLY & ~filters.COMMAND, reply_to_bot_handler))
