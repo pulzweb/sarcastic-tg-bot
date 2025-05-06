@@ -1950,22 +1950,26 @@ async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         update_result = await loop.run_in_executor(
             None,
             lambda: user_profiles_collection.find_one_and_update(
-                {"user_id": user.id},
+                {"user_id": user.id}, # Фильтр
                 {
+                    # Обновляем всегда:
                     "$set": {"penis_size": new_size, "last_penis_growth": current_time},
-                    # $setOnInsert тут нужен для случая, если профиля ВООБЩЕ не было
+                    # Устанавливаем ТОЛЬКО ПРИ СОЗДАНИИ (upsert) те поля, которые не меняются через $set
+                    # --->>> УБИРАЕМ penis_size и last_penis_growth ОТСЮДА <<<---
                     "$setOnInsert": {
-                        "user_id": user.id, "custom_nickname": None,
-                        "message_count": 0, "current_title": None,
-                        "penis_size": new_size, # Ставим новый размер при создании
-                        "last_penis_growth": current_time, # Ставим текущее время
+                        "user_id": user.id,
+                        "custom_nickname": None, # или user.first_name, если хочешь дефолт
+                        "message_count": 0,      # Начальный message_count
+                        "current_title": None,
                         "current_penis_title": None
+                        # penis_size и last_penis_growth будут установлены через $set
                     }
+                    # --->>> КОНЕЦ ИСПРАВЛЕНИЯ <<<---
                 },
-                projection={"penis_size": 1, "current_penis_title": 1}, # Нам нужен current_penis_title для сравнения
-                upsert=True, return_document=pymongo.ReturnDocument.AFTER
+                projection={"penis_size": 1, "current_penis_title": 1},
+                 upsert=True, return_document=pymongo.ReturnDocument.AFTER
+                )
             )
-        )
         if not update_result:
             logger.error(f"Не удалось обновить penis_size для {user_name}"); await context.bot.send_message(chat_id=chat_id, text=f"Бля, {user_name}, хуйня с базой."); return
 
