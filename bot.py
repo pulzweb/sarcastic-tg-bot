@@ -1846,57 +1846,55 @@ async def set_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # --- КОНЕЦ ФУНКЦИИ УСТАНОВКИ НИКНЕЙМА ---
 
-# --- ФУНКЦИЯ ДЛЯ КОМАНДЫ /whoami ---
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /whoami ---
 async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает инфу о пользователе: ник, кол-во сообщений, звание."""
+    """Показывает инфу о пользователе: ник, кол-во сообщений, звание, писюн."""
+    # Блок проверки техработ (ВСТАВЬ СЮДА, ЕСЛИ ЕЩЕ НЕ ВСТАВИЛ!)
+    # if not update or ... (код проверки техработ) ... return
+
     if not update.message or not update.message.from_user: return
     user = update.message.from_user
     chat_id = update.message.chat.id
 
-    logger.info(f"Пользователь {user.id} ({user.first_name}) запросил /whoami")
+    logger.info(f"Пользователь {user.id} ({user.first_name or 'Безымянный'}) запросил /whoami")
 
-    profile = await get_user_profile(user.id, chat_id) # Используем вспомогательную функцию
+    # --->>> ИСПОЛЬЗУЕМ get_user_profile_data <<<---
+    profile_data = await get_user_profile_data(user) # Получаем словарь с данными
 
-    nickname = profile.get("custom_nickname") if profile else None
-    display_name = nickname if nickname else user.first_name or "Безымянный Хуй"
-    message_count = profile.get("message_count", 0) if profile else 0
-    current_title = profile.get("current_title", "Новоприбывший Шкет") if profile else "Неучтенный Призрак"
+    display_name = profile_data["display_name"]
+    message_count = profile_data["message_count"]
+    current_title = profile_data.get("current_title") or "Новоприбывший Шкет" # get с дефолтом
 
-    # Определяем текущее звание по счетчику (даже если оно не записано в профиле)
+    # Определяем звание по сообщениям
     calculated_title = "Школьник на подсосе" # Дефолтное звание
     for count_threshold, (title_name, _) in sorted(TITLES_BY_COUNT.items()):
          if message_count >= count_threshold:
              calculated_title = title_name
-         else:
-             break # Дальше пороги выше
+         else: break
 
-    reply_text = f"🗿 Ты у нас кто?\n\n"
-    reply_text += f"<b>Имя/Ник:</b> {display_name}"
-    if nickname: reply_text += f" (в Telegram: {user.first_name or 'ХЗ'})"
+    reply_text = f"🗿 Ты у нас кто, {display_name}?\n\n"
+    reply_text += f"<b>Имя/Ник в Попиздяке:</b> {display_name}"
+    # Показываем имя ТГ, если ник кастомный и есть имя в ТГ
+    if profile_data.get("profile_doc") and profile_data["profile_doc"].get("custom_nickname") and user.first_name:
+        reply_text += f" (в Telegram: {user.first_name})"
     reply_text += f"\n<b>ID:</b> <code>{user.id}</code>"
-    reply_text += f"\n<b>Сообщений в моих чатах (с момента появления БД):</b> {message_count}"
-    reply_text += f"\n<b>Твое погоняло в банде Попиздяки:</b> {calculated_title}"
-    # --->>> ДОБАВЛЯЕМ ИНФУ О ПИСЬКЕ <<<---
-    if profile: # Если профиль есть
-        current_penis_size = profile.get("penis_size", 0)
-        calculated_penis_title = "Неизмеряемый отросток"
-        for size_threshold, (title_name, _) in sorted(PENIS_TITLES_BY_SIZE.items()):
-             if current_penis_size >= size_threshold:
-                 calculated_penis_title = title_name
-             else: break
+    reply_text += f"\n<b>Сообщений (в моей базе):</b> {message_count}"
+    reply_text += f"\n<b>Погоняло в банде:</b> {calculated_title}"
 
-        reply_text += f"\n\n<b>Твой Боевой Агрегат:</b>"
-        reply_text += f"\n<b>Длина:</b> {current_penis_size} см"
-        reply_text += f"\n<b>Писько-Звание:</b> {calculated_penis_title}"
-    # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
-    if profile and profile.get("current_title") and profile.get("current_title") != calculated_title:
-         reply_text += f"\n(Кстати, твое официально присвоенное звание '{profile.get('current_title')}' уже устарело, скоро обновится!)"
-    elif not profile:
-         reply_text += f"\n(Пока не видел твоих сообщений, чтобы записать профиль)"
+    # Добавляем инфу о письке
+    current_penis_size = profile_data.get("penis_size", 0) # Берем из profile_data
+    calculated_penis_title = "Неизмеряемый отросток" # Дефолтное писечное звание
+    for size_threshold, (title_name, _) in sorted(PENIS_TITLES_BY_SIZE.items()):
+         if current_penis_size >= size_threshold:
+             calculated_penis_title = title_name
+         else: break
+
+    reply_text += f"\n\n<b>Твой Боевой Агрегат:</b>"
+    reply_text += f"\n  <b>Длина:</b> {current_penis_size} см"
+    reply_text += f"\n  <b>Писько-Звание:</b> {calculated_penis_title}"
 
     await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode='HTML')
-
-# --- КОНЕЦ ФУНКЦИИ /whoami ---
+# --- КОНЕЦ ИСПРАВЛЕННОЙ ФУНКЦИИ /whoami ---
 
 # Убедись, что импорты asyncio, logging и коллекция history_collection определены выше
 
@@ -2136,7 +2134,7 @@ async def main() -> None:
     # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
 
 # --->>> ПРОВЕРЬ ЭТИ ДВА REGEX И ИХ ФУНКЦИИ <<<---
-    grow_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:писька|хуй|член|пенис|елда|стручок|агрегат|змея)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше)?.*'
+    grow_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:писька|хуй|член|пенис|елда|стручок|агрегат|змея)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше|плюс)?.*'
     application.add_handler(MessageHandler(filters.Regex(grow_penis_pattern) & filters.TEXT & ~filters.COMMAND, grow_penis)) # Должен вызывать grow_penis
 
     my_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:моя писька|мой хуй|мой член|мой пенис|какой у меня|что с моей пиписькой).*'
