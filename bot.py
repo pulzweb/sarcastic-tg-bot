@@ -1858,13 +1858,17 @@ async def set_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /whoami ---
 async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает инфу о пользователе: ник, кол-во сообщений, звание, писюн."""
-    # Блок проверки техработ (ВСТАВЬ СЮДА, ЕСЛИ ЕЩЕ НЕ ВСТАВИЛ!)
-    # if not update or ... (код проверки техработ) ... return
+    """Показывает инфу о пользователе: ник, кол-во сообщений, звание, писюн (по чату)."""
+    # --->>> БЛОК ПРОВЕРКИ ТЕХРАБОТ (УБЕДИСЬ, ЧТО ОН ТУТ ЕСТЬ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+        logger.warning(f"who_am_i: нет данных для проверки техработ")
+        return
 
-    if not update.message or not update.message.from_user: return
+    if not update.message or not update.message.from_user: return # Повторная проверка на всякий
     user = update.message.from_user
     chat_id = update.message.chat.id
+
+    loop = asyncio.get_running_loop()
 
     logger.info(f"Пользователь {user.id} ({user.first_name or 'Безымянный'}) запросил /whoami")
 
@@ -1892,8 +1896,8 @@ async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply_text += f"\n<b>Погоняло в банде:</b> {calculated_title}"
 
     # --->>> ИЗМЕНЕННЫЙ БЛОК ДЛЯ ПИСЬКИ (по текущему чату) <<<---
-    penis_stat_for_current_chat = await loop.run_in_executor( # loop должен быть определен выше
-        None, lambda: penis_stats_collection.find_one({"user_id": user.id, "chat_id": chat_id}) # Ищем для текущего chat_id
+    penis_stat_for_current_chat = await loop.run_in_executor( # Используем loop
+         None, lambda: penis_stats_collection.find_one({"user_id": user.id, "chat_id": chat_id})
     )
     current_penis_size_chat = 0
     calculated_penis_title_chat = "Неизмеряемый отросток (в этом чате)"
@@ -1950,12 +1954,16 @@ async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     last_growth_time = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
     current_penis_size = 0
-    current_penis_title_from_db = None
+    current_penis_title_from_db = None # Инициализируем
 
     if penis_stat:
-        last_growth_time = penis_stat.get("last_penis_growth", last_growth_time)
         current_penis_size = penis_stat.get("penis_size", 0)
         current_penis_title_from_db = penis_stat.get("current_penis_title")
+        # --->>> ИСПРАВЛЕНИЕ ЗДЕСЬ <<<---
+        _last_growth_from_db = penis_stat.get("last_penis_growth")
+        if isinstance(_last_growth_from_db, datetime.datetime):
+            # Если это datetime, делаем его aware (предполагая, что в БД оно UTC naive)
+            last_growth_time = _last_growth_from_db.replace(tzinfo=datetime.timezone.utc)
 
     current_time = datetime.datetime.now(datetime.timezone.utc)
     time_since_last_growth = (current_time - last_growth_time).total_seconds()
