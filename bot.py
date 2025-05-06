@@ -219,9 +219,12 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             lambda: user_profiles_collection.find_one_and_update(
                 {"user_id": user.id}, # Ищем по ID
                 {
-                    "$inc": {"message_count": 1}, # Увеличиваем счетчик
-                    "$set": {"tg_first_name": user.first_name, "tg_username": user.username}, # Обновляем ТГ инфу
-                    "$setOnInsert": {"user_id": user.id, "custom_nickname": None, "message_count": 1, "current_title": None, "penis_size": 0, "last_penis_growth": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "current_penis_title": None} # Ставим при создании
+                    "$inc": {"message_count": 1},
+                    "$set": {"tg_first_name": user.first_name, "tg_username": user.username},
+                    # --->>> УБИРАЕМ message_count ОТСЮДА <<<---
+                    "$setOnInsert": {"user_id": user.id, "custom_nickname": None, "current_title": None,
+                                     "penis_size": 0, "last_penis_growth": datetime.datetime.fromtimestamp(0, datetime.timezone.utc), "current_penis_title": None}
+                    # --->>> КОНЕЦ ИСПРАВЛЕНИЯ <<<---
                 },
                 projection={"message_count": 1, "custom_nickname": 1, "current_title": 1}, # Возвращаем нужные поля
                 upsert=True, # Создаем, если нет
