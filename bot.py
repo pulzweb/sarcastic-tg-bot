@@ -1934,21 +1934,22 @@ async def update_history_with_new_name(user_id: int, new_nickname: str, context:
         logger.error(f"Ошибка фонового обновления имени в истории для user_id {user_id}: {e}", exc_info=True)
 # --- КОНЕЦ ФОНОВОЙ ЗАДАЧИ ---
 
-# --- ИЗМЕНЕННАЯ grow_penis (С ШАНСОМ УКОРОЧЕНИЯ) ---
+# --- ИЗМЕНЕННАЯ grow_penis (С НАКАЗАНИЕМ ЗА ЧАСТУЮ ДРОЧКУ) ---
 async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # --->>> БЛОК ПРОВЕРКИ ТЕХРАБОТ (УБЕДИСЬ, ЧТО ОН ТУТ ЕСТЬ В НАЧАЛЕ!) <<<---
     # if not update or ... (код проверки техработ) ... return
 
     if not update.message or not update.message.from_user or not update.message.chat: return
     user = update.message.from_user
-    chat_id = update.message.chat.id # ВАЖНО: используем chat_id
+    chat_id = update.message.chat.id
     loop = asyncio.get_running_loop()
 
     profile_data_for_name = await get_user_profile_data(user)
     user_display_name = profile_data_for_name["display_name"]
 
-    logger.info(f"Пользователь '{user_display_name}' (ID: {user.id}) пытается изменить писюн в чате {chat_id}.")
+    logger.info(f"Пользователь '{user_display_name}' (ID: {user.id}) дергает писькомер в чате {chat_id}.")
 
+    # Получаем текущую писько-статистику
     penis_stat = await loop.run_in_executor(
         None, lambda: penis_stats_collection.find_one({"user_id": user.id, "chat_id": chat_id})
     )
@@ -1956,73 +1957,103 @@ async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     last_growth_time = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
     current_penis_size = 0
     current_penis_title_from_db = None
+    warned_during_cooldown = False # Флаг предупреждения
 
     if penis_stat:
         current_penis_size = penis_stat.get("penis_size", 0)
         current_penis_title_from_db = penis_stat.get("current_penis_title")
+        warned_during_cooldown = penis_stat.get("warned_during_cooldown", False) # Читаем флаг
         _last_growth_from_db = penis_stat.get("last_penis_growth")
         if isinstance(_last_growth_from_db, datetime.datetime):
             last_growth_time = _last_growth_from_db.replace(tzinfo=datetime.timezone.utc) if _last_growth_from_db.tzinfo is None else _last_growth_from_db
 
-
     current_time = datetime.datetime.now(datetime.timezone.utc)
     time_since_last_growth = (current_time - last_growth_time).total_seconds()
 
+    # --->>> НОВАЯ ЛОГИКА КУЛДАУНА И НАКАЗАНИЯ <<<---
     if time_since_last_growth < PENIS_GROWTH_COOLDOWN_SECONDS:
         remaining_time = PENIS_GROWTH_COOLDOWN_SECONDS - time_since_last_growth
         h = int(remaining_time // 3600); m = int((remaining_time % 3600) // 60)
-        await context.bot.send_message(chat_id=chat_id, text=f"🗿 Иди нахуй, {user_display_name}! Твой стручок еще не восстановился после прошлой дрочки. Дай ему отдохнуть хотя бы <b>{h} ч {m} мин</b>, заебал.", parse_mode='HTML')
-        return
 
-    # --->>> ЛОГИКА РОСТА/УКОРОЧЕНИЯ <<<---
+        if not warned_during_cooldown:
+            # Первое нарушение кулдауна - предупреждение
+            await context.bot.send_message(chat_id=chat_id, text=f"🗿 Э, {user_display_name}, ты заебал! Твой стручок еще на кулдауне! Осталось <b>{h} ч {m} мин</b>. Еще раз дернешь - укорочу нахуй!", parse_mode='HTML')
+            # Записываем, что предупредили
+            await loop.run_in_executor(None, lambda: penis_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"warned_during_cooldown": True}}, upsert=True))
+            logger.info(f"Пользователь {user_display_name} получил предупреждение за частую дрочку.")
+        else:
+            # Повторное нарушение - НАКАЗАНИЕ!
+            shrink_amount = random.randint(1, 15) # На сколько укоротить
+            new_size = current_penis_size - shrink_amount
+            if new_size < 0: new_size = 0
+
+            logger.info(f"НАКАЗАНИЕ! Писюн {user_display_name} в чате {chat_id} УКОРОЧЕН на {shrink_amount} см за заебывание, теперь {new_size} см! Кулдаун сброшен.")
+            await context.bot.send_message(chat_id=chat_id, text=f"🗿 АХ ТЫ Ж ХУЕСОС НЕТЕРПЕЛИВЫЙ, {user_display_name}! Я ЖЕ ПРЕДУПРЕЖДАЛ! Твой писюн **УСОХ на {shrink_amount} см** за твое заебалово! Теперь он <b>{new_size} см</b>! Кулдаун сброшен, можешь дрочить заново через 6 часов, если еще есть что.", parse_mode='HTML')
+            # Обновляем размер, СБРАСЫВАЕМ кулдаун (ставим current_time) и СБРАСЫВАЕМ флаг предупреждения
+            await loop.run_in_executor(None, lambda: penis_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"penis_size": new_size, "last_penis_growth": current_time, "warned_during_cooldown": False}}, upsert=True))
+            # Проверка на изменение звания после укорочения (можно вынести в отдельную функцию)
+            # ... (код проверки и отправки сообщения о звании, как ниже) ...
+            new_penis_title_achieved = None; new_penis_title_message = ""
+            for size_threshold, (title_name, achievement_message) in sorted(PENIS_TITLES_BY_SIZE.items()):
+                if new_size >= size_threshold: new_penis_title_achieved = title_name; new_penis_title_message = achievement_message
+                else: break
+            if new_penis_title_achieved != current_penis_title_from_db: # Сравниваем с тем, что было в БД
+                if new_penis_title_achieved:
+                     # ... (обновляем current_penis_title в БД и шлем сообщение) ...
+                     await loop.run_in_executor(None, lambda: penis_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"current_penis_title": new_penis_title_achieved}}))
+                     mention = user.mention_html(); achievement_text = new_penis_title_message.format(mention=mention, size=new_size)
+                     await context.bot.send_message(chat_id=chat_id, text=achievement_text, parse_mode='HTML')
+                elif current_penis_title_from_db: # Если звание было, а теперь нет
+                     await loop.run_in_executor(None, lambda: penis_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"current_penis_title": None}}))
+                     await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user.mention_html()}, после укорочения ты потерял все писечные звания! Жалкий.", parse_mode='HTML')
+        return # Выходим, т.к. кулдаун еще не прошел (или был только что сброшен наказанием)
+    # --->>> КОНЕЦ НОВОЙ ЛОГИКИ КУЛДАУНА <<<---
+
+    # Если кулдаун прошел - стандартная логика роста/усыхания
     new_size = current_penis_size
     change_message = ""
-    change_amount = random.randint(1, 30) # На сколько изменится
+    change_amount = random.randint(1, 30)
 
-    if random.random() < 0.003: # 0.3% шанс на укорочение
+    if random.random() < 0.003: # 0.3% шанс на укорочение (обычное)
         new_size -= change_amount
-        if new_size < 0: # Не может быть отрицательным
-            new_size = 0
-        logger.info(f"ПИСЮН {user_display_name} в чате {chat_id} ВНЕЗАПНО УКОРОТИЛСЯ на {change_amount} см, теперь {new_size} см!")
-        change_message = f"🗿 БЛЯТЬ, {user_display_name}! Неведомая хуйня! Твой писюн в этом чате **ВНЕЗАПНО УСОХ на {change_amount} см**! Теперь он жалкие <b>{new_size} см</b>! Похоже, ты где-то согрешил, мудила. Или это просто карма."
-    else: # 99.7% шанс на рост
+        if new_size < 0: new_size = 0
+        logger.info(f"Писюн {user_display_name} в чате {chat_id} ВНЕЗАПНО УКОРОТИЛСЯ на {change_amount} см, теперь {new_size} см!")
+        change_message = f"🗿 БЛЯТЬ, {user_display_name}! Неведомая хуйня! Твой писюн **ВНЕЗАПНО УСОХ на {change_amount} см**! Теперь он жалкие <b>{new_size} см</b>! Карма, сука."
+    else: # Рост
         new_size += change_amount
         logger.info(f"Писюн {user_display_name} в чате {chat_id} вырос на {change_amount} см, теперь {new_size} см.")
-        change_message = f"🗿 {user_display_name}, твой хуец в этом чате подрос на <b>{change_amount} см</b>! Теперь он <b>{new_size} см</b>! Так держать, дрочила!"
-    # --->>> КОНЕЦ ЛОГИКИ <<<---
+        change_message = f"🗿 {user_display_name}, твой хуец в этом чате подрос на <b>{change_amount} см</b>! Теперь он <b>{new_size} см</b>!"
 
     try:
-        update_doc = {"$set": {"penis_size": new_size, "last_penis_growth": current_time, "user_display_name": user_display_name}, "$setOnInsert": {"user_id": user.id, "chat_id": chat_id, "current_penis_title": None}}
+        # Обновляем размер, время и СБРАСЫВАЕМ ФЛАГ ПРЕДУПРЕЖДЕНИЯ, т.к. кулдаун прошел успешно
+        update_doc = {"$set": {"penis_size": new_size, "last_penis_growth": current_time, "warned_during_cooldown": False, "user_display_name": user_display_name}}
+        # ... (код с $setOnInsert и удалением дублей, как был) ...
         if "$setOnInsert" in update_doc and "$set" in update_doc:
             if "penis_size" in update_doc["$set"]: update_doc["$setOnInsert"].pop("penis_size", None)
             if "last_penis_growth" in update_doc["$set"]: update_doc["$setOnInsert"].pop("last_penis_growth", None)
+            if "warned_during_cooldown" in update_doc["$set"]: update_doc["$setOnInsert"].pop("warned_during_cooldown", None) # Добавили сброс
 
         await loop.run_in_executor(None, lambda: penis_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id}, update_doc, upsert=True))
         await context.bot.send_message(chat_id=chat_id, text=change_message, parse_mode='HTML')
 
-        # Проверка на новое писечное звание
+        # Проверка на новое писечное звание (как было)
         new_penis_title_achieved = None; new_penis_title_message = ""
+        # ... (код проверки званий и отправки сообщения) ...
         for size_threshold, (title_name, achievement_message) in sorted(PENIS_TITLES_BY_SIZE.items()):
             if new_size >= size_threshold: new_penis_title_achieved = title_name; new_penis_title_message = achievement_message
             else: break
-
-        # Отправляем сообщение о звании ТОЛЬКО ЕСЛИ оно изменилось ИЛИ его не было, а теперь появилось
-        # ИЛИ если звание было, но из-за уменьшения размера оно должно стать НИЖЕ
         if new_penis_title_achieved != current_penis_title_from_db:
-             if new_penis_title_achieved: # Если новое звание есть (не None)
-                logger.info(f"{user_display_name} в чате {chat_id} получил/изменил писечное звание на: {new_penis_title_achieved}")
+             if new_penis_title_achieved:
                 await loop.run_in_executor(None, lambda: penis_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"current_penis_title": new_penis_title_achieved}}))
                 mention = user.mention_html(); achievement_text = new_penis_title_message.format(mention=mention, size=new_size)
                 await context.bot.send_message(chat_id=chat_id, text=achievement_text, parse_mode='HTML')
-             elif current_penis_title_from_db: # Если нового звания нет (new_size < первого порога), а старое было
-                logger.info(f"{user_display_name} в чате {chat_id} потерял писечное звание. Теперь просто хуец.")
+             elif current_penis_title_from_db:
                 await loop.run_in_executor(None, lambda: penis_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"current_penis_title": None}}))
-                await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user.mention_html()}, похоже, твой агрегат так усох, что ты потерял все писечные звания! Теперь ты просто обладатель... ну ты понял. Жалкое зрелище.", parse_mode='HTML')
-
+                await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user.mention_html()}, после изменения ты потерял все писечные звания!", parse_mode='HTML')
 
     except Exception as e:
         logger.error(f"Ошибка при изменении письки для {user_display_name} в чате {chat_id}: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, {user_display_name}, ебанина, с хуем что-то не так. Не изменился.")
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, {user_display_name}, с хуем опять ебанина.")
 # --- КОНЕЦ ИЗМЕНЕННОЙ grow_penis ---
 
 # --- ПЕРЕПИСАННАЯ show_my_penis (ДЛЯ СТАТИСТИКИ ПО ЧАТАМ) ---
