@@ -61,6 +61,26 @@ PENIS_TITLES_BY_SIZE = {
 PENIS_GROWTH_COOLDOWN_SECONDS = 6 * 60 * 60 # 6 часов
 # --->>> КОНЕЦ СИСТЕМЫ <<<---
 
+# --->>> СИСТЕМА СИСЕЧНЫХ ЗВАНИЙ <<<---
+# Словарь: порог_размера: (Название звания, Сообщение о достижении)
+# Размеры условные, можно придумать свою шкалу. Например, от 0 до 7+
+TITS_TITLES_BY_SIZE = {
+    0:  ("Плоскодонка", "🗿 {mention}, твои сиськи {size}-го размера? Поздравляю, ты 'Плоскодонка'! Не расстраивайся, хоть спать на животе удобно."),
+    1:  ("Скромняшка", "🗿 Ого, {mention}, уже <b>{size}-й размер</b>! Звание 'Скромняшка' твоё! Маловато, конечно, но хоть что-то есть."),
+    2:  ("Золотая Середина", "🗿 {mention}, целых <b>{size} размер</b>! Ты теперь 'Золотая Середина'! И не много, и не мало, в самый раз, чтобы в маршрутке не мешали."),
+    3:  ("Уверенный Пользователь", "🗿 Нихуя себе, {mention}! <b>{size}-й размер</b>! Ты дослужилась(ся) до 'Уверенного Пользователя'! Таким и мужика можно придавить... случайно."),
+    4:  ("Арбузы на Выгуле", "🗿 Пиздец, {mention}, у тебя уже <b>{size}-й размер</b>! Ты теперь 'Арбузы на Выгуле'! Опасно, сука, опасно для окружающих!"),
+    5:  ("Доярка Вселенной", "🗿 ВАШУ МАТЬ! {mention}, <b>{size}-й размер</b>!!! Ты теперь 'Доярка Вселенной'! Снимаю шляпу... и лифчик (если бы он у меня был)."),
+    10:  ("СИСЬКИ БОГА", "🗿 Это вообще законно, {mention}?! <b>{size}-й размер</b>?! Ты не человек, у тебя 'СИСЬКИ БОГА'! Можно спутники сбивать!"),
+    20:  ("Галактические Буфера", "🗿 Ебать, {mention}?! <b>{size}+ размер</b>?! Ты владеешь 'Галактическими Буферами'! Перед тобой меркнет даже Млечный Путь!"),
+    50:  ("Вселенские дойки", "🗿 Того рот ебал, {mention}?! <b>{size}+ размер</b>?! Ты обладатель 'Вселенских доек'! Освоим космос хуле!"),
+    100:  ("Звездный сосок", "🗿 Ну ахуеть, {mention}?! <b>{size}+ размер</b>?! Ты теперь 'Звездный сосок', дальше только бесконечность!"),
+
+    # Добавь еще, если надо
+}
+TITS_GROWTH_COOLDOWN_SECONDS = 6 * 60 * 60 # 6 часов, как и для писек
+# --->>> КОНЕЦ СИСТЕМЫ <<<---
+
 # --- НАСТРОЙКИ ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 IO_NET_API_KEY = os.getenv("IO_NET_API_KEY")
@@ -113,6 +133,12 @@ try:
     penis_stats_collection.create_index([("chat_id", pymongo.ASCENDING), ("penis_size", pymongo.DESCENDING)]) # Для топа по чату
     logger.info("Коллекция penis_stats_by_chat готова.")
 # --->>> КОНЕЦ <<<---
+    tits_stats_collection = db['tits_stats_by_chat']
+            # Индексы
+    tits_stats_collection.create_index([("chat_id", pymongo.ASCENDING), ("user_id", pymongo.ASCENDING)], unique=True)
+    tits_stats_collection.create_index([("chat_id", pymongo.ASCENDING), ("tits_size", pymongo.DESCENDING)]) # По tits_size
+    logger.info("Коллекция tits_stats_by_chat готова.")
+
     logger.info("Коллекция user_profiles готова.")
     logger.info("Коллекции MongoDB готовы.")
     bot_status_collection = db['bot_status']
@@ -1884,7 +1910,24 @@ async def set_nickname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ КОМАНДЫ /whoami ---
 async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Показывает инфу о пользователе: ник, кол-во сообщений, звание, писюн (по чату)."""
-    # --->>> БЛОК ПРОВЕРКИ ТЕХРАБОТ (УБЕДИСЬ, ЧТО ОН ТУТ ЕСТЬ!) <<<---
+    # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ (ВСТАВЬ В КАЖДУЮ КОМАНДНУЮ ФУНКЦИЮ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+         logger.warning(f"grow_tits: нет данных в update для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан для grow_tits!") # Можно убрать это логгирование в каждой функции
+    loop_for_maint = asyncio.get_running_loop() # Отдельный loop для вызова is_maintenance_mode
+    maintenance_active = await is_maintenance_mode(loop_for_maint)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"Команда grow_tits отклонена из-за техработ в чате {real_chat_id}")
+        try:
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e: logger.warning(f"Не удалось ответить/удалить сообщение о техработах (grow_tits): {e}")
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     if not update or not update.message or not update.message.from_user or not update.message.chat:
         logger.warning(f"who_am_i: нет данных для проверки техработ")
         return
@@ -1937,6 +1980,21 @@ async def who_am_i(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply_text += f"\n  <b>Писько-Звание (здесь):</b> {calculated_penis_title_chat}"
     # --->>> КОНЕЦ ИЗМЕНЕНИЯ <<<---
 
+    reply_text += f"\n\n<b>Твои Дыньки (в этом чате '{update.message.chat.title or 'тут'}'):</b>"
+    # Получаем сисько-статистику для ЭТОГО ЮЗЕРА в ЭТОМ ЧАТЕ
+    tits_stat_chat = await loop.run_in_executor( # Убедись, что loop определен выше
+         None, lambda: tits_stats_collection.find_one({"user_id": user.id, "chat_id": chat_id})
+    )
+    current_tits_size_chat = 0
+    calculated_tits_title_chat = "Плоскодонка (в этом чате)" # Дефолт
+    if tits_stat_chat:
+        current_tits_size_chat = tits_stat_chat.get("tits_size", 0)
+        for size_threshold, (title_name, _) in sorted(TITS_TITLES_BY_SIZE.items()):
+            if current_tits_size_chat >= size_threshold: calculated_tits_title_chat = title_name
+            else: break
+    reply_text += f"\n  <b>Размер:</b> {current_tits_size_chat}-й"
+    reply_text += f"\n  <b>Сисько-Звание (здесь):</b> {calculated_tits_title_chat}"
+
     await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode='HTML')
 # --- КОНЕЦ ИСПРАВЛЕННОЙ ФУНКЦИИ /whoami ---
 
@@ -1961,9 +2019,24 @@ async def update_history_with_new_name(user_id: int, new_nickname: str, context:
 
 # --- ИЗМЕНЕННАЯ grow_penis (С НАКАЗАНИЕМ ЗА ЧАСТУЮ ДРОЧКУ) ---
 async def grow_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # --->>> БЛОК ПРОВЕРКИ ТЕХРАБОТ (УБЕДИСЬ, ЧТО ОН ТУТ ЕСТЬ В НАЧАЛЕ!) <<<---
-    # if not update or ... (код проверки техработ) ... return
-
+    # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ (ВСТАВЬ В КАЖДУЮ КОМАНДНУЮ ФУНКЦИЮ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+         logger.warning(f"grow_tits: нет данных в update для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан для grow_tits!") # Можно убрать это логгирование в каждой функции
+    loop_for_maint = asyncio.get_running_loop() # Отдельный loop для вызова is_maintenance_mode
+    maintenance_active = await is_maintenance_mode(loop_for_maint)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"Команда grow_tits отклонена из-за техработ в чате {real_chat_id}")
+        try:
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e: logger.warning(f"Не удалось ответить/удалить сообщение о техработах (grow_tits): {e}")
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
     if not update.message or not update.message.from_user or not update.message.chat: return
     user = update.message.from_user
     chat_id = update.message.chat.id
@@ -2116,8 +2189,24 @@ async def show_my_penis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- ПЕРЕПИСАННАЯ show_penis_top (ТОП ПО КОНКРЕТНОМУ ЧАТУ) ---
 async def show_penis_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Блок проверки техработ (ВСТАВЬ СЮДА!)
-    # if not update or ... (код проверки техработ) ... return
+    # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ (ВСТАВЬ В КАЖДУЮ КОМАНДНУЮ ФУНКЦИЮ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+         logger.warning(f"grow_tits: нет данных в update для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан для grow_tits!") # Можно убрать это логгирование в каждой функции
+    loop_for_maint = asyncio.get_running_loop() # Отдельный loop для вызова is_maintenance_mode
+    maintenance_active = await is_maintenance_mode(loop_for_maint)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"Команда grow_tits отклонена из-за техработ в чате {real_chat_id}")
+        try:
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e: logger.warning(f"Не удалось ответить/удалить сообщение о техработах (grow_tits): {e}")
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
 
     if not update.message or not update.message.from_user or not update.message.chat: return
     chat_id = update.message.chat.id # ВАЖНО: используем chat_id ТЕКУЩЕГО ЧАТА
@@ -2161,6 +2250,184 @@ async def show_penis_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await context.bot.send_message(chat_id=chat_id, text="🗿 Бля, не смог составить рейтинг хуев для этого чата. База наебнулась.")
 # --- КОНЕЦ ПЕРЕПИСАННОЙ show_penis_top ---
 
+# --- ИЗМЕНЕННАЯ grow_tits (ДРОБНЫЙ РОСТ/УСЫХАНИЕ) ---
+async def grow_tits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ (ВСТАВЬ В КАЖДУЮ КОМАНДНУЮ ФУНКЦИЮ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+         logger.warning(f"grow_tits: нет данных в update для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан для grow_tits!") # Можно убрать это логгирование в каждой функции
+    loop_for_maint = asyncio.get_running_loop() # Отдельный loop для вызова is_maintenance_mode
+    maintenance_active = await is_maintenance_mode(loop_for_maint)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"Команда grow_tits отклонена из-за техработ в чате {real_chat_id}")
+        try:
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e: logger.warning(f"Не удалось ответить/удалить сообщение о техработах (grow_tits): {e}")
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+
+    # Основная логика функции
+    if not update.message or not update.message.from_user or not update.message.chat: return # Повторная проверка, если вдруг техработы не отсеяли
+    user = update.message.from_user; chat_id = update.message.chat.id; loop = asyncio.get_running_loop()
+    profile_name_data = await get_user_profile_data(user); user_display_name = profile_name_data["display_name"]
+    logger.info(f"Пользователь '{user_display_name}' (ID: {user.id}) решил(а) изменить сиськи в чате {chat_id}.")
+
+    tits_stat = await loop.run_in_executor(None, lambda: tits_stats_collection.find_one({"user_id": user.id, "chat_id": chat_id}))
+    last_growth_time = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+    # --->>> РАЗМЕР ТЕПЕРЬ FLOAT <<<---
+    current_tits_size = 0.0
+    current_tits_title_db = None; warned_cooldown = False
+    if tits_stat:
+        current_tits_size = float(tits_stat.get("tits_size", 0.0)) # Читаем как float
+        current_tits_title_db = tits_stat.get("current_tits_title")
+        warned_cooldown = tits_stat.get("warned_during_cooldown", False)
+        _last_growth_db = tits_stat.get("last_tits_growth")
+        if isinstance(_last_growth_db, datetime.datetime): last_growth_time = _last_growth_db.replace(tzinfo=datetime.timezone.utc) if _last_growth_db.tzinfo is None else _last_growth_db
+
+    current_time = datetime.datetime.now(datetime.timezone.utc)
+    time_since_last = (current_time - last_growth_time).total_seconds()
+
+    if time_since_last < TITS_GROWTH_COOLDOWN_SECONDS:
+        remaining_time = TITS_GROWTH_COOLDOWN_SECONDS - time_since_last; h = int(remaining_time // 3600); m = int((remaining_time % 3600) // 60)
+        if not warned_cooldown:
+            await context.bot.send_message(chat_id=chat_id, text=f"🗿 Э, {user_display_name}, не торопись! Твои дыньки еще на кулдауне! Осталось <b>{h} ч {m} мин</b>. Еще раз попросишь - сдуются нахуй!", parse_mode='HTML')
+            await loop.run_in_executor(None, lambda: tits_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"warned_during_cooldown": True}}, upsert=True))
+        else:
+            # --->>> НАКАЗАНИЕ: УМЕНЬШАЕМ НА 0.1-1.0 <<<---
+            shrink_amount = round(random.uniform(0.1, 1.0), 1)
+            new_size = round(max(0.0, current_tits_size - shrink_amount), 1) # Округляем до 1 знака, не меньше 0
+            logger.info(f"НАКАЗАНИЕ! Сиськи {user_display_name} СДУЛИСЬ на {shrink_amount}, теперь {new_size}!")
+            await context.bot.send_message(chat_id=chat_id, text=f"🗿 АХ ТЫ Ж НЕТЕРПЕЛИВАЯ СУЧКА, {user_display_name}! Твои сиськи **СДУЛИСЬ на {shrink_amount} размера**! Теперь они <b>{new_size:.1f}-го размера</b>! Кулдаун сброшен.", parse_mode='HTML')
+            await loop.run_in_executor(None, lambda: tits_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"tits_size": new_size, "last_tits_growth": current_time, "warned_during_cooldown": False}}, upsert=True))
+            # Проверка звания (скопируй и адаптируй из старой функции)
+        return
+
+    new_size = current_tits_size
+    change_message = ""
+    # --->>> ИЗМЕНЕНИЕ РАЗМЕРА ОТ 0.1 ДО 1.0 <<<---
+    change_amount = round(random.uniform(0.1, 1.0), 1) # Случайное число от 0.1 до 1.0, округленное до 1 знака
+
+    if random.random() < 0.01: # 1% шанс на сдутие
+        new_size = round(max(0.0, current_tits_size - change_amount), 1)
+        logger.info(f"Сиськи {user_display_name} ВНЕЗАПНО СДУЛИСЬ на {change_amount}, теперь {new_size}!")
+        change_message = f"🗿 БЛЯТЬ, {user_display_name}! Твои сиськи **ВНЕЗАПНО СДУЛИСЬ на {change_amount} размера**! Теперь они жалкого <b>{new_size:.1f}-го размера</b>!"
+    else: # Рост
+        new_size = round(current_tits_size + change_amount, 1)
+        logger.info(f"Сиськи {user_display_name} выросли на {change_amount}, теперь {new_size}!")
+        change_message = f"🗿 {user_display_name}, твои бидоны подросли на <b>{change_amount} размера</b> и стали <b>{new_size:.1f}-го</b>! Поздравляю, ебать!"
+
+    try:
+        update_doc = {"$set": {"tits_size": new_size, "last_tits_growth": current_time, "warned_during_cooldown": False, "user_display_name": user_display_name}}
+        await loop.run_in_executor(None, lambda: tits_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id}, update_doc, upsert=True))
+        await context.bot.send_message(chat_id=chat_id, text=change_message, parse_mode='HTML')
+
+        # Проверка на новое сисечное звание
+        new_tits_title_achieved = None; new_tits_title_message = ""
+        for size_threshold, (title_name, achievement_message) in sorted(TITS_TITLES_BY_SIZE.items()):
+            if new_size >= float(size_threshold): # Сравниваем с float
+                new_tits_title_achieved = title_name; new_tits_title_message = achievement_message
+            else: break
+        if new_tits_title_achieved != current_tits_title_db:
+             if new_tits_title_achieved:
+                await loop.run_in_executor(None, lambda: tits_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"current_tits_title": new_tits_title_achieved}}))
+                mention = user.mention_html(); achievement_text = new_tits_title_message.format(mention=mention, size=f"{new_size:.1f}") # Форматируем вывод размера
+                await context.bot.send_message(chat_id=chat_id, text=achievement_text, parse_mode='HTML')
+             elif current_tits_title_db:
+                await loop.run_in_executor(None, lambda: tits_stats_collection.update_one({"user_id": user.id, "chat_id": chat_id},{"$set": {"current_tits_title": None}}))
+                await context.bot.send_message(chat_id=chat_id, text=f"🗿 {user.mention_html()}, после изменения твои сиськи потеряли все звания!", parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Ошибка при изменении сисек для {user_display_name}: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, {user_display_name}, с сиськами опять ебанина.")
+# --- КОНЕЦ ИЗМЕНЕННОЙ grow_tits ---
+
+
+async def show_my_tits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ (ВСТАВЬ В КАЖДУЮ КОМАНДНУЮ ФУНКЦИЮ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+         logger.warning(f"grow_tits: нет данных в update для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан для grow_tits!") # Можно убрать это логгирование в каждой функции
+    loop_for_maint = asyncio.get_running_loop() # Отдельный loop для вызова is_maintenance_mode
+    maintenance_active = await is_maintenance_mode(loop_for_maint)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"Команда grow_tits отклонена из-за техработ в чате {real_chat_id}")
+        try:
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e: logger.warning(f"Не удалось ответить/удалить сообщение о техработах (grow_tits): {e}")
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+    if not update.message or not update.message.from_user or not update.message.chat: return
+    user = update.message.from_user; chat_id = update.message.chat.id; loop = asyncio.get_running_loop()
+    profile_name_data = await get_user_profile_data(user); user_display_name = profile_name_data["display_name"]
+    logger.info(f"Пользователь '{user_display_name}' (ID: {user.id}) запросил инфу о сиськах в чате {chat_id}.")
+
+    tits_stat = await loop.run_in_executor(None, lambda: tits_stats_collection.find_one({"user_id": user.id, "chat_id": chat_id}))
+    current_tits_size = 0; current_tits_title = "Неизвестного размера (пока)"
+    if tits_stat:
+        current_tits_size = tits_stat.get("tits_size", 0)
+        for size_threshold, (title_name, _) in sorted(TITS_TITLES_BY_SIZE.items()):
+             if current_tits_size >= size_threshold: current_tits_title = title_name
+             else: break
+
+    reply_text = f"🗿 Итак, {user_display_name}, твои сисяндры в чате <b>'{update.message.chat.title or 'этом'}'</b>:\n\n"
+    reply_text += f"<b>Размер:</b> {current_tits_size}-й\n"
+    reply_text += f"<b>Сисько-Звание:</b> {current_tits_title}.\n\n"
+    if current_tits_size <= 0: reply_text += "Плоско, как доска, и грустно, как моя жизнь."
+    elif current_tits_size <= 2: reply_text += "Ну, хоть не в минус. Уже достижение, блядь."
+    elif current_tits_size <= 4: reply_text += "Вполне себе! Можно даже лифчик носить не для вида."
+    else: reply_text += "Охуеть! С такими можно и на таран идти!"
+    await context.bot.send_message(chat_id=chat_id, text=reply_text, parse_mode='HTML')
+
+
+async def show_tits_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # --->>> НАЧАЛО ПРОВЕРКИ ТЕХРАБОТ (ВСТАВЬ В КАЖДУЮ КОМАНДНУЮ ФУНКЦИЮ!) <<<---
+    if not update or not update.message or not update.message.from_user or not update.message.chat:
+         logger.warning(f"grow_tits: нет данных в update для проверки техработ")
+         return
+    real_chat_id = update.message.chat.id; real_user_id = update.message.from_user.id; real_chat_type = update.message.chat.type
+    try: admin_id = int(os.getenv("ADMIN_USER_ID", "0"))
+    except ValueError: admin_id = 0
+    if admin_id == 0: logger.warning("ADMIN_USER_ID не задан для grow_tits!") # Можно убрать это логгирование в каждой функции
+    loop_for_maint = asyncio.get_running_loop() # Отдельный loop для вызова is_maintenance_mode
+    maintenance_active = await is_maintenance_mode(loop_for_maint)
+    if maintenance_active and (real_user_id != admin_id or real_chat_type != 'private'):
+        logger.info(f"Команда grow_tits отклонена из-за техработ в чате {real_chat_id}")
+        try:
+            await context.bot.send_message(chat_id=real_chat_id, text="🔧 Сорян, у меня сейчас технические работы. Попробуй позже.")
+            await context.bot.delete_message(chat_id=real_chat_id, message_id=update.message.message_id)
+        except Exception as e: logger.warning(f"Не удалось ответить/удалить сообщение о техработах (grow_tits): {e}")
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+    if not update.message or not update.message.from_user or not update.message.chat: return
+    chat_id = update.message.chat.id; user_name_req = update.message.from_user.first_name or "Фанатка Сисек"; chat_title = update.message.chat.title or "этого чата"
+    logger.info(f"Пользователь '{user_name_req}' запросил топ сисек в чате '{chat_title}' ({chat_id})")
+    TOP_N = 10
+    try:
+        loop = asyncio.get_running_loop()
+        query = {"chat_id": chat_id, "tits_size": {"$gte": 0}} # Берем всех, у кого не отрицательный размер
+        top_users_cursor = await loop.run_in_executor( None, lambda: tits_stats_collection.find(query, {"user_display_name": 1, "tits_size": 1, "_id": 0}).sort("tits_size", pymongo.DESCENDING).limit(TOP_N))
+        top_users_list = list(top_users_cursor)
+        if not top_users_list:
+            await context.bot.send_message(chat_id=chat_id, text=f"🗿 Пиздец, в чате '{chat_title}' одни плоскодонки или еще никто не начал растить сиськи! Топ пуст."); return
+        reply_text_parts = [f"<b>🏆 Топ-{len(top_users_list)} Сисястых Богинь Чата '{chat_title}':</b>\n"]
+        for i, user_data in enumerate(top_users_list):
+            display_name = user_data.get("user_display_name") or "Анонимная Сиська"; tits_size = user_data.get("tits_size", 0)
+            place_emoji = "🥇" if i == 0 else ("🥈" if i == 1 else ("🥉" if i == 2 else f"{i + 1}."))
+            reply_text_parts.append(f"{place_emoji} {display_name} - <b>{tits_size}-й размер</b>")
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(reply_text_parts), parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Ошибка при получении топа сисек для чата {chat_id}: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text="🗿 Бля, не смог составить рейтинг сисек. База наебнулась.")
+
 # Дальше идет async def main() или другие функции...
 
 async def main() -> None:
@@ -2200,6 +2467,9 @@ async def main() -> None:
     application.add_handler(CommandHandler("grow_penis", grow_penis)) # Должен вызывать grow_penis
     application.add_handler(CommandHandler("my_penis", show_my_penis))  # Должен вызывать show_my_penis
     application.add_handler(CommandHandler("top_penis", show_penis_top)) # /top_penis
+    application.add_handler(CommandHandler("grow_tits", grow_tits))
+    application.add_handler(CommandHandler("my_tits", show_my_tits))
+    application.add_handler(CommandHandler("top_tits", show_tits_top))
 
 
 
@@ -2247,6 +2517,15 @@ async def main() -> None:
     top_penis_pattern = r'(?i).*(?:бот|попиздяка).*(?:топ писек|топ хуев|рейтинг членов|у кого самый большой).*'
     application.add_handler(MessageHandler(filters.Regex(top_penis_pattern) & filters.TEXT & ~filters.COMMAND, show_penis_top))
     # --->>> КОНЕЦ ПРОВЕРКИ <<<---
+
+    grow_tits_pattern = r'(?i).*(?:бот|попиздяка).*(сиськи|грудь|дыньки|буфера)\s*(?:расти|отрасти|увеличь|подрасти|накачай|больше|плюс)?.*'
+    application.add_handler(MessageHandler(filters.Regex(grow_tits_pattern) & filters.TEXT & ~filters.COMMAND, grow_tits))
+
+    my_tits_pattern = r'(?i).*(?:бот|попиздяка).*(?:мои сиськи|моя грудь|какие у меня сиськи).*'
+    application.add_handler(MessageHandler(filters.Regex(my_tits_pattern) & filters.TEXT & ~filters.COMMAND, show_my_tits))
+
+    top_tits_pattern = r'(?i).*(?:бот|попиздяка).*(?:топ сисек|рейтинг грудей|у кого самые большие сиськи).*'
+    application.add_handler(MessageHandler(filters.Regex(top_tits_pattern) & filters.TEXT & ~filters.COMMAND, show_tits_top))
 
 # Добавляем НОВЫЕ обработчики, которые требуют ОТВЕТА на сообщение
     application.add_handler(CommandHandler("pickup", get_pickup_line, filters=filters.REPLY)) # Только в ответе
