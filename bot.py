@@ -3,6 +3,7 @@ import logging
 import os
 import asyncio
 import re
+import pytz # <<<--- НОВЫЙ ИМПОРТ
 import datetime
 import requests # Нужен для NewsAPI
 import json # Для обработки ответа
@@ -45,6 +46,11 @@ from dotenv import load_dotenv
 
 # Загружаем секреты (.env для локального запуска)
 load_dotenv()
+
+# --->>> ОПРЕДЕЛЕНИЕ ЧАСОВЫХ ПОЯСОВ <<<---
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+UTC_TZ = pytz.utc # Уже есть в datetime, но для явности можно так
+# --->>> КОНЕЦ ОПРЕДЕЛЕНИЯ ЧАСОВЫХ ПОЯСОВ <<<---
 
 # --->>> СИСТЕМА ЗВАНИЙ ПО СООБЩЕНИЯМ <<<---
 # Словарь: порог_сообщений: (Название звания, Сообщение о достижении)
@@ -3470,6 +3476,8 @@ async def start_tos_battle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # --- Создание новой игры ---
     recruitment_ends_at = now_utc + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_DURATION_SECONDS)
+
+    recruitment_ends_at_msk = recruitment_ends_at.astimezone(MOSCOW_TZ)
     
     # Сообщение о наборе
     recruitment_text = (
@@ -3477,7 +3485,7 @@ async def start_tos_battle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"{host_user.mention_html()} затеял эпичный Баттл <b>'Правда или Высер от Попиздяки'</b> на {TOS_BATTLE_NUM_QUESTIONS} раундов!\n"
         f"Собираем отряд самых отбитых интеллектуалов (или просто везучих ублюдков)!\n\n"
         f"🏆 <b>Приз победителю:</b> +{TOS_BATTLE_PENIS_REWARD_CM} см к писюну ИЛИ +{TOS_BATTLE_TITS_REWARD_SIZE} к размеру сисек (на выбор победителя, хе-хе)!\n\n"
-        f"Набор открыт до: <b>{recruitment_ends_at.strftime('%H:%M:%S UTC')}</b> (примерно {TOS_BATTLE_RECRUITMENT_DURATION_SECONDS // 60} мин.)\n"
+        f"Набор открыт до: <b>{recruitment_ends_at_msk.strftime('%H:%M:%S MSK')}</b> (примерно {TOS_BATTLE_RECRUITMENT_DURATION_SECONDS // 60} мин.)\n"
         f"Жми кнопку, если не ссышь!"
     )
     
@@ -3681,12 +3689,18 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
                 return
             
             current_recruitment_ends_at_cb = battle_current_state_for_extend_cb["recruitment_ends_at"]
-            new_recruitment_ends_at_cb = current_recruitment_ends_at_cb + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS)
+            # Убедимся, что время из БД в UTC, если оно aware
+            if current_recruitment_ends_at_cb.tzinfo is None:
+                current_recruitment_ends_at_cb = UTC_TZ.localize(current_recruitment_ends_at_cb)
+            else:
+                current_recruitment_ends_at_cb = current_recruitment_ends_at_cb.astimezone(UTC_TZ)
+
+            new_recruitment_ends_at_utc_cb = current_recruitment_ends_at_cb + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS)
             
-            update_result_extend_cb = await loop.run_in_executor(
+            update_result_extend_cb = await loop.run_in_executor( # Обновляем в БД В UTC!
                 None, lambda: tos_battles_collection.update_one(
                     {"_id": battle_doc_id, "status": "recruiting"}, 
-                    {"$set": {"recruitment_ends_at": new_recruitment_ends_at_cb}}
+                    {"$set": {"recruitment_ends_at": new_recruitment_ends_at_utc_cb}}
                 )
             )
             if update_result_extend_cb.modified_count > 0:
@@ -3702,13 +3716,16 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
                         auto_end_recruitment_job, time_until_new_end_seconds_cb, 
                         chat_id=chat_id, data={'game_id': game_id_int, 'host_id': battle["host_id"]}, name=job_name_ext_cb
                     )
-                    remaining_minutes_cb = int(time_until_new_end_seconds_cb // 60)
-                    remaining_seconds_part_cb = int(time_until_new_end_seconds_cb % 60)
-                    time_left_str_cb = f"{remaining_minutes_cb} мин {remaining_seconds_part_cb} сек"
+                    # Конвертируем новое время окончания в MSK для отображения
+                    new_recruitment_ends_at_msk_cb = new_recruitment_ends_at_utc_cb.astimezone(MOSCOW_TZ)
+                    remaining_minutes_cb_display = int(time_until_new_end_seconds_cb_display // 60)
+                    remaining_seconds_part_cb_display = int(time_until_new_end_seconds_cb_display % 60)
+                    time_left_str_cb_display = f"{remaining_minutes_cb_display} мин {remaining_seconds_part_cb_display} сек"
+                    
                     await context.bot.send_message(
                         chat_id, 
                         f"⏳ Хост {user_who_clicked.mention_html()} продлил набор на <b>{TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS} секунд</b>!\n"
-                        f"Новое время окончания набора: <b>{new_recruitment_ends_at_cb.strftime('%H:%M:%S UTC')}</b> (осталось ~{time_left_str_cb}).",
+                        f"Новое время окончания набора: <b>{new_recruitment_ends_at_msk_cb.strftime('%H:%M:%S MSK')}</b> (осталось ~{time_left_str_cb_display}).",
                         parse_mode='HTML', reply_to_message_id=game_id_int
                     )
                 else: 
