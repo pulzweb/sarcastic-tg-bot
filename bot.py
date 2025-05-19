@@ -334,7 +334,7 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С УЛУЧШЕННЫМ УДАЛЕНИЕМ <think>) ---
 async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None) -> None:
-    MAX_MESSAGE_LENGTH = 4096 # Стандартный лимит Telegram
+    #MAX_MESSAGE_LENGTH = 4096 # Стандартный лимит Telegram
      # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
 # Проверяем наличие update и message - без них проверка невозможна
     if not update or not update.message or not update.message.from_user or not update.message.chat:
@@ -422,7 +422,7 @@ async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE
             f"8.  Если интересных сюжетов не нашлось, напиши ОДНУ строку: `🗿 Перепись долбоебов не выявила сегодня ярких экземпляров. Скукота.`\n\n"
             f"ВАЖНОЕ ОГРАНИЧЕНИЕ ПО ДЛИНЕ:\n" # <--- НОВЫЙ БЛОК
             f"   а) Каждый отдельный пункт хроники (абзац, начинающийся с 🗿) должен быть НЕ БОЛЕЕ ~150-200 символов (включая панчлайн).\n"
-            f"   б) ВЕСЬ ТВОЙ ОТВЕТ (вся хроника) ДОЛЖЕН УМЕЩАТЬСЯ примерно в {MAX_MESSAGE_LENGTH - 500} символов (оставляем запас). Это примерно 4-5 стандартных пунктов.\n" # MAX_MESSAGE_LENGTH - 500 - это чтобы дать ИИ ориентир, а не точную цифру, т.к. он считает токены. 500 - это запас.
+            f"   б) ВЕСЬ ТВОЙ ОТВЕТ (вся хроника) ДОЛЖЕН УМЕЩАТЬСЯ примерно в {MAX_TELEGRAM_MESSAGE_LENGTH - 500} символов (оставляем запас). Это примерно 4-5 стандартных пунктов.\n" # MAX_MESSAGE_LENGTH - 500 - это чтобы дать ИИ ориентир, а не точную цифру, т.к. он считает токены. 500 - это запас.
             f"   в) Если ты нашел МНОГО интересных сюжетов (например, 6-7), но понимаешь, что все они не влезут в указанный общий лимит, **ВЫБЕРИ САМЫЕ СОЧНЫЕ 3-4 сюжета** и опиши только их. Лучше меньше, но качественно и чтобы все влезло, чем пытаться впихнуть все и быть оборванным.\n"
             f"   г) ЗАВЕРШАЙ КАЖДУЯ МЫСЛЬ И КАЖДЫЙ ПУНКТ ЛАКОНИЧНО. Не обрывай предложения на полуслове.\n\n" # <--- КОНЕЦ НОВОГО БЛОКА
             f"Пример ЗАЕБАТОГО формата:\n"
@@ -568,8 +568,8 @@ async def analyze_pic(update: Update | None, context: ContextTypes.DEFAULT_TYPE,
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        MAX_MESSAGE_LENGTH = 4096;
-        if len(sarcastic_comment) > MAX_MESSAGE_LENGTH: sarcastic_comment = sarcastic_comment[:MAX_MESSAGE_LENGTH - 3] + "..."
+        #MAX_MESSAGE_LENGTH = 4096;
+        if len(sarcastic_comment) > MAX_TELEGRAM_MESSAGE_LENGTH: sarcastic_comment = sarcastic_comment[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
 
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_comment)
         logger.info(f"Отправлен коммент к картинке ai.io.net '{sarcastic_comment[:50]}...'")
@@ -846,8 +846,8 @@ async def generate_poem(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not poem_text.startswith("🗿") and not poem_text.startswith("["): poem_text = "🗿 " + poem_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        MAX_MESSAGE_LENGTH = 4096; # Обрезка
-        if len(poem_text) > MAX_MESSAGE_LENGTH: poem_text = poem_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        # = 4096; # Обрезка
+        if len(poem_text) > MAX_TELEGRAM_MESSAGE_LENGTH: poem_text = poem_text[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
         sent_message = await context.bot.send_message(chat_id=chat_id, text=poem_text)
         logger.info(f"Отправлен стих про {target_name}.")
         if sent_message: # Запись для /retry
@@ -906,8 +906,8 @@ async def get_prediction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not prediction_text.startswith(("🗿", "✨", "[")): prediction_text = final_prefix + prediction_text
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
-        MAX_MESSAGE_LENGTH = 4096;
-        if len(prediction_text) > MAX_MESSAGE_LENGTH: prediction_text = prediction_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        #MAX_MESSAGE_LENGTH = 4096;
+        if len(prediction_text) > MAX_TELEGRAM_MESSAGE_LENGTH: prediction_text = prediction_text[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
         await context.bot.send_message(chat_id=chat_id, text=prediction_text)
         logger.info(f"Отправлено предсказание для {user_name}.")
         # Запись для /retry не делаем для предсказаний, т.к. оно рандомное
@@ -993,8 +993,8 @@ async def get_pickup_line(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        MAX_MESSAGE_LENGTH = 4096; # Обрезка
-        if len(pickup_line_text) > MAX_MESSAGE_LENGTH: pickup_line_text = pickup_line_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        #MAX_MESSAGE_LENGTH = 4096; # Обрезка
+        if len(pickup_line_text) > MAX_TELEGRAM_MESSAGE_LENGTH: pickup_line_text = pickup_line_text[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
 
         # Отправляем подкат (НЕ как ответ, а просто в чат, упоминая цель)
         target_mention = target_user.mention_html() if target_user.username else f"<b>{target_name}</b>"
@@ -1198,8 +1198,8 @@ async def roast_user(update: Update | None, context: ContextTypes.DEFAULT_TYPE,
 
 
         final_text = f"Прожарка для {target_mention_html}:\n\n{roast_text}"
-        if len(final_text) > MAX_MESSAGE_LENGTH: # MAX_MESSAGE_LENGTH должен быть определен глобально
-            final_text = final_text[:MAX_MESSAGE_LENGTH-20] + "... (слишком длинно)"
+        if len(final_text) > MAX_TELEGRAM_MESSAGE_LENGTH: # MAX_MESSAGE_LENGTH должен быть определен глобально
+            final_text = final_text[:MAX_TELEGRAM_MESSAGE_LENGTH-20] + "... (слишком длинно)"
         sent_message = await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
         logger.info(f"Отправлен роаст для {target_name}.")
 
@@ -1289,9 +1289,9 @@ async def reply_to_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             if not admin_response_text.startswith(("🗿", "[")):
                 admin_response_text = "🗿 " + admin_response_text
             
-            MAX_MESSAGE_LENGTH_ADMIN_REPLY = 4096 # Стандартный лимит
-            if len(admin_response_text) > MAX_MESSAGE_LENGTH_ADMIN_REPLY:
-                admin_response_text = admin_response_text[:MAX_MESSAGE_LENGTH_ADMIN_REPLY - 3] + "..."
+            MAX_TELEGRAM_MESSAGE_LENGTH_ADMIN_REPLY = 4096 # Стандартный лимит
+            if len(admin_response_text) > MAX_TELEGRAM_MESSAGE_LENGTH_ADMIN_REPLY:
+                admin_response_text = admin_response_text[:MAX_TELEGRAM_MESSAGE_LENGTH_ADMIN_REPLY - 3] + "..."
 
             if thinking_msg_admin:
                 try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg_admin.message_id)
@@ -1379,9 +1379,9 @@ async def reply_to_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if not response_text_comeback.startswith(("🗿", "[")):
             response_text_comeback = "🗿 " + response_text_comeback
         
-        MAX_MESSAGE_LENGTH_COMEBACK = 4096
-        if len(response_text_comeback) > MAX_MESSAGE_LENGTH_COMEBACK:
-            response_text_comeback = response_text_comeback[:MAX_MESSAGE_LENGTH_COMEBACK - 3] + "..."
+        MAX_TELEGRAM_MESSAGE_LENGTH_COMEBACK = 4096
+        if len(response_text_comeback) > MAX_TELEGRAM_MESSAGE_LENGTH_COMEBACK:
+            response_text_comeback = response_text_comeback[:MAX_TELEGRAM_MESSAGE_LENGTH_COMEBACK - 3] + "..."
         
         await update.message.reply_text(text=response_text_comeback) # Отвечаем на сообщение пользователя
         logger.info(f"Отправлен контекстный ответ на ответ боту (обычный юзер) в чате {chat_id}")
@@ -1463,9 +1463,9 @@ async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> N
         # --->>> КОНЕЦ ГЕНЕРАЦИИ ФАКТА <<<---
 
         # Обрезаем, если надо
-        MAX_MESSAGE_LENGTH = 4096
-        if len(fact_text) > MAX_MESSAGE_LENGTH:
-            fact_text = fact_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        #MAX_MESSAGE_LENGTH = 4096
+        if len(fact_text) > MAX_TELEGRAM_MESSAGE_LENGTH:
+            fact_text = fact_text[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
 
         # --->>> Отправка и обновление БД (ВНУТРИ TRY...EXCEPT НА ОТПРАВКУ) <<<---
         try:
@@ -1762,8 +1762,8 @@ async def post_news_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         safe_comment = comment.replace('<', '<').replace('>', '>').replace('&', '&')
         message_parts.append(f"\n- <a href='{url}'>{safe_title}</a>\n  {safe_comment}")
     final_message = "\n".join(message_parts)
-    MAX_MESSAGE_LENGTH = 4096
-    if len(final_message) > MAX_MESSAGE_LENGTH: final_message = final_message[:MAX_MESSAGE_LENGTH - 3] + "..."
+    #MAX_MESSAGE_LENGTH = 4096
+    if len(final_message) > MAX_TELEGRAM_MESSAGE_LENGTH: final_message = final_message[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
 
     # Получаем список ВСЕХ активных чатов из БД
     active_chat_ids = []
@@ -1934,8 +1934,8 @@ async def praise_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_message.message_id)
         except Exception: pass
 
-        MAX_MESSAGE_LENGTH = 4096; # Обрезка
-        if len(praise_text) > MAX_MESSAGE_LENGTH: praise_text = praise_text[:MAX_MESSAGE_LENGTH - 3] + "..."
+        #MAX_MESSAGE_LENGTH = 4096; # Обрезка
+        if len(praise_text) > MAX_TELEGRAM_MESSAGE_LENGTH: praise_text = praise_text[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
 
         # Отправляем "похвалу"
         target_mention = target_user.mention_html() if target_user.username else f"<b>{target_name}</b>"
