@@ -3886,7 +3886,8 @@ async def main() -> None:
     application.add_handler(MessageHandler(filters.Regex(list_chats_pattern) & filters.TEXT & ~filters.COMMAND, list_bot_chats))
 
     application.add_handler(CommandHandler("tos_battle", start_tos_battle))
-    application.add_handler(CommandHandler("пв_баттл", start_tos_battle)) # Русский аналог
+    tos_battle_rus_pattern = r'(?i)^\s*/(?:пв_баттл|пв баттл|баттл пв)\b.*' # Начинается с / и затем команда
+    application.add_handler(MessageHandler(filters.Regex(tos_battle_rus_pattern) & filters.COMMAND, start_tos_battle))
     tos_battle_pattern = r'(?i).*\b(бот|попиздяка)\b\s+(?:пв баттл|правда или высер баттл|заруба в пв|tos battle).*'
     application.add_handler(MessageHandler(filters.Regex(tos_battle_pattern) & filters.TEXT & ~filters.COMMAND, start_tos_battle))
 
