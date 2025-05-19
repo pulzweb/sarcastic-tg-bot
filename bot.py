@@ -14,7 +14,9 @@ import hypercorn.config
 from hypercorn.asyncio import serve as hypercorn_async_serve
 import signal
 import pymongo
-from pymongo.errors import ConnectionFailure
+from pymongo.errors import ConnectionFailure, PyMongoError
+from bson.objectid import ObjectId # <<<--- ВОТ ЭТОТ ИМПОРТ НУЖЕН
+# ... остальные импорты ...
 
 # Импорты для AI.IO.NET (OpenAI библиотека)
 from openai import OpenAI, AsyncOpenAI, BadRequestError
@@ -3701,7 +3703,7 @@ async def auto_end_recruitment_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Вызываем функцию начала самой игры
     await _actually_start_the_battle_game(context, battle["_id"])
 
-async def _actually_start_the_battle_game(context: ContextTypes.DEFAULT_TYPE, battle_doc_id: pymongo.ObjectId) -> None:
+async def _actually_start_the_battle_game(context: ContextTypes.DEFAULT_TYPE, battle_doc_id: ObjectId) -> None: # Просто ObjectId
     loop = asyncio.get_running_loop()
     battle = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
     if not battle:
