@@ -21,9 +21,23 @@ from openai import OpenAI, AsyncOpenAI, BadRequestError
 import httpx
 
 # Импорты Telegram
-from telegram import Update, Bot, User
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, JobQueue
-import telegram # --->>> ВОТ ЭТА СТРОКА НУЖНА <<<---
+from telegram import ( # Сгруппируем импорты из telegram
+    Update,
+    Bot,
+    User,
+    InlineKeyboardMarkup, # <<<--- НУЖЕН ДЛЯ КНОПОК "ПРАВДА ИЛИ ВЫСЕР"
+    InlineKeyboardButton  # <<<--- НУЖЕН ДЛЯ КНОПОК "ПРАВДА ИЛИ ВЫСЕР"
+)
+from telegram.ext import ( # Сгруппируем импорты из telegram.ext
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    JobQueue, # Уже есть
+    CallbackQueryHandler # <<<--- НУЖЕН ДЛЯ ОБРАБОТКИ НАЖАТИЙ КНОПОК
+)
+import telegram # --->>> ВОТ ЭТА СТРОКА НУЖНА <<<--- (у тебя уже есть)
 
 from dotenv import load_dotenv
 
@@ -101,6 +115,10 @@ NEWS_JOB_NAME = "post_news_job"
 if not GNEWS_API_KEY:
     logger.warning("GNEWS_API_KEY не найден! Новостная функция будет отключена.")
 
+# --->>> НАСТРОЙКИ ИГРЫ "ПРАВДА ИЛИ ВЫСЕР" <<<---
+TRUTH_OR_SHIT_COOLDOWN_SECONDS = 5 * 60      # 5 минут кулдаун на запуск новой игры в чате
+TRUTH_OR_SHIT_AUTO_REVEAL_DELAY_SECONDS = 3 * 60 # Через сколько секунд автоматически раскрывать ответ (3 минуты)
+# --->>> КОНЕЦ НАСТРОЕК ИГРЫ <<<---
 
 # Проверка ключей
 if not TELEGRAM_BOT_TOKEN: raise ValueError("НЕ НАЙДЕН TELEGRAM_BOT_TOKEN!")
@@ -139,6 +157,24 @@ try:
     tits_stats_collection.create_index([("chat_id", pymongo.ASCENDING), ("user_id", pymongo.ASCENDING)], unique=True)
     tits_stats_collection.create_index([("chat_id", pymongo.ASCENDING), ("tits_size", pymongo.DESCENDING)]) # По tits_size
     logger.info("Коллекция tits_stats_by_chat готова.")
+
+# --->>> НОВАЯ КОЛЛЕКЦИЯ ДЛЯ ИГР "ПРАВДА ИЛИ ВЫСЕР" <<<---
+    active_truth_or_shit_games_collection = db['truth_or_shit_games'] # Изменил имя для ясности
+    active_truth_or_shit_games_collection.create_index([("chat_id", pymongo.ASCENDING), ("message_id_question", pymongo.ASCENDING)], unique=True) # Уникальная игра по чату и ID сообщения
+    active_truth_or_shit_games_collection.create_index([("chat_id", pymongo.ASCENDING), ("revealed", pymongo.ASCENDING)]) # Для поиска активных игр
+    # TTL индекс для автоматического удаления СТАРЫХ РАСКРЫТЫХ или ОЧЕНЬ СТАРЫХ НЕРАСКРЫТЫХ игр (например, через 3 дня)
+# Чтобы не хранить мусор вечно. Время в секундах.
+# Важно: expires_at должно быть полем типа datetime.datetime
+# Мы не будем его явно ставить, MongoDB будет использовать текущее время + expireAfterSeconds для документов без этого поля,
+# если бы мы его добавили. Но лучше использовать created_at и чистить старые игры другим механизмом,
+# либо ставить expires_at явно при раскрытии игры.
+# Для простоты, пока оставим TTL на 'created_at', но он удалит ВСЕ старые игры, даже нераскрытые.
+# Более правильно: добавить поле 'game_over_at' и TTL на него, или чистить периодически.
+# Пока сделаем TTL на created_at для автоочистки очень старых игр (например, 7 дней).
+    TRUTH_OR_SHIT_GAME_TTL_SECONDS = 7 * 24 * 60 * 60 # 7 дней
+    active_truth_or_shit_games_collection.create_index("created_at", expireAfterSeconds=TRUTH_OR_SHIT_GAME_TTL_SECONDS)
+    logger.info("Коллекция truth_or_shit_games готова.")
+# --->>> КОНЕЦ НОВОЙ КОЛЛЕКЦИИ <<<---
 
     logger.info("Коллекция user_profiles готова.")
     logger.info("Коллекции MongoDB готовы.")
@@ -2983,6 +3019,390 @@ async def generate_and_set_nickname(update: Update, context: ContextTypes.DEFAUL
             except Exception: pass
         await context.bot.send_message(chat_id=chat_id, text=f"🗿 Бля, хотел тебя обозвать как-нибудь по-новому, да мой ИИ-мозг перегрелся. Ходи пока как {user_display_name_before}.")
 
+
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ РАСКРЫТИЯ ОТВЕТА В "ПРАВДА ИЛИ ВЫСЕР" ---
+async def _reveal_truth_or_shit_answer(
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        original_question_msg_id: int,
+        triggered_by_user: User | None = None # Кто нажал кнопку "Раскрыть" (если применимо)
+    ):
+    loop = asyncio.get_running_loop()
+    logger.info(f"Запрос на раскрытие ответа для игры (msg_id: {original_question_msg_id}) в чате {chat_id}.")
+
+    game_data = await loop.run_in_executor(
+        None, lambda: active_truth_or_shit_games_collection.find_one_and_update(
+            {"chat_id": chat_id, "message_id_question": original_question_msg_id, "revealed": False},
+            {"$set": {"revealed": True}} # Сразу помечаем как раскрытое, чтобы избежать гонок состояний
+        )
+    )
+
+    if not game_data: # Либо игра не найдена, либо уже была раскрыта
+        logger.info(f"Игра (msg_id: {original_question_msg_id}) в чате {chat_id} не найдена или уже раскрыта. Ничего не делаем.")
+        # Попытаемся убрать кнопки у старого сообщения, если оно еще существует и имеет кнопки
+        try:
+            await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=original_question_msg_id, reply_markup=None)
+        except telegram.error.BadRequest as e: # "Message to edit not found" or "message can't be edited" or "message is not modified"
+            if "message is not modified" not in str(e).lower() and "message to edit not found" not in str(e).lower():
+                logger.warning(f"Ошибка при попытке убрать кнопки у старого сообщения ToS (msg_id: {original_question_msg_id}): {e}")
+        except Exception: pass # Игнорируем другие ошибки здесь
+        return
+
+    correct_answer_is_truth = game_data["is_truth"]
+    statement_text = game_data["statement"]
+    
+    result_text_human = "✅ ПРАВДА!" if correct_answer_is_truth else "❌ ВЫСЕР ЕБАНЫЙ!"
+    
+    votes_summary = "Никто даже не попытался блеснуть интеллектом и проголосовать. Стадо тупорылых баранов."
+    if game_data.get("votes"):
+        total_votes = len(game_data["votes"])
+        if total_votes > 0:
+            correct_votes_count = sum(1 for uid, vote_val in game_data["votes"].items() if vote_val == correct_answer_is_truth)
+            wrong_votes_count = total_votes - correct_votes_count
+            if total_votes == 1:
+                votes_summary = f"Единственный смельчак, который проголосовал, оказался {'непроходимым долбоебом' if correct_votes_count == 0 else 'на удивление прошаренным (или ему просто повезло)'}."
+            else:
+                votes_summary = (f"Из {total_votes} отважившихся дегенератов, {correct_votes_count} каким-то чудом угадали (или подсмотрели), "
+                                 f"а {wrong_votes_count} жидко обосрались, подтвердив свою репутацию.")
+    
+    triggered_by_text = ""
+    if triggered_by_user:
+        triggered_by_text = f"(По просьбе нетерпеливого {triggered_by_user.mention_html()})\n"
+
+
+    reveal_comment_prompt = (
+        f"Ты - Попиздяка, ведущий игры 'Правда или Высер'. Игра завершена.\n"
+        f"Утверждение было: «{statement_text}»\n"
+        f"Правильный ответ: {result_text_human}\n"
+        f"Статистика голосов (если была): {votes_summary}\n\n"
+        f"Напиши короткий (2-4 предложения), саркастичный и матерный комментарий по итогам. "
+        f"Если были голосовавшие, удели внимание тем, кто ошибся. Если не было, пройдись по пассивности аудитории. "
+        f"Начинай с `🗿 Итак, долбоебы и сочувствующие, слушайте сюда:`"
+    )
+    ai_reveal_comment = await _call_ionet_api(
+        messages=[{"role": "user", "content": reveal_comment_prompt}],
+        model_id=IONET_TEXT_MODEL_ID, max_tokens=200, temperature=0.8
+    ) or "🗿 Ну вот и все. Кто угадал - тот не совсем дебил. Остальные - просто дебилы, смиритесь."
+    if not ai_reveal_comment.startswith("🗿"): ai_reveal_comment = "🗿 " + ai_reveal_comment
+
+    final_reveal_message = (
+        f"<b>Игра 'Правда или Высер' ОКОНЧЕНА!</b>\n{triggered_by_text}\n"
+        f"Утверждение Попиздяки было:\n«<i>{statement_text}</i>»\n\n"
+        f"И это был... <b>{result_text_human}</b>\n\n"
+        f"{ai_reveal_comment}"
+    )
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=original_question_msg_id,
+            text=final_reveal_message, parse_mode='HTML', reply_markup=None
+        )
+    except telegram.error.BadRequest as e_edit:
+        if "message is not modified" in str(e_edit).lower():
+            logger.info(f"Сообщение ToS (msg_id: {original_question_msg_id}) не было изменено при раскрытии, возможно, уже содержит тот же текст. Убираю кнопки.")
+            try: await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=original_question_msg_id, reply_markup=None)
+            except Exception: pass
+        else:
+            logger.warning(f"Не удалось отредактировать сообщение ToS (msg_id: {original_question_msg_id}) для раскрытия ответа: {e_edit}. Отправляю новым.")
+            await context.bot.send_message(chat_id=chat_id, text=final_reveal_message, parse_mode='HTML')
+            try: await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=original_question_msg_id, reply_markup=None)
+            except Exception: pass
+    except Exception as e_unhandled:
+        logger.error(f"Непредвиденная ошибка при редактировании сообщения ToS: {e_unhandled}")
+        await context.bot.send_message(chat_id=chat_id, text=final_reveal_message, parse_mode='HTML') # Запасной вариант
+
+
+    logger.info(f"Игра (msg_id: {original_question_msg_id}) в чате {chat_id} успешно раскрыта. Правильный ответ: {correct_answer_is_truth}")
+
+    # Обновляем время последней игры в chat_activity для кулдауна
+    await loop.run_in_executor(
+        None, lambda: chat_activity_collection.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"last_tos_game_end_time": datetime.datetime.now(datetime.timezone.utc)}}, # Используем время окончания
+            upsert=True
+        )
+    )
+# --- КОНЕЦ ВСПОМОГАТЕЛЬНОЙ ФУНКЦИИ ---
+
+# --- JOB ДЛЯ АВТОМАТИЧЕСКОГО РАСКРЫТИЯ "ПРАВДА ИЛИ ВЫСЕР" ---
+async def auto_reveal_truth_or_shit_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    job = context.job
+    if not job or not job.chat_id or not job.data or 'message_id_question' not in job.data:
+        logger.error(f"Ошибка в job 'auto_reveal_truth_or_shit_job': нет необходимых данных. Job data: {job.data if job else 'No job'}")
+        return
+    
+    chat_id = job.chat_id
+    message_id_question = job.data['message_id_question']
+    
+    logger.info(f"Сработал авто-ревил для игры (msg_id: {message_id_question}) в чате {chat_id}.")
+    await _reveal_truth_or_shit_answer(context, chat_id, message_id_question, triggered_by_user=None)
+# --- КОНЕЦ JOB ДЛЯ АВТОМАТИЧЕСКОГО РАСКРЫТИЯ ---
+
+# --- КОМАНДА ЗАПУСКА ИГРЫ "ПРАВДА ИЛИ ВЫСЕР" ---
+async def start_truth_or_shit_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.chat or not update.message.from_user:
+        return
+
+    chat_id = update.message.chat.id
+    user = update.message.from_user
+    loop = asyncio.get_running_loop()
+
+    # --->>> ПРОВЕРКА ТЕХРАБОТ <<<---
+    maintenance_active = await is_maintenance_mode(loop)
+    if maintenance_active and (user.id != ADMIN_USER_ID or update.message.chat.type != 'private'):
+        await update.message.reply_text("🔧 Техработы, не до игр разума сегодня.")
+        return
+    # --->>> КОНЕЦ ПРОВЕРКИ ТЕХРАБОТ <<<---
+
+    # --->>> ПРОВЕРКА КУЛДАУНА ДЛЯ ЧАТА <<<---
+    chat_activity = await loop.run_in_executor(
+        None, lambda: chat_activity_collection.find_one({"chat_id": chat_id})
+    )
+    now_utc_start = datetime.datetime.now(datetime.timezone.utc)
+    # Используем время окончания предыдущей игры для кулдауна
+    if chat_activity and "last_tos_game_end_time" in chat_activity:
+        last_game_end_time = chat_activity["last_tos_game_end_time"]
+        if last_game_end_time.tzinfo is None: # Убедимся, что есть таймзона
+            last_game_end_time = last_game_end_time.replace(tzinfo=datetime.timezone.utc)
+        
+        if (now_utc_start - last_game_end_time).total_seconds() < TRUTH_OR_SHIT_COOLDOWN_SECONDS:
+            remaining = TRUTH_OR_SHIT_COOLDOWN_SECONDS - (now_utc_start - last_game_end_time).total_seconds()
+            await update.message.reply_text(f"🗿 Э, не так часто! Новая игра 'Правда или Высер' будет доступна через {int(remaining // 60)} мин {int(remaining % 60)} сек.")
+            return
+    # --->>> КОНЕЦ ПРОВЕРКИ КУЛДАУНА <<<---
+
+    # --- Проверка, нет ли уже активной (нераскрытой) игры ---
+    active_game = await loop.run_in_executor(
+        None, lambda: active_truth_or_shit_games_collection.find_one({"chat_id": chat_id, "revealed": False})
+    )
+    if active_game:
+        # Пересоздаем кнопки для существующей игры
+        keyboard_active = [
+            [
+                InlineKeyboardButton("👍 Это Правда!", callback_data=f"tos_vote_true_{active_game['message_id_question']}"),
+                InlineKeyboardButton("👎 Это Высер!", callback_data=f"tos_vote_false_{active_game['message_id_question']}")
+            ],
+            [InlineKeyboardButton("🤔 Раскрыть ответ!", callback_data=f"tos_reveal_{active_game['message_id_question']}")]
+        ]
+        reply_markup_active = InlineKeyboardMarkup(keyboard_active)
+        try:
+            await context.bot.send_message(
+                chat_id,
+                text=f"🗿 Э, тормози, в этом чате уже идет игра 'Правда или Высер'! Вот она, голосуй или раскрывай:\n\n«{active_game['statement']}»",
+                reply_markup=reply_markup_active,
+                parse_mode='HTML'
+            )
+        except Exception as e_send_active:
+             logger.error(f"Не удалось переотправить активную игру ToS: {e_send_active}")
+             await update.message.reply_text(f"🗿 В этом чате уже идет игра, но я не смог ее переслать. Пиздец.")
+        return
+
+    thinking_msg = await update.message.reply_text("🗿 Ща я вам загадку от Попиздяки придумаю, готовьте свои куриные мозги...")
+
+    should_be_truth = random.choice([True, False])
+
+    if should_be_truth:
+        statement_prompt = (
+            "Ты - Попиздяка, кладезь странных, но реальных фактов. Придумай ОДИН МАЛОИЗВЕСТНЫЙ, но РЕАЛЬНЫЙ и ПРОВЕРЯЕМЫЙ факт. "
+            "Он должен быть сформулирован как утверждение, коротко (1-2 предложения) и без указания, что это правда. "
+            "Не используй фразы типа 'Попиздяка утверждает'. Просто сам факт."
+            "\nПример: Медуза Turritopsis Dohrnii потенциально бессмертна."
+        )
+    else:
+        statement_prompt = (
+            "Ты - Попиздяка, генератор абсурдного бреда. Придумай ОДИН АБСОЛЮТНО ЛЖИВЫЙ, но НАУКООБРАЗНЫЙ и ПРАВДОПОДОБНО ЗВУЧАЩИЙ высер. "
+            "Он должен быть сформулирован как утверждение, коротко (1-2 предложения) и без указания, что это ложь. "
+            "Не используй фразы типа 'Попиздяка утверждает'. Просто сам высер."
+            "\nПример: Если чихнуть с открытыми глазами, они вылетят из орбит со скоростью пробки от шампанского."
+        )
+    
+    generated_statement_text = await _call_ionet_api(
+        messages=[{"role": "user", "content": statement_prompt}],
+        model_id=IONET_TEXT_MODEL_ID, max_tokens=100, temperature=0.85 # Температуру можно подкрутить
+    )
+
+    if thinking_msg:
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg.message_id)
+        except Exception: pass
+
+    if not generated_statement_text or generated_statement_text.startswith("[") or len(generated_statement_text.strip()) < 10: # Проверка на минимальную длину
+        await update.message.reply_text("🗿 Мой ИИ-мозг сегодня выдал какую-то хуйню вместо загадки. Попробуйте позже или пните админа.")
+        return
+    
+    final_statement_for_game = "🗿 Попиздяка утверждает: " + generated_statement_text.strip()
+
+    question_message = await context.bot.send_message(
+        chat_id=chat_id, 
+        text=f"<b>Правда или Высер от Попиздяки?</b>\n\n{final_statement_for_game}", 
+        parse_mode='HTML'
+    )
+    msg_id_for_callback = question_message.message_id
+
+    keyboard = [
+        [
+            InlineKeyboardButton("👍 Это Правда!", callback_data=f"tos_vote_true_{msg_id_for_callback}"),
+            InlineKeyboardButton("👎 Это Высер!", callback_data=f"tos_vote_false_{msg_id_for_callback}")
+        ],
+        [InlineKeyboardButton("🤔 Раскрыть ответ!", callback_data=f"tos_reveal_{msg_id_for_callback}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id_for_callback, reply_markup=reply_markup)
+
+    game_data_to_save = {
+        "chat_id": chat_id, "message_id_question": msg_id_for_callback,
+        "statement": final_statement_for_game, "is_truth": should_be_truth,
+        "created_at": now_utc_start, "votes": {}, "revealed": False
+    }
+    await loop.run_in_executor(None, lambda: active_truth_or_shit_games_collection.insert_one(game_data_to_save))
+    logger.info(f"Игра 'Правда или Высер' запущена в чате {chat_id}. MsgID: {msg_id_for_callback}, Утверждение: '{final_statement_for_game[:50]}...', Ответ: {should_be_truth}")
+
+    # Планируем авто-раскрытие
+    job_name = f"tos_auto_reveal_{chat_id}_{msg_id_for_callback}"
+    # Удаляем старый job с таким же именем, если он вдруг остался (маловероятно, но для чистоты)
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for old_job in current_jobs:
+        old_job.schedule_removal()
+        logger.info(f"Удален старый job для ToS: {job_name}")
+
+    context.job_queue.run_once(
+        auto_reveal_truth_or_shit_job, 
+        TRUTH_OR_SHIT_AUTO_REVEAL_DELAY_SECONDS,
+        chat_id=chat_id, 
+        data={'message_id_question': msg_id_for_callback, 'source_user_id': user.id}, # source_user_id на всякий случай
+        name=job_name
+    )
+    logger.info(f"Запланирован авто-ревил для игры {job_name} через {TRUTH_OR_SHIT_AUTO_REVEAL_DELAY_SECONDS} сек.")
+
+# --- КОНЕЦ КОМАНДЫ ЗАПУСКА ИГРЫ ---
+
+# --- ОБРАБОТЧИК КНОПОК ДЛЯ "ПРАВДА ИЛИ ВЫСЕР" ---
+async def truth_or_shit_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data or not query.message: # Добавил проверку query.message
+        logger.warning("truth_or_shit_button_callback получен без query или query.data или query.message")
+        if query: await query.answer("Ошибка: нет данных для обработки.") # Отвечаем на коллбэк, если он есть
+        return
+        
+    await query.answer() # Обязательно ответить на колбэк, можно с текстом alert'а
+
+    callback_data_parts = query.data.split("_") # tos_vote_true_MSGID или tos_reveal_MSGID
+    
+    if len(callback_data_parts) < 3:
+        logger.error(f"Некорректный формат callback_data для ToS: {query.data}")
+        try: await query.edit_message_text(text="Что-то пошло не так с этой кнопкой... Формат нарушен.")
+        except Exception: pass
+        return
+
+    action_prefix = callback_data_parts[0] # "tos"
+    action_type = callback_data_parts[1]   # "vote" или "reveal"
+    
+    try:
+        original_question_msg_id = int(callback_data_parts[-1]) # Последний элемент - ID
+    except (IndexError, ValueError):
+        logger.error(f"Не удалось извлечь message_id из callback_data ToS: {query.data}")
+        try: await query.edit_message_text(text="Ошибка: не могу найти ID исходной игры.")
+        except Exception: pass
+        return
+
+    chat_id = query.message.chat_id
+    user_who_clicked = query.from_user # Это объект telegram.User
+    loop = asyncio.get_running_loop()
+
+    # Найти активную игру (еще не раскрытую)
+    game_data = await loop.run_in_executor(
+        None, lambda: active_truth_or_shit_games_collection.find_one(
+            {"chat_id": chat_id, "message_id_question": original_question_msg_id, "revealed": False}
+        )
+    )
+
+    if not game_data:
+        already_revealed_game = await loop.run_in_executor( # Проверим, может она уже раскрыта
+             None, lambda: active_truth_or_shit_games_collection.find_one(
+                {"chat_id": chat_id, "message_id_question": original_question_msg_id, "revealed": True}
+            )
+        )
+        if already_revealed_game:
+             text_for_old_game = (f"<b>Игра 'Правда или Высер' ОКОНЧЕНА!</b>\n\n"
+                                 f"Утверждение Попиздяки было:\n«<i>{already_revealed_game['statement']}</i>»\n\n"
+                                 f"И это был... <b>{'✅ ПРАВДА!' if already_revealed_game['is_truth'] else '❌ ВЫСЕР ЕБАНЫЙ!'}</b>\n\n"
+                                 "🗿 Поезд ушел, лошара! Следи за игрой внимательнее в следующий раз.")
+             try:
+                await query.edit_message_text(text=text_for_old_game, parse_mode='HTML', reply_markup=None)
+             except Exception as e_edit_old:
+                logger.info(f"Не удалось отредактировать старую игру ToS (уже раскрыта): {e_edit_old}")
+
+        else: # Игры вообще нет
+            try: await query.edit_message_text(text="🗿 Эта игра уже закончилась, протухла или ее спиздили инопланетяне.")
+            except Exception: pass
+        # В любом случае убираем кнопки, если они еще есть у сообщения, на которое нажали
+        try: await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=query.message.message_id, reply_markup=None)
+        except Exception: pass
+        return
+
+    # --- Обработка ГОЛОСОВАНИЯ ---
+    if action_type == "vote":
+        if len(callback_data_parts) < 4: # tos_vote_CHOICE_MSGID
+             logger.error(f"Некорректный формат callback_data для голосования ToS: {query.data}")
+             try: await query.edit_message_text(text="Ошибка кнопки голосования.")
+             except Exception: pass
+             return
+
+        vote_choice_str = callback_data_parts[2] # "true" или "false"
+        user_vote_as_bool = (vote_choice_str == "true")
+
+        # Запись голоса
+        # Мы не можем напрямую обновить поле в словаре votes без $set и указания ключа user_id
+        # Поэтому используем $set с "точечной нотацией"
+        update_result = await loop.run_in_executor(
+            None, lambda: active_truth_or_shit_games_collection.update_one(
+                {"_id": game_data["_id"]}, # Находим по уникальному _id документа игры
+                {"$set": {f"votes.{user_who_clicked.id}": {"name": user_who_clicked.first_name, "vote": user_vote_as_bool} }}
+            )
+        )
+        
+        if update_result.modified_count > 0:
+            logger.info(f"Пользователь {user_who_clicked.first_name} ({user_who_clicked.id}) в чате {chat_id} проголосовал '{user_vote_as_bool}' за игру msg_id {original_question_msg_id}")
+            # Обновляем текст сообщения, чтобы показать, что голос принят
+            # (можно просто ответить на callback без изменения текста сообщения, если не хотим спамить редактированием)
+            # await query.answer(f"Твой голос '{('Правда' if user_vote_as_bool else 'Высер')}' принят!")
+
+            # Опционально: обновить сообщение, добавив туда имя проголосовавшего
+            current_statement = game_data['statement']
+            new_text_after_vote = (f"<b>Правда или Высер от Попиздяки?</b>\n\n{current_statement}\n\n"
+                                   f"----------------\n"
+                                   f"🗿 {user_who_clicked.mention_html()} считает, что это <b>{('Правда' if user_vote_as_bool else 'Высер')}</b>. Ждем остальных дебилов или жми 'Раскрыть'.")
+            try:
+                await query.edit_message_text(text=new_text_after_vote, parse_mode='HTML', reply_markup=query.message.reply_markup)
+            except telegram.error.BadRequest as e_vote_edit: # Message is not modified
+                 if "message is not modified" not in str(e_vote_edit).lower():
+                     logger.warning(f"Ошибка редактирования сообщения ToS после голоса: {e_vote_edit}")
+                 else: # Если не изменилось (например, юзер переголосовал так же) - просто отвечаем на коллбэк
+                     await query.answer(f"Твой голос '{('Правда' if user_vote_as_bool else 'Высер')}' уже был таким.")
+            except Exception as e_unhandled_vote_edit:
+                 logger.error(f"Непредвиденная ошибка редактирования сообщения ToS после голоса: {e_unhandled_vote_edit}")
+
+
+        else: # Голос не изменился или ошибка обновления
+            logger.warning(f"Не удалось обновить голос для {user_who_clicked.id} в игре {original_question_msg_id}")
+            await query.answer("Что-то пошло не так с твоим голосом или ты уже так голосовал.")
+
+    # --- Обработка РАСКРЫТИЯ ОТВЕТА ---
+    elif action_type == "reveal":
+        logger.info(f"Пользователь {user_who_clicked.first_name} ({user_who_clicked.id}) нажал 'Раскрыть ответ' для игры msg_id {original_question_msg_id}.")
+        
+        # Удаляем запланированный job авто-раскрытия, так как раскрываем вручную
+        job_name_to_remove = f"tos_auto_reveal_{chat_id}_{original_question_msg_id}"
+        current_jobs_reveal = context.job_queue.get_jobs_by_name(job_name_to_remove)
+        if current_jobs_reveal:
+            for old_job_reveal in current_jobs_reveal:
+                old_job_reveal.schedule_removal()
+            logger.info(f"Удален запланированный job авто-ревила: {job_name_to_remove}")
+        else:
+            logger.info(f"Не найден job для удаления при ручном ревиле: {job_name_to_remove} (возможно, уже сработал или ошибка).")
+
+        await _reveal_truth_or_shit_answer(context, chat_id, original_question_msg_id, triggered_by_user=user_who_clicked)
+# --- КОНЕЦ ОБРАБОТЧИКА КНОПОК ---
+
 # Дальше идет async def main() или другие функции...
 
 async def main() -> None:
@@ -3105,6 +3525,15 @@ async def main() -> None:
 
     list_chats_pattern = r'(?i).*\b(бот|попиздяка)\b\s+(?:список чатов|где ты есть|в каких чатах).*'
     application.add_handler(MessageHandler(filters.Regex(list_chats_pattern) & filters.TEXT & ~filters.COMMAND, list_bot_chats))
+
+# --- ИГРА "ПРАВДА ИЛИ ВЫСЕР" ---
+    application.add_handler(CommandHandler("truth_or_shit", start_truth_or_shit_game))
+    application.add_handler(CommandHandler("tos", start_truth_or_shit_game)) # Короткий вариант
+    tos_pattern = r'(?i).*\b(бот|попиздяка)\b\s+(?:правда или высер|загадка|факт или бред|сыграем в правда высер|пв|давай игру).*'
+    application.add_handler(MessageHandler(filters.Regex(tos_pattern) & filters.TEXT & ~filters.COMMAND, start_truth_or_shit_game))
+# Обработчик для кнопок игры (должен идти до общих обработчиков MessageHandler, если они есть)
+    application.add_handler(CallbackQueryHandler(truth_or_shit_button_callback, pattern=r'^tos_.*'))
+# --- КОНЕЦ ИГРЫ "ПРАВДА ИЛИ ВЫСЕР" ---    
 
     # --->>> ДОБАВЛЯЕМ РУССКИЕ АНАЛОГИ ДЛЯ ТЕХРАБОТ <<<---
     # Regex для ВКЛючения техработ
