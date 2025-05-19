@@ -88,6 +88,7 @@ MONGO_DB_URL = os.getenv("MONGO_DB_URL")
 MAX_MESSAGES_TO_ANALYZE = 200 # Оптимальное значение
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
 if ADMIN_USER_ID == 0: logger.warning("ADMIN_USER_ID не задан!")
+MAX_TELEGRAM_MESSAGE_LENGTH = 4096 # Стандартный лимит Telegram
 
 # --- НАСТРОЙКИ НОВОСТЕЙ (GNEWS) ---
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY")
@@ -333,6 +334,7 @@ async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- ПОЛНАЯ ФУНКЦИЯ analyze_chat (С УЛУЧШЕННЫМ УДАЛЕНИЕМ <think>) ---
 async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE, direct_chat_id: int | None = None, direct_user: User | None = None) -> None:
+    MAX_MESSAGE_LENGTH = 4096 # Стандартный лимит Telegram
      # --->>> НАЧАЛО НОВОЙ ПРОВЕРКИ ТЕХРАБОТ <<<---
 # Проверяем наличие update и message - без них проверка невозможна
     if not update or not update.message or not update.message.from_user or not update.message.chat:
@@ -459,8 +461,8 @@ async def analyze_chat(update: Update | None, context: ContextTypes.DEFAULT_TYPE
         except Exception: pass
 
         # Страховочная обрезка и отправка
-        MAX_MESSAGE_LENGTH = 4096;
-        if len(sarcastic_summary) > MAX_MESSAGE_LENGTH: sarcastic_summary = sarcastic_summary[:MAX_MESSAGE_LENGTH - 3] + "..."
+        #MAX_MESSAGE_LENGTH = 4096;
+        if len(sarcastic_summary) > MAX_TELEGRAM_MESSAGE_LENGTH: sarcastic_summary = sarcastic_summary[:MAX_TELEGRAM_MESSAGE_LENGTH - 3] + "..."
         sent_message = await context.bot.send_message(chat_id=chat_id, text=sarcastic_summary)
         logger.info(f"Отправил результат анализа ai.io.net '{sarcastic_summary[:50]}...'")
 
