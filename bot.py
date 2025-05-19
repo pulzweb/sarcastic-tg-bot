@@ -3541,298 +3541,296 @@ async def start_tos_battle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data or not query.message:
-        logger.warning("tos_battle_button_callback получен без query или query.data или query.message")
-        if query: await query.answer("Ошибка: нет данных для обработки колбэка.")
+        logger.warning("tos_battle_button_callback: получен неполный CallbackQuery.")
+        if query: await query.answer("Ошибка: неполные данные для обработки.", show_alert=True)
         return
             
-    await query.answer() # Всегда отвечаем на callback query
+    await query.answer() # Отвечаем на callback query, чтобы убрать "часики" у кнопки
 
     callback_data_full = query.data
     parts = callback_data_full.split("_") # e.g., "tosbattle_join_GAMEID" or "tosbattle_ans_GAMEID_QINDEX_CHOICE"
 
     if not (parts and parts[0] == "tosbattle" and len(parts) >= 2):
-        logger.warning(f"Некорректный префикс или длина callback_data для tos_battle: {callback_data_full}")
-        try: await query.edit_message_text("Ошибка: Неверный формат данных кнопки.")
-        except Exception: pass
+        logger.warning(f"tos_battle_button_callback: Некорректный префикс или длина callback_data: {callback_data_full}")
+        try: await query.edit_message_text("Ошибка: Неверный формат данных кнопки баттла.")
+        except Exception: pass # Если сообщение уже изменено/удалено
         return
 
     action = parts[1]
-    # game_id (message_id сообщения о наборе) может быть не у всех кнопок этапа набора,
-    # но он должен быть у кнопок этапа ответов на вопросы и у кнопок хоста.
-    # Для join без game_id мы будем искать активную игру в статусе recruiting.
-    game_id_from_cb = None
-    if action in ["extend", "start"] and len(parts) > 2: # tosbattle_extend_GAMEID
-        try: game_id_from_cb = int(parts[2])
-        except ValueError: logger.error(f"Ошибка извлечения game_id из CB для хоста: {callback_data_full}"); return
-    elif action == "ans" and len(parts) > 3: # tosbattle_ans_GAMEID_QINDEX_CHOICE
-        try: game_id_from_cb = int(parts[2])
-        except ValueError: logger.error(f"Ошибка извлечения game_id из CB для ответа: {callback_data_full}"); return
-    elif action == "join" and len(parts) > 2: # tosbattle_join_GAMEID (если вдруг передали)
-        try: game_id_from_cb = int(parts[2])
-        except ValueError: logger.error(f"Ошибка извлечения game_id из CB для join: {callback_data_full}"); return
-
-
     chat_id = query.message.chat.id
-    user_who_clicked = query.from_user
+    user_who_clicked = query.from_user # telegram.User объект
     loop = asyncio.get_running_loop()
 
-    # --- Ищем игру ---
-    # Если это этап набора или команды хоста, ищем по game_id (если есть) или просто активную в наборе.
-    # Если это ответ на вопрос, ищем по game_id и статусу "playing".
-    battle_search_filter = {"chat_id": chat_id}
-    if game_id_from_cb:
-        battle_search_filter["game_id"] = game_id_from_cb
+    # Извлечение game_id (message_id сообщения о наборе) из callback_data
+    game_id_from_cb_str = None
+    if action in ["extend", "start"] and len(parts) >= 3: # tosbattle_ACTION_GAMEID
+        game_id_from_cb_str = parts[2]
+    elif action == "ans" and len(parts) >= 4: # tosbattle_ans_GAMEID_QINDEX_CHOICE
+        game_id_from_cb_str = parts[2]
+    elif action == "prize" and len(parts) >= 5: # tosbattle_prize_TYPE_GAMEID_WINNERID
+        game_id_from_cb_str = parts[3]
+    elif action == "join" and len(parts) >= 3: # tosbattle_join_GAMEID (необязательный, но если есть)
+        game_id_from_cb_str = parts[2]
     
+    game_id_int = None
+    if game_id_from_cb_str:
+        try:
+            game_id_int = int(game_id_from_cb_str)
+        except ValueError:
+            logger.error(f"tos_battle_button_callback: Не удалось преобразовать game_id '{game_id_from_cb_str}' в int. CB: {callback_data_full}")
+            # Сообщаем об ошибке, если можем отредактировать исходное сообщение
+            try: await query.edit_message_text("Ошибка: Неверный ID игры в данных кнопки.")
+            except Exception: pass
+            return
+
+    # --- Поиск игры в MongoDB ---
+    battle_search_filter = {"chat_id": chat_id}
+    if game_id_int:
+        battle_search_filter["game_id"] = game_id_int
+    
+    # Определяем ожидаемый статус игры в зависимости от действия
+    expected_status = None
     if action in ["join", "extend", "start"]:
-        battle_search_filter["status"] = "recruiting"
+        expected_status = "recruiting"
     elif action == "ans":
-        battle_search_filter["status"] = "playing"
-    else: # Неизвестное действие
-        logger.warning(f"Неизвестное действие '{action}' в tos_battle_button_callback. CB: {callback_data_full}")
-        return
+        expected_status = "playing"
+    elif action == "prize": # Для приза игра должна быть "finished"
+        expected_status = "finished" 
+        # Дополнительно можно проверить, что приз еще не выдан, если бы мы хранили это
+        # battle_search_filter["prize_claimed_by"] = {"$exists": False}
+
+    if expected_status:
+        battle_search_filter["status"] = expected_status
+    
+    # Если это join без game_id, ищем любую игру в наборе
+    if action == "join" and not game_id_int:
+        battle_search_filter.pop("game_id", None) # Убираем game_id из фильтра
+        battle_search_filter["status"] = "recruiting"
 
     battle = await loop.run_in_executor(
         None, lambda: tos_battles_collection.find_one(battle_search_filter)
     )
 
-    # Если для join без game_id не нашли, а game_id_from_cb был None, то значит игра не найдена
-    if not battle and action == "join" and not game_id_from_cb:
-         active_recruiting_battle = await loop.run_in_executor( # Попробуем найти любую активную в наборе
-            None, lambda: tos_battles_collection.find_one({"chat_id": chat_id, "status": "recruiting"})
-         )
-         if active_recruiting_battle:
-             battle = active_recruiting_battle
-             game_id_from_cb = battle["game_id"] # Присваиваем game_id найденной игры
-         else:
-            try: await query.edit_message_text("🗿 Набор на этот Баттл уже завершен, отменен или я потерял его следы. Попробуй запустить новый.")
-            except Exception: pass
-            try: await context.bot.edit_message_reply_markup(chat_id, message_id=query.message.message_id, reply_markup=None)
-            except Exception: pass
-            return
-    elif not battle: # Если игра не найдена по другим критериям
-        try: await query.edit_message_text("🗿 Эта игра уже завершилась, отменена или произошла ошибка. Запусти новую, если не ссышь.")
-        except Exception: pass
-        try: await context.bot.edit_message_reply_markup(chat_id, message_id=query.message.message_id, reply_markup=None)
-        except Exception: pass
+    if not battle:
+        logger.info(f"tos_battle_button_callback: Актуальная игра для действия '{action}' (game_id: {game_id_int}) в чате {chat_id} не найдена или ее статус не соответствует ({expected_status}).")
+        not_found_message = "🗿 Этот Баттл уже завершен, отменен, или ты пытаешься нажать кнопку не той игры. Запусти новый, если кишка не тонка!"
+        if action == "join" and not game_id_int:
+            not_found_message = "🗿 Активных наборов на Баттл в этом чате сейчас нет. Стань первым, запусти свой!"
+        try:
+            # Пытаемся отредактировать сообщение, на которое нажали (если оно еще существует)
+            await query.edit_message_text(not_found_message)
+            await context.bot.edit_message_reply_markup(chat_id, message_id=query.message.message_id, reply_markup=None)
+        except Exception: pass # Игнорируем ошибки, если сообщение уже изменено/удалено
         return
     
-    # Убедимся, что game_id_from_cb теперь точно есть, если мы нашли battle
-    if not game_id_from_cb and battle:
-        game_id_from_cb = battle["game_id"]
+    # Если мы нашли игру по общему фильтру (для join без game_id), то game_id_int теперь равен battle["game_id"]
+    if not game_id_int and battle: # Это условие важно для кнопки "join" без game_id
+        game_id_int = battle["game_id"]
+    
+    battle_doc_id = battle["_id"] # ObjectId документа для точных обновлений
 
+    # --- Обработка действий НАБОРА ("recruiting" status) ---
+    if battle["status"] == "recruiting":
+        if action == "join":
+            if str(user_who_clicked.id) in battle.get("participants", {}):
+                await context.bot.send_message(chat_id, f"🗿 {user_who_clicked.mention_html()}, ты уже вписался, угомонись!", parse_mode='HTML', reply_to_message_id=game_id_int)
+                return
+            if len(battle.get("participants", {})) >= TOS_BATTLE_MAX_PARTICIPANTS:
+                await context.bot.send_message(chat_id, f"🗿 {user_who_clicked.mention_html()}, мест нет, все забито долбоебами ({TOS_BATTLE_MAX_PARTICIPANTS} макс).", parse_mode='HTML', reply_to_message_id=game_id_int)
+                return
 
-    # --- Обработка действий НАБОРА ---
-    if action == "join":
-        if battle.get("status") != "recruiting":
-            await context.bot.send_message(chat_id, f"🗿 {user_who_clicked.mention_html()}, набор уже закрыт, поздно пить боржоми!", parse_mode='HTML', reply_to_message_id=game_id_from_cb)
-            return
-
-        if str(user_who_clicked.id) in battle.get("participants", {}):
-            await context.bot.send_message(chat_id, f"🗿 {user_who_clicked.mention_html()}, ты уже вписался в эту кровавую баню, хватит тыкать!", parse_mode='HTML', reply_to_message_id=game_id_from_cb)
-            return
-        
-        if len(battle.get("participants", {})) >= TOS_BATTLE_MAX_PARTICIPANTS:
-            await context.bot.send_message(chat_id, f"🗿 {user_who_clicked.mention_html()}, извини, все места для долбоебов уже заняты ({TOS_BATTLE_MAX_PARTICIPANTS} макс). В следующий раз будешь шустрее.", parse_mode='HTML', reply_to_message_id=game_id_from_cb)
-            return
-
-        user_name_to_store = user_who_clicked.first_name or user_who_clicked.username or f"Аноним-{user_who_clicked.id}"
-        new_participant_data = {"name": user_name_to_store, "score": 0, "answers": [None] * TOS_BATTLE_NUM_QUESTIONS} # Инициализируем None для ответов
-        
-        update_result_join = await loop.run_in_executor(
-            None, lambda: tos_battles_collection.update_one(
-                {"_id": battle["_id"]},
-                {"$set": {f"participants.{user_who_clicked.id}": new_participant_data}}
-            )
-        )
-        if update_result_join.modified_count > 0:
-            logger.info(f"Пользователь {user_who_clicked.id} ({user_name_to_store}) присоединился к баттлу game_id: {game_id_from_cb} в чате {chat_id}")
-            # Отправляем подтверждение в чат
-            await context.bot.send_message(chat_id, f"✅ {user_who_clicked.mention_html()} теперь в деле! Готовься позориться или блистать тупостью!", parse_mode='HTML', reply_to_message_id=game_id_from_cb)
+            user_name_to_store = user_who_clicked.first_name or user_who_clicked.username or f"Анон-{user_who_clicked.id}"
+            new_participant_data = {"name": user_name_to_store, "score": 0, "answers": [None] * TOS_BATTLE_NUM_QUESTIONS}
             
-            # Опционально: обновить сообщение о наборе, добавив имя нового участника или их количество
-            # Это может быть сложно, так как нужно пересобирать текст сообщения и кнопки.
-            # Проще просто отправлять отдельное сообщение о присоединении.
-        else:
-            await context.bot.send_message(chat_id, f"⚠️ {user_who_clicked.mention_html()}, не удалось тебя записать. Возможно, ты уже там или Попиздяка глючит.", parse_mode='HTML', reply_to_message_id=game_id_from_cb)
-
-    elif action == "extend" and user_who_clicked.id == battle.get("host_id"):
-        if battle.get("status") != "recruiting":
-            await context.bot.send_message(chat_id, "Набор уже закрыт, продлевать нечего.", reply_to_message_id=game_id_from_cb)
-            return
-
-        new_recruitment_ends_at = battle["recruitment_ends_at"] + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS)
-        update_result_extend = await loop.run_in_executor(
-            None, lambda: tos_battles_collection.update_one(
-                {"_id": battle["_id"]},
-                {"$set": {"recruitment_ends_at": new_recruitment_ends_at}}
-            )
-        )
-        if update_result_extend.modified_count > 0:
-            logger.info(f"Хост {user_who_clicked.id} продлил набор для баттла {game_id_from_cb} до {new_recruitment_ends_at}")
-            
-            # Перепланировка job'а
-            job_name_recruit_end_ext = f"tosbattle_recruit_end_{chat_id}_{game_id_from_cb}"
-            current_jobs_ext = context.job_queue.get_jobs_by_name(job_name_recruit_end_ext)
-            for old_job_ext in current_jobs_ext: old_job_ext.schedule_removal()
-            
-            time_until_new_end = (new_recruitment_ends_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
-            if time_until_new_end > 0:
-                context.job_queue.run_once(
-                    auto_end_recruitment_job, time_until_new_end,
-                    chat_id=chat_id, data={'game_id': game_id_from_cb, 'host_id': battle["host_id"]}, name=job_name_recruit_end_ext
+            update_join = await loop.run_in_executor(
+                None, lambda: tos_battles_collection.update_one(
+                    {"_id": battle_doc_id}, {"$set": {f"participants.{user_who_clicked.id}": new_participant_data}}
                 )
-                logger.info(f"Job окончания набора для {game_id_from_cb} перепланирован на {new_recruitment_ends_at}")
-                await context.bot.send_message(chat_id, f"⏳ Хост {user_who_clicked.mention_html()} продлил набор на Баттл! Новое время окончания: <b>{new_recruitment_ends_at.strftime('%H:%M:%S UTC')}</b>", parse_mode='HTML', reply_to_message_id=game_id_from_cb)
-            else: # Если после продления время уже прошло
-                await context.bot.send_message(chat_id, "Хост пытался продлить, но время уже вышло. Начинаем или отменяем...", reply_to_message_id=game_id_from_cb)
-                await auto_end_recruitment_job(context) # Вызываем логику завершения набора немедленно
-        else:
-             await context.bot.send_message(chat_id, "Не удалось продлить набор (возможно, уже продлевали или ошибка).", reply_to_message_id=game_id_from_cb)
+            )
+            if update_join.modified_count > 0:
+                logger.info(f"User {user_who_clicked.id} присоединился к баттлу {game_id_int}")
+                await context.bot.send_message(chat_id, f"✅ {user_who_clicked.mention_html()} записан! Готовь очко!", parse_mode='HTML', reply_to_message_id=game_id_int)
+            else:
+                await context.bot.send_message(chat_id, f"⚠️ {user_who_clicked.mention_html()}, ошибка записи. Попробуй еще.", parse_mode='HTML', reply_to_message_id=game_id_int)
 
-    elif action == "start" and user_who_clicked.id == battle.get("host_id"):
-        if battle.get("status") != "recruiting":
-            await context.bot.send_message(chat_id, "Этот баттл уже начался или завершен, нельзя начать заново.", reply_to_message_id=game_id_from_cb)
-            return
+        elif action == "extend" and user_who_clicked.id == battle.get("host_id"):
+            new_ends_at = battle["recruitment_ends_at"] + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS)
+            update_extend = await loop.run_in_executor(None, lambda: tos_battles_collection.update_one({"_id": battle_doc_id}, {"$set": {"recruitment_ends_at": new_ends_at}}))
+            
+            if update_extend.modified_count > 0:
+                logger.info(f"Хост {user_who_clicked.id} продлил набор для баттла {game_id_int} до {new_ends_at}")
+                job_name_ext = f"tosbattle_recruit_end_{chat_id}_{game_id_int}"
+                for old_job in context.job_queue.get_jobs_by_name(job_name_ext): old_job.schedule_removal()
+                
+                time_left_ext = (new_ends_at - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                if time_left_ext > 0:
+                    context.job_queue.run_once(auto_end_recruitment_job, time_left_ext, chat_id=chat_id, data={'game_id': game_id_int, 'host_id': battle["host_id"]}, name=job_name_ext)
+                    await context.bot.send_message(chat_id, f"⏳ Хост {user_who_clicked.mention_html()} продлил набор! Новое время: <b>{new_ends_at.strftime('%H:%M:%S UTC')}</b>", parse_mode='HTML', reply_to_message_id=game_id_int)
+                else:
+                    await context.bot.send_message(chat_id, "Хост пытался продлить, но время уже вышло.", reply_to_message_id=game_id_int)
+                    await auto_end_recruitment_job(context) # Запускаем завершение набора
+            else:
+                await context.bot.send_message(chat_id, "Не удалось продлить набор.", reply_to_message_id=game_id_int)
 
-        current_participants_count = len(battle.get("participants", {}))
-        if current_participants_count < TOS_BATTLE_MIN_PARTICIPANTS:
-            await context.bot.send_message(chat_id, f"🚫 {user_who_clicked.mention_html()}, маловато будет! Нужно хотя бы {TOS_BATTLE_MIN_PARTICIPANTS} участника для старта, а у нас пока {current_participants_count}. Пусть еще записываются или отменяй.", parse_mode='HTML', reply_to_message_id=game_id_from_cb)
-            return
+        elif action == "start" and user_who_clicked.id == battle.get("host_id"):
+            if len(battle.get("participants", {})) < TOS_BATTLE_MIN_PARTICIPANTS:
+                await context.bot.send_message(chat_id, f"🚫 Нужно хотя бы {TOS_BATTLE_MIN_PARTICIPANTS} участника, у нас {len(battle.get('participants', {}))}.", parse_mode='HTML', reply_to_message_id=game_id_int)
+                return
+            
+            logger.info(f"Хост {user_who_clicked.id} запускает баттл {game_id_int} досрочно.")
+            job_name_start = f"tosbattle_recruit_end_{chat_id}_{game_id_int}"
+            for old_job_s in context.job_queue.get_jobs_by_name(job_name_start): old_job_s.schedule_removal()
+            await _actually_start_the_battle_game(context, battle_doc_id)
         
-        logger.info(f"Хост {user_who_clicked.id} запускает баттл {game_id_from_cb} досрочно.")
-        # Удаляем job авто-окончания набора
-        job_name_to_remove_start = f"tosbattle_recruit_end_{chat_id}_{game_id_from_cb}"
-        current_jobs_start = context.job_queue.get_jobs_by_name(job_name_to_remove_start)
-        for old_job_start in current_jobs_start:
-            old_job_start.schedule_removal()
-            logger.info(f"Удален job авто-окончания набора: {job_name_to_remove_start} (старт по кнопке хоста)")
-        
-        await _actually_start_the_battle_game(context, battle["_id"])
+        else: # Если действие не join/extend/start, но статус recruiting (например, кто-то нажал на кнопку ответа на вопрос на этапе набора)
+            if user_who_clicked.id != battle.get("host_id") and action in ["extend", "start"]:
+                 await query.answer("Только хост игры может это сделать, не лезь!", show_alert=True)
+            elif action == "ans":
+                 await query.answer("Игра еще не началась, долбоеб!", show_alert=True)
+            # Для других непредусмотренных действий на этапе набора можно ничего не делать или query.answer()
 
-    # --- Обработка ОТВЕТОВ НА ВОПРОСЫ ---
-    elif action == "ans":
-        if battle.get("status") != "playing":
-            await query.answer("Этап ответов на вопросы еще не начался или уже закончился.", show_alert=True)
-            return
-        
-        # callback_data: tosbattle_ans_GAMEID_QINDEX_CHOICE
-        if len(parts) < 5: 
-            logger.error(f"Некорректный callback_data для ответа на вопрос баттла: {query.data}")
+    # --- Обработка ОТВЕТОВ НА ВОПРОСЫ ("playing" status) ---
+    elif battle["status"] == "playing" and action == "ans":
+        if len(parts) < 5: # tosbattle_ans_GAMEID_QINDEX_CHOICE
+            logger.error(f"Некорректный CB для ответа на вопрос: {query.data}")
             await query.answer("Ошибка формата кнопки ответа.", show_alert=True)
             return
         
         try:
-            # game_id_from_ans_cb уже должен быть определен ранее из parts[2]
-            question_index_from_ans_cb = int(parts[3])
-            answer_choice_str = parts[4] # "true" или "false"
-        except (ValueError, IndexError) as e_parse_ans:
-            logger.error(f"Ошибка парсинга callback_data ответа на вопрос: {query.data}, {e_parse_ans}")
+            question_index_cb = int(parts[3])
+            answer_choice_cb_str = parts[4]
+        except (ValueError, IndexError) as e_parse_ans_cb:
+            logger.error(f"Ошибка парсинга CB ответа на вопрос: {query.data}, {e_parse_ans_cb}")
             await query.answer("Ошибка данных кнопки.", show_alert=True)
             return
 
-        user_answer_bool = (answer_choice_str == "true")
+        user_answer_as_bool = (answer_choice_cb_str == "true")
 
-        # Проверяем, является ли кликнувший участником баттла
         if str(user_who_clicked.id) not in battle.get("participants", {}):
-            await query.answer("Ты не участвуешь в этом баттле, левый хуй!", show_alert=True)
+            await query.answer("Ты не в игре, пошел нахуй!", show_alert=True)
             return
 
-        current_q_idx_db = battle.get("current_question_index", -1)
-        if current_q_idx_db != question_index_from_ans_cb:
-            await query.answer("Это не текущий вопрос или ты проебал все полимеры!", show_alert=True)
+        current_q_idx_from_db = battle.get("current_question_index", -1)
+        if current_q_idx_from_db != question_index_cb:
+            await query.answer("Это не текущий вопрос или ты опоздал!", show_alert=True)
             return
         
-        questions_list = battle.get("questions", [])
-        if question_index_from_ans_cb >= len(questions_list) or \
-           questions_list[question_index_from_ans_cb].get("revealed_to_users"):
-            await query.answer("Этот вопрос уже был раскрыт или что-то пошло не так с его номером.", show_alert=True)
+        questions_list_db = battle.get("questions", [])
+        if question_index_cb >= len(questions_list_db) or questions_list_db[question_index_cb].get("revealed_to_users"):
+            await query.answer("Вопрос уже раскрыт или ошибка номера.", show_alert=True)
             return
 
-        user_answers_for_this_q = questions_list[question_index_from_ans_cb].get("user_answers_to_this_q", {})
-        if str(user_who_clicked.id) in user_answers_for_this_q:
-            await query.answer("Ты уже отвечал на этот раунд, хитрожопый! Не пытайся наебать Попиздяку.", show_alert=True)
+        user_answers_this_q_db = questions_list_db[question_index_cb].get("user_answers_to_this_q", {})
+        if str(user_who_clicked.id) in user_answers_this_q_db:
+            await query.answer("Ты уже отвечал на этот раунд!", show_alert=True)
             return
 
-        user_name_for_ans_record = user_who_clicked.first_name or user_who_clicked.username or f"Анон-{user_who_clicked.id}"
-        answer_record = {"name": user_name_for_ans_record, "answer_bool": user_answer_bool, "answered_at": datetime.datetime.now(datetime.timezone.utc)}
+        user_name_ans_rec = user_who_clicked.first_name or user_who_clicked.username or f"Анон-{user_who_clicked.id}"
+        answer_record_to_db = {"name": user_name_ans_rec, "answer_bool": user_answer_as_bool, "answered_at": datetime.datetime.now(datetime.timezone.utc)}
         
-        update_result_ans_q = await loop.run_in_executor(
+        update_ans_q = await loop.run_in_executor(
             None, lambda: tos_battles_collection.update_one(
-                {"_id": battle["_id"]},
-                {"$set": {f"questions.{question_index_from_ans_cb}.user_answers_to_this_q.{user_who_clicked.id}": answer_record}}
+                {"_id": battle_doc_id},
+                {"$set": {f"questions.{question_index_cb}.user_answers_to_this_q.{user_who_clicked.id}": answer_record_to_db}}
             )
         )
 
-        if update_result_ans_q.modified_count > 0:
-            logger.info(f"Пользователь {user_who_clicked.id} ответил '{user_answer_bool}' на вопрос {question_index_from_ans_cb} баттла {game_id_from_cb}")
-            await query.answer(f"Твой ответ ('{('Правда' if user_answer_bool else 'Высер')}') на раунд {question_index_from_ans_cb + 1} принят! Жди результатов, ссыкло.", show_alert=False) # show_alert=False чтобы не мешать другим
+        if update_ans_q.modified_count > 0:
+            logger.info(f"User {user_who_clicked.id} ответил '{user_answer_as_bool}' на Q{question_index_cb} баттла {game_id_int}")
+            await query.answer(f"Твой ответ ('{('Правда' if user_answer_as_bool else 'Высер')}') на раунд {question_index_cb + 1} принят! Жди.", show_alert=False)
             
-            # Проверка, все ли УЧАСТНИКИ ответили, и если да, раскрыть ответ досрочно
-            # (это более сложная логика, пока можно опустить для простоты, job все равно раскроет)
-            # current_participants_ids = set(str(pid) for pid in battle.get("participants", {}).keys())
-            # updated_answers_for_this_q = (await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle["_id"]}))).get("questions")[question_index_from_ans_cb].get("user_answers_to_this_q",{})
-            # answered_ids_now = set(updated_answers_for_this_q.keys())
-            
-            # if current_participants_ids and answered_ids_now.issuperset(current_participants_ids):
-            #     logger.info(f"Все участники ({len(current_participants_ids)}) ответили на вопрос {question_index_from_ans_cb} баттла {game_id_from_cb}. Раскрываем досрочно.")
-            #     job_name_q_reveal_early = f"tosbattle_q_reveal_{chat_id}_{game_id_from_cb}_{question_index_from_ans_cb}"
-            #     current_jobs_q_early = context.job_queue.get_jobs_by_name(job_name_q_reveal_early)
-            #     for old_job_q_early in current_jobs_q_early: old_job_q_early.schedule_removal()
-            #     await _process_battle_question_reveal(context, battle["_id"], question_index_from_ans_cb, auto_triggered=False)
+            # Опциональная проверка, все ли ответили (для досрочного раскрытия)
+            # battle_reloaded = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
+            # if battle_reloaded:
+            #    all_participants_ids_set = set(str(pid) for pid in battle_reloaded.get("participants", {}).keys())
+            #    answered_ids_this_q_set = set(battle_reloaded["questions"][question_index_cb].get("user_answers_to_this_q", {}).keys())
+            #    if all_participants_ids_set and answered_ids_this_q_set.issuperset(all_participants_ids_set):
+            #        logger.info(f"Все участники ответили на Q{question_index_cb} баттла {game_id_int}. Раскрываем досрочно.")
+            #        job_name_q_reveal_early_cb = f"tosbattle_q_reveal_{chat_id}_{game_id_int}_{question_index_cb}"
+            #        for j in context.job_queue.get_jobs_by_name(job_name_q_reveal_early_cb): j.schedule_removal()
+            #        await _process_battle_question_reveal(context, battle_doc_id, question_index_cb, auto_triggered=False)
         else:
-            await query.answer("Не удалось записать твой ответ или ты уже отвечал. Попробуй еще раз или смирись.", show_alert=True)
-    
-    else: # Если действие не join, extend, start, ans
-        logger.warning(f"Неизвестное или не относящееся к текущему состоянию действие в tos_battle_button_callback: {action} для game_id {game_id_from_cb}")
+            await query.answer("Не удалось записать ответ. Попробуй снова.", show_alert=True)
 
-async def auto_end_recruitment_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    if not job or not job.chat_id or not job.data or 'game_id' not in job.data:
-        logger.error(f"Ошибка в job 'auto_end_recruitment_job': нет необходимых данных. Job: {job}")
-        return
+    # --- Обработка ВЫБОРА ПРИЗА ("finished" status) ---
+    elif battle["status"] == "finished" and action == "prize":
+        if len(parts) < 5: # tosbattle_prize_TYPE_GAMEID_WINNERID
+            logger.error(f"Некорректный CB для выбора приза: {query.data}")
+            await query.answer("Ошибка формата кнопки приза.", show_alert=True)
+            return
         
-    chat_id = job.chat_id
-    game_id = job.data['game_id']
-    # host_id = job.data.get('host_id') # Если нужно для логов
-    loop = asyncio.get_running_loop()
-
-    logger.info(f"Сработал job: автоматическое окончание набора для баттла game_id: {game_id} в чате {chat_id}.")
-
-    # Ищем игру, которая все еще в статусе набора
-    # Используем find_one_and_update, чтобы атомарно проверить и изменить статус, если время вышло
-    # Это предотвратит гонку состояний, если хост нажмет "Начать" почти одновременно с job'ом
-    
-    now_utc_job = datetime.datetime.now(datetime.timezone.utc)
-    battle = await loop.run_in_executor(
-        None, lambda: tos_battles_collection.find_one(
-            {"chat_id": chat_id, "game_id": game_id, "status": "recruiting", "recruitment_ends_at": {"$lte": now_utc_job}}
-        )
-    )
-
-    if not battle:
-        logger.info(f"Job: Баттл {game_id} в чате {chat_id} не найден в статусе 'recruiting' или время набора еще не истекло/продлено. Ничего не делаем.")
-        return
-
-    current_participants_count = len(battle.get("participants", {}))
-    if current_participants_count < TOS_BATTLE_MIN_PARTICIPANTS:
-        logger.info(f"Job: Недостаточно участников ({current_participants_count}/{TOS_BATTLE_MIN_PARTICIPANTS}) для старта баттла {game_id}. Отменяем.")
-        await loop.run_in_executor(
-            None, lambda: tos_battles_collection.update_one(
-                {"_id": battle["_id"]},
-                {"$set": {"status": "cancelled_not_enough_players"}}
-            )
-        )
-        # Убираем кнопки у сообщения о наборе
+        prize_type_choice = parts[2] # "penis" или "tits"
         try:
-            await context.bot.edit_message_reply_markup(chat_id, message_id=battle["message_id_recruitment"], reply_markup=None)
-            await context.bot.send_message(chat_id, f"🚫 Набор на Баттл 'Правда или Высер' (ID: {game_id}) завершен! К сожалению, набралось меньше {TOS_BATTLE_MIN_PARTICIPANTS} долбоебов. Игра отменяется. Попробуйте в другой раз, когда соберется толпа побольше.", reply_to_message_id=battle["message_id_recruitment"])
-        except Exception as e_cancel:
-             logger.error(f"Job: Ошибка при отмене баттла {game_id}: {e_cancel}")
-        return
+            # game_id_from_prize_cb = int(parts[3]) # Уже есть как game_id_int
+            winner_id_from_prize_cb = int(parts[4])
+        except (ValueError, IndexError) as e_parse_prize_cb:
+            logger.error(f"Ошибка парсинга CB приза: {query.data}, {e_parse_prize_cb}")
+            await query.answer("Ошибка данных кнопки приза.", show_alert=True)
+            return
 
-    logger.info(f"Job: Время набора для баттла {game_id} истекло. Начинаем игру.")
-    # Вызываем функцию начала самой игры
-    await _actually_start_the_battle_game(context, battle["_id"])
+        if user_who_clicked.id != winner_id_from_prize_cb:
+            await query.answer("Это не твой приз, не лезь, сука!", show_alert=True)
+            return
+        
+        # Проверка, не выдан ли приз (добавить поле "prize_awarded_to_winner_id" в battle_doc)
+        if battle.get("prize_awarded_to"):
+            await query.answer("Приз уже был выбран и выдан. Хватит попрошайничать!", show_alert=True)
+            try: await query.edit_message_reply_markup(reply_markup=None) # Убрать кнопки у сообщения с выбором приза
+            except Exception: pass
+            return
+
+        try:
+            await query.edit_message_reply_markup(reply_markup=None) # Убираем кнопки выбора приза
+        except Exception as e_edit_prize_kb_cb:
+            logger.warning(f"Не удалось убрать кнопки выбора приза: {e_edit_prize_kb_cb}")
+
+        user_profile_prize_cb = await get_user_profile_data(user_who_clicked)
+        winner_display_name_prize = user_profile_prize_cb.get("display_name", user_who_clicked.first_name or "Победитель")
+        prize_applied_msg = ""
+
+        if prize_type_choice == "penis":
+            penis_stat_prize_cb = await loop.run_in_executor(None, lambda: penis_stats_collection.find_one({"user_id": winner_id_from_prize_cb, "chat_id": chat_id}))
+            current_penis_size_cb = penis_stat_prize_cb.get("penis_size", 0) if penis_stat_prize_cb else 0
+            new_penis_size_cb = current_penis_size_cb + TOS_BATTLE_PENIS_REWARD_CM
+            
+            await loop.run_in_executor(None, lambda: penis_stats_collection.update_one(
+                {"user_id": winner_id_from_prize_cb, "chat_id": chat_id},
+                {"$set": {"penis_size": new_penis_size_cb, "user_display_name": winner_display_name_prize},
+                 "$setOnInsert": {"user_id": winner_id_from_prize_cb, "chat_id": chat_id, "last_penis_growth": datetime.datetime.fromtimestamp(0,datetime.timezone.utc), "current_penis_title":None, "warned_during_cooldown": False}},
+                upsert=True
+            ))
+            prize_applied_msg = f"🍆 Писюн <b>{winner_display_name_prize}</b> ВНЕЗАПНО вырос на {TOS_BATTLE_PENIS_REWARD_CM}см и теперь составляет <b>{new_penis_size_cb}см</b>! Вот это подгон от Попиздяки!"
+            logger.info(f"Приз (писюн) выдан {winner_display_name_prize} ({winner_id_from_prize_cb}) за баттл {game_id_int}.")
+            # TODO: Проверка на новое писечное звание
+
+        elif prize_type_choice == "tits":
+            tits_stat_prize_cb = await loop.run_in_executor(None, lambda: tits_stats_collection.find_one({"user_id": winner_id_from_prize_cb, "chat_id": chat_id}))
+            current_tits_size_cb = float(tits_stat_prize_cb.get("tits_size", 0.0)) if tits_stat_prize_cb else 0.0
+            new_tits_size_cb = round(current_tits_size_cb + TOS_BATTLE_TITS_REWARD_SIZE, 1)
+
+            await loop.run_in_executor(None, lambda: tits_stats_collection.update_one(
+                {"user_id": winner_id_from_prize_cb, "chat_id": chat_id},
+                {"$set": {"tits_size": new_tits_size_cb, "user_display_name": winner_display_name_prize},
+                 "$setOnInsert": {"user_id": winner_id_from_prize_cb, "chat_id": chat_id, "last_tits_growth": datetime.datetime.fromtimestamp(0,datetime.timezone.utc), "current_tits_title":None, "warned_during_cooldown": False}},
+                upsert=True
+            ))
+            prize_applied_msg = f"🍈 Сиськи <b>{winner_display_name_prize}</b> подросли на {TOS_BATTLE_TITS_REWARD_SIZE} размера и стали <b>{new_tits_size_cb:.1f}-го</b>! Поздравляем с апгрейдом, сисястая богиня (или нет)!"
+            logger.info(f"Приз (сиськи) выдан {winner_display_name_prize} ({winner_id_from_prize_cb}) за баттл {game_id_int}.")
+            # TODO: Проверка на новое сисечное звание
+        
+        if prize_applied_msg:
+            await context.bot.send_message(chat_id, text=f"🎉 <b>Награда нашла героя!</b> 🎉\n{prize_applied_msg}", parse_mode='HTML')
+            # Помечаем, что приз выдан
+            await loop.run_in_executor(None, lambda: tos_battles_collection.update_one(
+                {"_id": battle_doc_id}, {"$set": {"prize_awarded_to": winner_id_from_prize_cb, "prize_type": prize_type_choice}}
+            ))
+        else:
+            await query.answer("Неизвестный тип приза.", show_alert=True)
+            
+    else: # Если действие не join/extend/start/ans/prize ИЛИ статус игры не соответствует действию
+        logger.warning(f"Неизвестное действие '{action}' или несоответствующий статус '{battle.get('status')}' в tos_battle_button_callback. CB: {query.data}")
+        # Можно просто ничего не делать или ответить на query.answer()
+        # await query.answer("Это действие сейчас недоступно.", show_alert=True)
 
 async def _actually_start_the_battle_game(context: ContextTypes.DEFAULT_TYPE, battle_doc_id: ObjectId) -> None:
     loop = asyncio.get_running_loop()
@@ -4052,29 +4050,42 @@ async def auto_reveal_battle_question_job(context: ContextTypes.DEFAULT_TYPE) ->
 
 async def _process_battle_question_reveal(context: ContextTypes.DEFAULT_TYPE, battle_doc_id: ObjectId, question_index: int, auto_triggered: bool = False):
     loop = asyncio.get_running_loop()
+    # Получаем САМУЮ АКТУАЛЬНУЮ версию баттла из БД
     battle = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
 
     if not battle or battle.get("status") != "playing":
-        logger.info(f"_process_battle_question_reveal: Баттл {battle_doc_id} не найден или не в статусе 'playing'.")
+        logger.info(f"_process_battle_question_reveal: Баттл {battle_doc_id} не найден или не в статусе 'playing'. Текущий статус: {battle.get('status')}")
+        # Если статус уже 'finished', возможно, игра завершилась другим путем (например, ошибкой)
+        if battle and battle.get("status") == "finished":
+             # Убираем кнопки у сообщения с вопросом, если оно еще есть и имеет их
+            if battle.get("message_id_current_question"):
+                try:
+                    await context.bot.edit_message_reply_markup(battle["chat_id"], message_id=battle["message_id_current_question"], reply_markup=None)
+                except Exception: pass
         return
 
-    if question_index >= len(battle.get("questions", [])):
-        logger.error(f"Неверный question_index {question_index} для баттла {battle_doc_id}")
+    questions_list = battle.get("questions", [])
+    if question_index >= len(questions_list):
+        logger.error(f"Неверный question_index {question_index} для баттла {battle_doc_id} при раскрытии.")
+        await _end_tos_battle(context, battle, error_occurred=True, error_message="Ошибка индекса вопроса") # Завершаем с ошибкой
         return
 
-    # Проверяем, не был ли этот вопрос уже раскрыт (на случай гонки состояний)
-    if battle["questions"][question_index].get("revealed_to_users"):
-        logger.info(f"Вопрос {question_index} баттла {battle_doc_id} уже был раскрыт.")
-        return
+    # Проверяем, не был ли этот вопрос уже раскрыт
+    if questions_list[question_index].get("revealed_to_users"):
+        logger.info(f"Вопрос {question_index} баттла {battle_doc_id} уже был раскрыт (проверка в _process_battle_question_reveal).")
+        return # Ничего не делаем, если уже раскрыт
 
     chat_id = battle["chat_id"]
-    game_id = battle["game_id"]
+    game_id = battle["game_id"] # message_id_recruitment
     
-    logger.info(f"ЗАГЛУШКА: Раскрытие ответа на вопрос {question_index + 1} для баттла {game_id} в чате {chat_id}.")
-    statement_data = battle["questions"][question_index]
-    is_correct_truth = statement_data["is_truth"]
+    logger.info(f"Раскрытие ответа на вопрос {question_index + 1} для баттла {game_id} в чате {chat_id}. Auto-triggered: {auto_triggered}")
     
-    # 1. Пометить вопрос как раскрытый
+    statement_data = questions_list[question_index]
+    correct_answer_is_truth = statement_data["is_truth"]
+    statement_text = statement_data["statement"]
+    user_answers_for_this_q = statement_data.get("user_answers_to_this_q", {})
+
+    # 1. Пометить вопрос как раскрытый в БД
     await loop.run_in_executor(
         None, lambda: tos_battles_collection.update_one(
             {"_id": battle_doc_id},
@@ -4082,25 +4093,84 @@ async def _process_battle_question_reveal(context: ContextTypes.DEFAULT_TYPE, ba
         )
     )
     
-    # 2. Убрать кнопки у сообщения с вопросом
-    if battle.get("message_id_current_question"):
+    # 2. Убрать кнопки у сообщения с вопросом (если оно было)
+    message_id_of_this_question = battle.get("message_id_current_question")
+    if message_id_of_this_question:
         try:
-            await context.bot.edit_message_reply_markup(chat_id, message_id=battle["message_id_current_question"], reply_markup=None)
+            await context.bot.edit_message_text( # Редактируем текст, чтобы показать, что время вышло
+                chat_id=chat_id,
+                message_id=message_id_of_this_question,
+                text=f"<b>Раунд {question_index + 1} - ВРЕМЯ ВЫШЛО!</b>\n\n{statement_text}\n\n<i>Сейчас Попиздяка объявит вердикт...</i>",
+                parse_mode='HTML',
+                reply_markup=None # Убираем кнопки
+            )
         except Exception as e_edit_q:
-            logger.warning(f"Не удалось убрать кнопки у вопроса {question_index} баттла {game_id}: {e_edit_q}")
+            logger.warning(f"Не удалось отредактировать/убрать кнопки у вопроса {question_index} баттла {game_id}: {e_edit_q}")
 
-    # 3. Объявить правильный ответ (пока без подсчета очков)
-    result_text_q = "✅ ПРАВДА!" if is_correct_truth else "❌ ВЫСЕР ЕБАНЫЙ!"
-    await context.bot.send_message(
-        chat_id,
-        f"⏳ Время вышло или все проголосовали за Раунд {question_index + 1}!\n"
-        f"Утверждение было: «<i>{statement_data['statement']}</i>»\n\n"
-        f"И это был... <b>{result_text_q}</b>\n\n"
-        f"ЗАГЛУШКА: Здесь будет подсчет очков и комментарий Попиздяки.",
-        parse_mode='HTML'
-    )
+    # 3. Подсчет очков за этот раунд и обновление общего счета участников
+    updated_participants_data = battle.get("participants", {})
+    round_results_log = [] # Для логов и, возможно, для промпта ИИ
+
+    for user_id_str, participant_info in updated_participants_data.items():
+        user_id_int = int(user_id_str) # Ключи в MongoDB словарях часто строки
+        user_answer_record = user_answers_for_this_q.get(str(user_id_int)) # И здесь тоже ищем по строке
+
+        if user_answer_record:
+            user_answered_correctly = (user_answer_record["answer_bool"] == correct_answer_is_truth)
+            if user_answered_correctly:
+                participant_info["score"] = participant_info.get("score", 0) + 1
+                round_results_log.append(f"{participant_info.get('name', 'Анон')} угадал(а)")
+            else:
+                round_results_log.append(f"{participant_info.get('name', 'Анон')} обосрался(лась)")
+            # Записываем сам факт ответа (правильно/неправильно) в массив ответов участника
+            if "answers" not in participant_info or not isinstance(participant_info["answers"], list) or len(participant_info["answers"]) != TOS_BATTLE_NUM_QUESTIONS:
+                participant_info["answers"] = [None] * TOS_BATTLE_NUM_QUESTIONS # Инициализируем, если нужно
+            participant_info["answers"][question_index] = user_answered_correctly # True если угадал, False если нет
+        else:
+            round_results_log.append(f"{participant_info.get('name', 'Анон')} проебал(а) момент и не ответил(а)")
+            # Также записываем None или специальное значение для неответивших
+            if "answers" not in participant_info or not isinstance(participant_info["answers"], list) or len(participant_info["answers"]) != TOS_BATTLE_NUM_QUESTIONS:
+                participant_info["answers"] = [None] * TOS_BATTLE_NUM_QUESTIONS
+            participant_info["answers"][question_index] = "no_answer" # Или None
+
+    # Обновляем данные участников (счета и массив ответов) в БД
+    if updated_participants_data: # Если есть участники
+        await loop.run_in_executor(
+            None, lambda: tos_battles_collection.update_one(
+                {"_id": battle_doc_id},
+                {"$set": {"participants": updated_participants_data}}
+            )
+        )
     
-    # 4. Перейти к следующему вопросу или завершить игру
+    # 4. Объявить правильный ответ и комментарий Попиздяки
+    result_text_q_human = "✅ ЭТО БЫЛА ПРАВДА!" if correct_answer_is_truth else "❌ КОНЕЧНО ЖЕ, ЭТО ВЫСЕР ЕБАНЫЙ!"
+    
+    # Промпт для ИИ-комментария к раунду
+    round_comment_prompt = (
+        f"Ты - Попиздяка, ведущий интеллектуальной битвы 'Правда или Высер'. Только что закончился раунд.\n"
+        f"Утверждение было: «{statement_text}»\n"
+        f"Правильный ответ: {result_text_q_human}\n"
+        f"Результаты игроков в этом раунде: {'; '.join(round_results_log) if round_results_log else 'Никто не играл или не ответил.'}\n\n"
+        f"Напиши короткий (2-3 предложения), саркастичный и матерный комментарий к итогам ЭТОГО РАУНДА. "
+        f"Особенно пройдись по тем, кто ошибся или не ответил. Похвали (в своем стиле) угадавших. "
+        f"Начинай с `🗿 По итогам раунда:`"
+    )
+    ai_round_comment = await _call_ionet_api(
+        messages=[{"role": "user", "content": round_comment_prompt}],
+        model_id=IONET_TEXT_MODEL_ID, max_tokens=180, temperature=0.8
+    ) or "🗿 Ну что, кто-то угадал, кто-то обосрался. Обычное дело в этом цирке."
+    if not ai_round_comment.startswith("🗿"): ai_round_comment = "🗿 " + ai_round_comment
+
+    round_reveal_message = (
+        f"<b>Итоги Раунда {question_index + 1}!</b>\n\n"
+        f"Утверждение было: «<i>{statement_text}</i>»\n"
+        f"Правильный вердикт Попиздяки: <b>{result_text_q_human}</b>\n\n"
+        f"{ai_round_comment}"
+    )
+    await context.bot.send_message(chat_id, text=round_reveal_message, parse_mode='HTML')
+    await asyncio.sleep(1.0) # Пауза перед следующим вопросом или итогами
+
+    # 5. Перейти к следующему вопросу или завершить игру
     next_question_index = question_index + 1
     if next_question_index < TOS_BATTLE_NUM_QUESTIONS:
         await loop.run_in_executor(
@@ -4109,55 +4179,248 @@ async def _process_battle_question_reveal(context: ContextTypes.DEFAULT_TYPE, ba
                 {"$set": {"current_question_index": next_question_index}}
             )
         )
-        # Получаем обновленные данные баттла перед передачей
-        battle_updated_for_next_q = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
-        if battle_updated_for_next_q:
-            await _ask_next_tos_battle_question(context, battle_updated_for_next_q)
+        # Получаем обновленные данные баттла (с обновленными очками и новым current_question_index)
+        battle_for_next_q = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
+        if battle_for_next_q:
+            await _ask_next_tos_battle_question(context, battle_for_next_q)
         else:
-            logger.error(f"Не удалось получить обновленный баттл {battle_doc_id} для следующего вопроса.")
-            await context.bot.send_message(chat_id, "🗿 Пиздец, я запутался в вопросах. Игра окончена досрочно из-за моей тупости.")
-            await _end_tos_battle(context, battle, error_occurred=True) # Завершаем с ошибкой
+            logger.error(f"Не удалось получить обновленный баттл {battle_doc_id} для вопроса {next_question_index}.")
+            await context.bot.send_message(chat_id, "🗿 Пиздец, я потерял нить игры после этого раунда. Придется закончить.")
+            # Передаем battle, который у нас есть, но он может быть не до конца обновлен
+            await _end_tos_battle(context, battle, error_occurred=True, error_message="Потеря данных баттла при переходе к след. вопросу")
     else:
-        logger.info(f"Все {TOS_BATTLE_NUM_QUESTIONS} вопросов баттла {game_id} заданы. Завершаем игру.")
-        await _end_tos_battle(context, battle) # Передаем battle, который у нас уже есть
+        logger.info(f"Все {TOS_BATTLE_NUM_QUESTIONS} вопросов баттла {game_id} заданы и раскрыты. Завершаем игру.")
+        # Передаем battle (который содержит обновленные очки после последнего раунда)
+        await _end_tos_battle(context, battle)
 
-async def _end_tos_battle(context: ContextTypes.DEFAULT_TYPE, battle_data: dict, error_occurred: bool = False) -> None:
+async def _end_tos_battle(context: ContextTypes.DEFAULT_TYPE, battle_data: dict, 
+                          error_occurred: bool = False, error_message: str = "") -> None:
     loop = asyncio.get_running_loop()
     chat_id = battle_data["chat_id"]
-    game_id = battle_data["game_id"]
+    game_id = battle_data["game_id"] # message_id_recruitment
     battle_doc_id = battle_data["_id"]
 
-    logger.info(f"ЗАГЛУШКА: Завершение баттла {game_id} в чате {chat_id}. Ошибка: {error_occurred}")
+    logger.info(f"Завершение баттла {game_id} в чате {chat_id}. Ошибка во время игры: {error_occurred} ('{error_message}')")
 
-    # Обновляем статус игры на "finished"
-    now_for_final_finish = datetime.datetime.now(datetime.timezone.utc)
+    now_for_final_finish_end = datetime.datetime.now(datetime.timezone.utc)
     await loop.run_in_executor(
         None, lambda: tos_battles_collection.update_one(
             {"_id": battle_doc_id},
-            {"$set": {"status": "finished", "finished_at": now_for_final_finish}}
+            {"$set": {"status": "finished", "finished_at": now_for_final_finish_end, "prizes_awarded_info": {}}}, # Добавим поле для информации о выданных призах
+            upsert=False 
         )
     )
     
-    # Обновляем время окончания баттла в chat_activity_collection для кулдауна
     await loop.run_in_executor(
         None, lambda: chat_activity_collection.update_one(
             {"chat_id": chat_id},
-            {"$set": {"last_tos_battle_end_time": now_for_final_finish}},
+            {"$set": {"last_tos_battle_end_time": now_for_final_finish_end}},
             upsert=True
         )
     )
+    logger.info(f"Баттл {game_id} завершен (статус обновлен). Кулдаун для чата обновлен.")
 
     if error_occurred:
-        message_text = f"🏁 <b>Баттл 'Правда или Высер' (ID: {game_id}) ПРЕРВАН из-за технической шоколадки у Попиздяки!</b> 🏁\n\n🗿 Извиняйте, долбоебы, но сегодня без победителей и призов. Можете пойти нахуй."
+        message_text_final_err = (f"🏁 <b>Баттл 'Правда или Высер' (ID: {game_id}) ПРЕРВАН из-за технической шоколадки у Попиздяки!</b> 🏁\n\n"
+                                  f"Причина: {error_message or 'Неизвестный пиздец'}\n\n"
+                                  f"🗿 Извиняйте, долбоебы, но сегодня без победителей и призов. Можете пойти нахуй.")
+        await context.bot.send_message(chat_id, text=message_text_final_err, parse_mode='HTML', reply_to_message_id=game_id)
+        return
+
+    participants_final = battle_data.get("participants", {})
+    if not participants_final:
+        await context.bot.send_message(chat_id, "🏁 Баттл завершен, но никто не участвовал. Какие же вы скучные.", reply_to_message_id=game_id)
+        return
+
+    sorted_participants = sorted(participants_final.items(), key=lambda item: item[1].get("score", 0), reverse=True)
+
+    results_table_lines = ["<b>🏆 Итоговая таблица лидеров (или долбоебов):</b>"]
+    winners = []
+    max_score = 0
+    if sorted_participants:
+        max_score = sorted_participants[0][1].get("score", 0)
+
+    if max_score <= 0 : 
+        results_table_lines.append("\nНикто не набрал положительных очков. Позорище!")
     else:
-        message_text = (
-            f"🏁 <b>Баттл 'Правда или Высер' (ID: {game_id}) ОКОНЧЕН!</b> 🏁\n\n"
-            f"🗿 Попиздяка утомился и пока не умеет считать очки и награждать победителей. Так что считайте, что победила дружба (нет, победила моя лень).\n"
-            f"Спасибо за участие, или идите нахуй, если не участвовали."
-        )
+        for i, (user_id_str, p_data) in enumerate(sorted_participants):
+            name = p_data.get("name", f"Анон-{user_id_str}")
+            score = p_data.get("score", 0)
+            medal = ""
+            if score == max_score : medal = "🥇 " 
+            elif i == 1 and score > 0: medal = "🥈 " # Добавил score > 0 для медалей
+            elif i == 2 and score > 0: medal = "🥉 "
+            else: medal = f"{i+1}. " if score > 0 else f"{i+1}. (дно) " # Уточнение для тех, кто с нулем или меньше
+            results_table_lines.append(f"{medal}{name}: <b>{score}</b> очк.")
+            if score == max_score:
+                winners.append({"id": int(user_id_str), "name": name, "score": score})
     
-    await context.bot.send_message(chat_id, text=message_text, parse_mode='HTML', reply_to_message_id=game_id)
-    logger.info(f"Баттл {game_id} (заглушка) завершен. Кулдаун обновлен.")        
+    # "Главный обосрамс" (логика как была)
+    worst_score = float('inf')
+    most_wrong_answers = -1
+    biggest_losers_by_score = []
+    biggest_losers_by_wrong_answers = []
+    has_actual_answers = False 
+
+    for user_id_str_loser, p_data_loser in participants_final.items():
+        score_loser = p_data_loser.get("score", 0)
+        answers_array_loser = p_data_loser.get("answers", [None] * TOS_BATTLE_NUM_QUESTIONS)
+        wrong_answers_count_loser = sum(1 for ans_l in answers_array_loser if ans_l is False) 
+        if any(ans_l is not None and ans_l != "no_answer" for ans_l in answers_array_loser):
+            has_actual_answers = True
+
+        if score_loser < worst_score:
+            worst_score = score_loser
+            biggest_losers_by_score = [{"name": p_data_loser.get("name", f"Анон-{user_id_str_loser}"), "score": score_loser}]
+        elif score_loser == worst_score:
+            biggest_losers_by_score.append({"name": p_data_loser.get("name", f"Анон-{user_id_str_loser}"), "score": score_loser})
+
+        if wrong_answers_count_loser > most_wrong_answers:
+            most_wrong_answers = wrong_answers_count_loser
+            biggest_losers_by_wrong_answers = [{"name": p_data_loser.get("name", f"Анон-{user_id_str_loser}"), "wrong_count": wrong_answers_count_loser}]
+        elif wrong_answers_count_loser == most_wrong_answers and most_wrong_answers >= 0 :
+            biggest_losers_by_wrong_answers.append({"name": p_data_loser.get("name", f"Анон-{user_id_str_loser}"), "wrong_count": wrong_answers_count_loser})
+            
+    loser_nomination_text = ""
+    loser_names_wrong_final = "" # Инициализируем
+    loser_names_score_final = "" # Инициализируем
+
+    if has_actual_answers:
+        if most_wrong_answers > 0 and biggest_losers_by_wrong_answers:
+            loser_names_wrong_final = ", ".join([l["name"] for l in biggest_losers_by_wrong_answers])
+            loser_nomination_text = f"\n\n💩 <b>Главный Обосрамс Баттла</b> (больше всех ошибок - {most_wrong_answers}): <b>{loser_names_wrong_final}</b>! Ваши бурные овации (нет)!"
+        elif biggest_losers_by_score and worst_score < max_score and max_score > 0 : # Показывать только если есть победитель и кто-то отстал
+            loser_names_score_final = ", ".join([l["name"] for l in biggest_losers_by_score])
+            loser_nomination_text = f"\n\n📉 А титул 'Почти Смог, но Все Равно Хуйло' ({worst_score} очк.) достается: <b>{loser_names_score_final}</b>!"
+
+    results_message = "\n".join(results_table_lines) + loser_nomination_text
+
+    final_comment_prompt = (
+        f"Ты - Попиздяка, ведущий интеллектуальной битвы 'Правда или Высер'. Игра окончена.\n"
+        f"Победитель(и) (если есть): {', '.join([w['name'] for w in winners]) if winners else 'Победителей нет (все долбоебы)'}\n"
+        f"Максимальный счет: {max_score if winners else '0 (позорище)'}\n"
+        f"Главный обосрамс (если есть): {loser_names_wrong_final if loser_names_wrong_final else (loser_names_score_final if loser_names_score_final else 'Все были одинаково тупы или гениальны, хуй разберешь')}\n\n"
+        f"Напиши зажигательный, саркастичный и матерный комментарий по итогам всего Баттла. "
+        f"Поздравь победителей так, чтобы они почувствовали себя королями говна. Разъеби проигравших. "
+        f"Начинай с `🗿 Ну что, конченные, вот и итоги вашего интеллектуального высера:`"
+    )
+    ai_final_comment = await _call_ionet_api(
+        messages=[{"role": "user", "content": final_comment_prompt}],
+        model_id=IONET_TEXT_MODEL_ID, max_tokens=250, temperature=0.85
+    ) or "🗿 Игра окончена. Кто выиграл - молодец. Кто проиграл - соси хуй. Все просто."
+    if not ai_final_comment.startswith("🗿"): ai_final_comment = "🗿 " + ai_final_comment
+
+    full_final_message_text = f"🏁 <b>Баттл 'Правда или Высер' (ID: {game_id}) ОКОНЧЕН!</b> 🏁\n\n{results_message}\n\n{ai_final_comment}"
+    
+    message_parts_final = []
+    # Логика разбиения на части, если сообщение слишком длинное (оставлена как есть)
+    if len(full_final_message_text) > 4096:
+        cutoff = full_final_message_text.rfind("\n\n", 0, 4000)
+        if cutoff == -1: cutoff = 4000
+        message_parts_final.append(full_final_message_text[:cutoff])
+        message_parts_final.append(full_final_message_text[cutoff:])
+    else:
+        message_parts_final.append(full_final_message_text)
+
+    for part_msg_final_send in message_parts_final:
+        await context.bot.send_message(chat_id, text=part_msg_final_send, parse_mode='HTML', reply_to_message_id=game_id)
+        await asyncio.sleep(0.3)
+
+    # --- НОВАЯ ЛОГИКА НАЧИСЛЕНИЯ ПРИЗА ---
+    prizes_awarded_info_dict = {} # Для записи в БД информации о выданных призах
+
+    if winners: # Если есть победители (max_score > 0)
+        num_winners = len(winners)
+        prize_notifications = [f"🏆 <b>Награждение победителей Баттла (ID: {game_id}):</b>"]
+
+        if num_winners == 1:
+            winner_obj_single = winners[0]
+            winner_id_s = winner_obj_single["id"]
+            winner_name_s = winner_obj_single["name"]
+            
+            user_profile_s = await get_user_profile_data(User(id=winner_id_s, first_name=winner_name_s, is_bot=False))
+            winner_display_name_s = user_profile_s.get("display_name", winner_name_s)
+
+            # Начисляем +5см к писюну
+            penis_stat_s = await loop.run_in_executor(None, lambda: penis_stats_collection.find_one({"user_id": winner_id_s, "chat_id": chat_id}))
+            current_penis_s = penis_stat_s.get("penis_size", 0) if penis_stat_s else 0
+            new_penis_s = current_penis_s + 5 # TOS_BATTLE_PENIS_REWARD_SINGLE = 5
+            await loop.run_in_executor(None, lambda: penis_stats_collection.update_one(
+                {"user_id": winner_id_s, "chat_id": chat_id},
+                {"$set": {"penis_size": new_penis_s, "user_display_name": winner_display_name_s}}, upsert=True
+            ))
+            prize_notifications.append(f"🍆 Писюн единственного чемпиона <b>{winner_display_name_s}</b> вырос на <b>5см</b> и теперь равен <b>{new_penis_s}см</b>!")
+            # TODO: Проверка на новое писечное звание
+            
+            # Начисляем +0.3 к сиськам
+            tits_stat_s = await loop.run_in_executor(None, lambda: tits_stats_collection.find_one({"user_id": winner_id_s, "chat_id": chat_id}))
+            current_tits_s = float(tits_stat_s.get("tits_size", 0.0)) if tits_stat_s else 0.0
+            new_tits_s = round(current_tits_s + 0.3, 1) # TOS_BATTLE_TITS_REWARD_SINGLE = 0.3
+            await loop.run_in_executor(None, lambda: tits_stats_collection.update_one(
+                {"user_id": winner_id_s, "chat_id": chat_id},
+                {"$set": {"tits_size": new_tits_s, "user_display_name": winner_display_name_s}}, upsert=True
+            ))
+            prize_notifications.append(f"🍈 Сиськи <b>{winner_display_name_s}</b> подросли на <b>0.3</b> и стали <b>{new_tits_s:.1f}-го</b> размера!")
+            # TODO: Проверка на новое сисечное звание
+
+            prizes_awarded_info_dict[str(winner_id_s)] = {"penis_added": 5, "tits_added": 0.3}
+            logger.info(f"Призы (писюн +5, сиськи +0.3) выданы единственному победителю {winner_display_name_s} ({winner_id_s}) за баттл {game_id}.")
+
+        else: # Несколько победителей
+            prize_notifications.append(f"\nУ нас <b>{num_winners} победителя(ей)</b>! Попиздяка решил не мелочиться и каждому подкинуть по чуть-чуть:")
+            penis_reward_multi = 2  # Фиксировано +2 см
+            tits_reward_multi = 0.1 # Фиксировано +0.1
+            
+            prize_notifications.append(f"- Каждый получает <b>+{penis_reward_multi}см</b> к писюну.")
+            prize_notifications.append(f"- И <b>+{tits_reward_multi:.1f}</b> к размеру сисек!")
+            logger.info(f"{num_winners} победителя(ей) в баттле {game_id}. Писюн +{penis_reward_multi}см, Сиськи +{tits_reward_multi:.1f} каждому.")
+
+            for winner_obj_m in winners:
+                winner_id_m_prize = winner_obj_m["id"]
+                winner_name_m_prize = winner_obj_m["name"]
+                user_profile_m_prize = await get_user_profile_data(User(id=winner_id_m_prize, first_name=winner_name_m_prize, is_bot=False))
+                winner_display_name_m_prize = user_profile_m_prize.get("display_name", winner_name_m_prize)
+
+                # Начисляем писюн
+                penis_stat_m_prize = await loop.run_in_executor(None, lambda: penis_stats_collection.find_one({"user_id": winner_id_m_prize, "chat_id": chat_id}))
+                current_penis_m_prize = penis_stat_m_prize.get("penis_size", 0) if penis_stat_m_prize else 0
+                new_penis_m_prize = current_penis_m_prize + penis_reward_multi
+                await loop.run_in_executor(None, lambda: penis_stats_collection.update_one(
+                    {"user_id": winner_id_m_prize, "chat_id": chat_id},
+                    {"$set": {"penis_size": new_penis_m_prize, "user_display_name": winner_display_name_m_prize}}, upsert=True
+                ))
+                prize_notifications.append(f"🍆 Писюн <b>{winner_display_name_m_prize}</b> вырос до <b>{new_penis_m_prize}см</b>.")
+                
+                # Начисляем сиськи
+                tits_stat_m_prize = await loop.run_in_executor(None, lambda: tits_stats_collection.find_one({"user_id": winner_id_m_prize, "chat_id": chat_id}))
+                current_tits_m_prize = float(tits_stat_m_prize.get("tits_size", 0.0)) if tits_stat_m_prize else 0.0
+                new_tits_m_prize = round(current_tits_m_prize + tits_reward_multi, 1)
+                await loop.run_in_executor(None, lambda: tits_stats_collection.update_one(
+                    {"user_id": winner_id_m_prize, "chat_id": chat_id},
+                    {"$set": {"tits_size": new_tits_m_prize, "user_display_name": winner_display_name_m_prize}}, upsert=True
+                ))
+                prize_notifications.append(f"🍈 Сиськи <b>{winner_display_name_m_prize}</b> подросли до <b>{new_tits_m_prize:.1f}-го</b>.")
+                
+                prizes_awarded_info_dict[str(winner_id_m_prize)] = {"penis_added": penis_reward_multi, "tits_added": tits_reward_multi}
+            
+        await context.bot.send_message(chat_id, text="\n".join(prize_notifications), parse_mode='HTML')
+        # Сохраняем информацию о выданных призах в документе баттла
+        await loop.run_in_executor(
+            None, lambda: tos_battles_collection.update_one(
+                {"_id": battle_doc_id}, 
+                {"$set": {"prizes_awarded_info": prizes_awarded_info_dict}}
+            )
+        )
+
+    else: # Нет победителей с положительным счетом
+        await context.bot.send_message(chat_id, "🗿 По итогам этой битвы умов, победителей с положительным счетом не нашлось. Какие же вы все-таки долбоебы. Приз остается у Попиздяки!", parse_mode='HTML')
+    
+    # Кнопки выбора приза для одиночного победителя больше не нужны, так как приз начисляется автоматически
+    # или был обработан в tos_battle_button_callback, если бы мы оставили выбор.
+    # В текущей логике, если победитель один, ему начисляются оба бонуса автоматически.
+    # Если мы хотим оставить выбор для одного победителя, нужно вернуть кнопки и обработчик tosbattle_prize в tos_battle_button_callback.
+    # Сейчас я сделал так, что ОДИН победитель получает +5см И +0.3 сисек автоматически.
+    # Если нужно вернуть выбор, сообщи.
 
 # Дальше идет async def main() или другие функции...
 
