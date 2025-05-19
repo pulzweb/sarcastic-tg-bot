@@ -3703,64 +3703,79 @@ async def auto_end_recruitment_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Вызываем функцию начала самой игры
     await _actually_start_the_battle_game(context, battle["_id"])
 
-async def _actually_start_the_battle_game(context: ContextTypes.DEFAULT_TYPE, battle_doc_id: ObjectId) -> None: # Просто ObjectId
+async def _actually_start_the_battle_game(context: ContextTypes.DEFAULT_TYPE, battle_doc_id: ObjectId) -> None:
     loop = asyncio.get_running_loop()
-    battle = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
-    if not battle:
+    # Получаем battle_data перед тем как его изменять
+    battle_before_update = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
+    
+    if not battle_before_update:
         logger.error(f"_actually_start_the_battle_game: Баттл с _id {battle_doc_id} не найден!")
+        # Если баттл не найден, возможно, стоит попробовать очистить job, если он был создан с этим ID
+        # Но это уже более сложная логика восстановления состояния.
         return
     
-    chat_id = battle["chat_id"]
-    game_id = battle["game_id"] # message_id_recruitment
-    participants_count = len(battle.get("participants", {}))
+    chat_id = battle_before_update["chat_id"]
+    game_id = battle_before_update["game_id"] # message_id_recruitment
+    participants_count = len(battle_before_update.get("participants", {}))
+    host_name = battle_before_update.get("host_name", "Неизвестный хост")
 
-    logger.info(f"НАЧАЛО ИГРЫ (ЗАГЛУШКА) для баттла {game_id} в чате {chat_id}. Участников: {participants_count}")
+    logger.info(f"ЗАПУСК И НЕМЕДЛЕННОЕ ЗАВЕРШЕНИЕ (ЗАГЛУШКА) для баттла {game_id} в чате {chat_id}. Участников: {participants_count}")
     
-    # 1. Изменить статус игры на "playing" в БД
-    await loop.run_in_executor(
+    # 1. Изменить статус игры на "finished" в БД
+    #    и обновить время окончания игры для кулдауна следующего баттла
+    now_for_finish = datetime.datetime.now(datetime.timezone.utc)
+    update_result = await loop.run_in_executor(
         None, lambda: tos_battles_collection.update_one(
-            {"_id": battle_doc_id},
-            {"$set": {"status": "playing", "current_question_index": 0}} # Начинаем с 0-го вопроса
+            {"_id": battle_doc_id, "status": {"$ne": "finished"}}, # Обновляем, только если еще не завершен
+            {"$set": {"status": "finished", 
+                       "finished_at": now_for_finish,
+                       "current_question_index": -2 # Специальный индекс для "завершено на этапе заглушки"
+                      }}
         )
     )
-    
+
+    if update_result.modified_count == 0 and battle_before_update["status"] == "finished":
+        logger.info(f"Баттл {game_id} уже был завершен. Ничего не делаем в _actually_start_the_battle_game.")
+        return
+    elif update_result.modified_count == 0:
+        logger.warning(f"Не удалось обновить статус баттла {game_id} на 'finished'. Текущий статус: {battle_before_update['status']}")
+        # Возможно, стоит отправить сообщение об ошибке, но пока просто лог.
+        return
+
+
     # 2. Убрать кнопки набора у сообщения о наборе
     try:
-        await context.bot.edit_message_reply_markup(chat_id, message_id=game_id, reply_markup=None)
+        await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=game_id, reply_markup=None)
     except Exception as e_edit_markup:
-        logger.warning(f"Не удалось убрать кнопки у сообщения о наборе {game_id}: {e_edit_markup}")
+        logger.warning(f"Не удалось убрать кнопки у сообщения о наборе {game_id} при заглушечном завершении: {e_edit_markup}")
 
-    # 3. Сгенерировать TOS_BATTLE_NUM_QUESTIONS вопросов (это будет долго, вынесем в отдельную функцию потом)
-    # Пока заглушка
-    generated_questions_list = []
-    for i in range(TOS_BATTLE_NUM_QUESTIONS):
-        is_tr = random.choice([True, False])
-        stmt = f"Заглушка-утверждение №{i+1} (это {'правда' if is_tr else 'высер'})"
-        generated_questions_list.append({"statement": stmt, "is_truth": is_tr, "revealed_to_users": False, "user_answers_to_this_q": {}})
+    # 3. Отправить сообщение о том, что игра (пока) завершена на этапе заглушки
+    participant_names = [p_data.get("name", "Анон") for p_id, p_data in battle_before_update.get("participants", {}).items()]
     
-    await loop.run_in_executor(
-        None, lambda: tos_battles_collection.update_one(
-            {"_id": battle_doc_id},
-            {"$set": {"questions": generated_questions_list}}
-        )
+    final_message_text = (
+        f"🏁 <b>Баттл 'Правда или Высер' (ID: {game_id}) завершен на этапе подготовки!</b> 🏁\n\n"
+        f"Хост: {host_name}\n"
+        f"Записавшиеся герои (или долбоебы): {', '.join(participant_names) if participant_names else 'Никто не успел вписаться, лол.'}\n\n"
+        f"🗿 Попиздяка пока еще не научился проводить сами раунды этой ебанины. Но он старается (нет).\n"
+        f"Так что считайте, что все свободны, а приз никому не достался. Разве что моральное удовлетворение от того, что вы чуть не сыграли в интеллектуальную рулетку."
     )
-    logger.info(f"Сгенерированы заглушки вопросов для баттла {game_id}")
 
-    # 4. Отправить сообщение о начале игры
-    participant_names = [p_data.get("name", "Анон") for p_id, p_data in battle.get("participants", {}).items()]
     await context.bot.send_message(
-        chat_id,
-        f"🔥 <b>БАТТЛ 'ПРАВДА ИЛИ ВЫСЕР' НАЧИНАЕТСЯ!</b> 🔥\n"
-        f"Участники этой интеллектуальной бойни: {', '.join(participant_names) if participant_names else 'Никто не записался, лол'}\n"
-        f"Всего будет {TOS_BATTLE_NUM_QUESTIONS} раундов. Готовьте свои мозги (или что там у вас вместо них)!\n"
-        f"Сейчас будет первый вопрос...",
+        chat_id=chat_id,
+        text=final_message_text,
         parse_mode='HTML',
         reply_to_message_id=game_id
     )
-    
-    # 5. Запустить логику первого вопроса (это будет следующая большая часть)
-    # await _ask_next_tos_battle_question(context, battle_doc_id)
-    await context.bot.send_message(chat_id, "ЗАГЛУШКА: Здесь должен быть первый вопрос баттла.")    
+
+    # 4. Обновить время окончания баттла в chat_activity_collection для кулдауна
+    await loop.run_in_executor(
+        None, lambda: chat_activity_collection.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"last_tos_battle_end_time": now_for_finish}},
+            upsert=True
+        )
+    )
+    logger.info(f"Баттл {game_id} (заглушка) завершен. Кулдаун обновлен.")
 
 # Дальше идет async def main() или другие функции...
 
