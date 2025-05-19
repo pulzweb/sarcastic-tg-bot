@@ -3683,58 +3683,78 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
                 await context.bot.send_message(chat_id, f"⚠️ {user_who_clicked.mention_html()}, ошибка записи. Попробуй еще.", parse_mode='HTML', reply_to_message_id=game_id_int)
 
         elif action == "extend" and user_who_clicked.id == battle.get("host_id"):
-            battle_current_state_for_extend_cb = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
-            if not battle_current_state_for_extend_cb or battle_current_state_for_extend_cb.get("status") != "recruiting":
-                await context.bot.send_message(chat_id, "Не удалось продлить: игра уже не в стадии набора.", reply_to_message_id=game_id_int)
+            # Сначала получим актуальное время окончания из БД
+            battle_current_for_extend = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
+            if not battle_current_for_extend or battle_current_for_extend.get("status") != "recruiting":
+                await context.bot.send_message(chat_id, "Не удалось продлить: игра уже не в стадии набора или ошибка.", reply_to_message_id=game_id_int)
                 return
             
-            current_recruitment_ends_at_cb = battle_current_state_for_extend_cb["recruitment_ends_at"]
-            # Убедимся, что время из БД в UTC, если оно aware
-            if current_recruitment_ends_at_cb.tzinfo is None:
-                current_recruitment_ends_at_cb = UTC_TZ.localize(current_recruitment_ends_at_cb)
+            current_recruitment_ends_at_from_db = battle_current_for_extend["recruitment_ends_at"]
+            # Убедимся, что время из БД в UTC и оно aware
+            if current_recruitment_ends_at_from_db.tzinfo is None:
+                current_recruitment_ends_at_from_db = UTC_TZ.localize(current_recruitment_ends_at_from_db)
             else:
-                current_recruitment_ends_at_cb = current_recruitment_ends_at_cb.astimezone(UTC_TZ)
+                current_recruitment_ends_at_from_db = current_recruitment_ends_at_from_db.astimezone(UTC_TZ)
 
-            new_recruitment_ends_at_utc_cb = current_recruitment_ends_at_cb + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS)
+            # Рассчитываем новое время окончания (в UTC)
+            new_recruitment_ends_at_utc_for_update = current_recruitment_ends_at_from_db + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS)
             
-            update_result_extend_cb = await loop.run_in_executor( # Обновляем в БД В UTC!
+            update_result_extend = await loop.run_in_executor(
                 None, lambda: tos_battles_collection.update_one(
-                    {"_id": battle_doc_id, "status": "recruiting"}, 
-                    {"$set": {"recruitment_ends_at": new_recruitment_ends_at_utc_cb}}
+                    {"_id": battle_doc_id, "status": "recruiting"}, # Важно проверить статус в запросе
+                    {"$set": {"recruitment_ends_at": new_recruitment_ends_at_utc_for_update}}
                 )
             )
-            if update_result_extend_cb.modified_count > 0:
-                logger.info(f"Хост {user_who_clicked.id} продлил набор для баттла {game_id_int} до {new_recruitment_ends_at_cb}")
-                job_name_ext_cb = f"tosbattle_recruit_end_{chat_id}_{game_id_int}"
-                for old_job_cb in context.job_queue.get_jobs_by_name(job_name_ext_cb): old_job_cb.schedule_removal()
+            
+            if update_result_extend.modified_count > 0:
+                # new_recruitment_ends_at_utc_for_update теперь актуальное время окончания
+                logger.info(f"Хост {user_who_clicked.id} продлил набор для баттла {game_id_int} до {new_recruitment_ends_at_utc_for_update}")
                 
-                time_now_utc_ext_cb = datetime.datetime.now(datetime.timezone.utc)
-                time_until_new_end_seconds_cb = (new_recruitment_ends_at_cb - time_now_utc_ext_cb).total_seconds()
+                job_name_ext_cb_fix = f"tosbattle_recruit_end_{chat_id}_{game_id_int}"
+                for old_job_fix in context.job_queue.get_jobs_by_name(job_name_ext_cb_fix): 
+                    old_job_fix.schedule_removal()
+                
+                time_now_utc_ext_cb_fix = datetime.datetime.now(datetime.timezone.utc)
+                time_until_new_end_seconds_cb_fix = (new_recruitment_ends_at_utc_for_update - time_now_utc_ext_cb_fix).total_seconds()
 
-                if time_until_new_end_seconds_cb > 0:
+                if time_until_new_end_seconds_cb_fix > 0:
                     context.job_queue.run_once(
-                        auto_end_recruitment_job, time_until_new_end_seconds_cb, 
-                        chat_id=chat_id, data={'game_id': game_id_int, 'host_id': battle["host_id"]}, name=job_name_ext_cb
+                        auto_end_recruitment_job, 
+                        time_until_new_end_seconds_cb_fix, 
+                        chat_id=chat_id, 
+                        data={'game_id': game_id_int, 'host_id': battle["host_id"]}, # Используем battle["host_id"] из первоначально загруженного battle
+                        name=job_name_ext_cb_fix
                     )
+                    logger.info(f"Job окончания набора для {game_id_int} перепланирован на {new_recruitment_ends_at_utc_for_update}")
+                    
                     # Конвертируем новое время окончания в MSK для отображения
-                    new_recruitment_ends_at_msk_cb = new_recruitment_ends_at_utc_cb.astimezone(MOSCOW_TZ)
-                    remaining_minutes_cb_display = int(time_until_new_end_seconds_cb_display // 60)
-                    remaining_seconds_part_cb_display = int(time_until_new_end_seconds_cb_display % 60)
-                    time_left_str_cb_display = f"{remaining_minutes_cb_display} мин {remaining_seconds_part_cb_display} сек"
+                    new_recruitment_ends_at_msk_display = new_recruitment_ends_at_utc_for_update.astimezone(MOSCOW_TZ)
+                    remaining_minutes_display = int(time_until_new_end_seconds_cb_fix // 60)
+                    remaining_seconds_part_display = int(time_until_new_end_seconds_cb_fix % 60)
+                    time_left_str_display = f"{remaining_minutes_display} мин {remaining_seconds_part_display} сек"
                     
                     await context.bot.send_message(
                         chat_id, 
                         f"⏳ Хост {user_who_clicked.mention_html()} продлил набор на <b>{TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS} секунд</b>!\n"
-                        f"Новое время окончания набора: <b>{new_recruitment_ends_at_msk_cb.strftime('%H:%M:%S MSK')}</b> (осталось ~{time_left_str_cb_display}).",
-                        parse_mode='HTML', reply_to_message_id=game_id_int
+                        f"Новое время окончания набора: <b>{new_recruitment_ends_at_msk_display.strftime('%H:%M:%S MSK')}</b> (осталось ~{time_left_str_display}).",
+                        parse_mode='HTML', 
+                        reply_to_message_id=game_id_int
                     )
                 else: 
-                    await context.bot.send_message(chat_id, "Хост пытался продлить, но время уже вышло. Набор завершается...", reply_to_message_id=game_id_int)
-                    job_data_manual_trigger_cb = {'game_id': game_id_int, 'host_id': battle["host_id"], 'chat_id': chat_id}
-                    fake_job_cb = type('FakeJob', (), {'data': job_data_manual_trigger_cb, 'chat_id': chat_id, 'name': f'manual_trigger_rec_end_{game_id_int}'})
-                    await auto_end_recruitment_job(context=ContextTypes.DEFAULT_TYPE(application=context.application, chat_id=chat_id, job=fake_job_cb))
+                    # Это условие маловероятно, если мы только что успешно продлили и $set сработал,
+                    # но на всякий случай.
+                    await context.bot.send_message(chat_id, "Хост пытался продлить, но время уже истекло или что-то пошло не так. Набор завершается...", reply_to_message_id=game_id_int)
+                    # Принудительно вызываем job, если он еще не сработал
+                    # Создаем "фейковый" job объект для передачи данных в auto_end_recruitment_job
+                    job_data_manual = {'game_id': game_id_int, 'host_id': battle["host_id"], 'chat_id': chat_id} # battle["host_id"]
+                    # Создаем простой объект с атрибутами data и chat_id, имитирующий Job из JobQueue
+                    fake_job_manual = type('FakeJob', (), {'data': job_data_manual, 'chat_id': chat_id, 'name': f'manual_trigger_rec_end_{game_id_int}_extend_fail'})()
+                    # Передаем context.application в ContextTypes.DEFAULT_TYPE
+                    await auto_end_recruitment_job(context=ContextTypes.DEFAULT_TYPE(application=context.application, chat_id=chat_id, job=fake_job_manual))
             else:
-                 await context.bot.send_message(chat_id, "Не удалось продлить набор (возможно, игра уже не в стадии набора или вы не хост).", reply_to_message_id=game_id_int)
+                 # Если modified_count == 0, значит $set не сработал (например, документ не соответствовал фильтру _id и status)
+                 logger.warning(f"Не удалось обновить время продления для баттла {game_id_int}. Возможно, статус изменился.")
+                 await context.bot.send_message(chat_id, "Не удалось продлить набор (возможно, игра уже не в стадии набора или произошла ошибка).", reply_to_message_id=game_id_int)
         
         elif action == "start" and user_who_clicked.id == battle.get("host_id"):
             if len(battle.get("participants", {})) < TOS_BATTLE_MIN_PARTICIPANTS:
