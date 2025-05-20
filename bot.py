@@ -3536,17 +3536,19 @@ async def start_tos_battle(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Сохраняем игру в БД
     battle_data = {
         "chat_id": chat_id,
-        "game_id": game_id, # Это message_id сообщения о наборе
+        "game_id": game_id, 
         "status": "recruiting",
         "host_id": host_user.id,
         "host_name": host_user.first_name or host_user.username or "Анонимный Заводила",
-        "created_at": now_utc,
+        "created_at": now_utc, # now_utc должен быть определен
         "recruitment_ends_at": recruitment_ends_at,
-        "participants": {}, # {user_id: {"name": "...", "score": 0, "answers": []}}
-        "questions": [], # Будут сгенерированы перед началом игры
+        "participants": {}, 
+        "questions": [], 
         "current_question_index": -1,
         "message_id_recruitment": game_id,
-        "message_id_current_question": None
+        "message_id_current_question": None,
+        "message_id_last_extension_notice": None, # <<<--- ВОТ ЭТО ПОЛЕ
+        "prizes_awarded_info": {} 
     }
     await loop.run_in_executor(None, lambda: tos_battles_collection.insert_one(battle_data))
     logger.info(f"Баттл 'Правда или Высер' (game_id: {game_id}) запущен хостом {host_user.id} в чате {chat_id}. Набор до {recruitment_ends_at}.")
@@ -3683,33 +3685,38 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
                 await context.bot.send_message(chat_id, f"⚠️ {user_who_clicked.mention_html()}, ошибка записи. Попробуй еще.", parse_mode='HTML', reply_to_message_id=game_id_int)
 
         elif action == "extend" and user_who_clicked.id == battle.get("host_id"):
-            # Сначала получим актуальное время окончания из БД
-            battle_current_for_extend = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
+            # Сначала получим актуальное состояние баттла, включая message_id_last_extension_notice
+            battle_current_for_extend = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id})) # battle_doc_id должен быть определен ранее
             if not battle_current_for_extend or battle_current_for_extend.get("status") != "recruiting":
-                await context.bot.send_message(chat_id, "Не удалось продлить: игра уже не в стадии набора или ошибка.", reply_to_message_id=game_id_int)
+                await context.bot.send_message(chat_id, "Не удалось продлить: игра уже не в стадии набора или ошибка.", reply_to_message_id=game_id_int) # game_id_int должен быть определен ранее
                 return
             
             current_recruitment_ends_at_from_db = battle_current_for_extend["recruitment_ends_at"]
-            # Убедимся, что время из БД в UTC и оно aware
             if current_recruitment_ends_at_from_db.tzinfo is None:
-                current_recruitment_ends_at_from_db = UTC_TZ.localize(current_recruitment_ends_at_from_db)
+                current_recruitment_ends_at_from_db = UTC_TZ.localize(current_recruitment_ends_at_from_db) # UTC_TZ должен быть определен глобально
             else:
                 current_recruitment_ends_at_from_db = current_recruitment_ends_at_from_db.astimezone(UTC_TZ)
 
-            # Рассчитываем новое время окончания (в UTC)
             new_recruitment_ends_at_utc_for_update = current_recruitment_ends_at_from_db + datetime.timedelta(seconds=TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS)
             
-            update_result_extend = await loop.run_in_executor(
+            update_result_extend_time = await loop.run_in_executor(
                 None, lambda: tos_battles_collection.update_one(
-                    {"_id": battle_doc_id, "status": "recruiting"}, # Важно проверить статус в запросе
+                    {"_id": battle_doc_id, "status": "recruiting"},
                     {"$set": {"recruitment_ends_at": new_recruitment_ends_at_utc_for_update}}
                 )
             )
             
-            if update_result_extend.modified_count > 0:
-                # new_recruitment_ends_at_utc_for_update теперь актуальное время окончания
+            if update_result_extend_time.modified_count > 0:
                 logger.info(f"Хост {user_who_clicked.id} продлил набор для баттла {game_id_int} до {new_recruitment_ends_at_utc_for_update}")
                 
+                message_id_old_extension_notice = battle_current_for_extend.get("message_id_last_extension_notice")
+                if message_id_old_extension_notice:
+                    try:
+                        await context.bot.delete_message(chat_id=chat_id, message_id=message_id_old_extension_notice)
+                        logger.info(f"Удалено старое сообщение о продлении (ID: {message_id_old_extension_notice}) для баттла {game_id_int}")
+                    except Exception as e_del_ext:
+                        logger.warning(f"Не удалось удалить старое сообщение о продлении {message_id_old_extension_notice}: {e_del_ext}")
+
                 job_name_ext_cb_fix = f"tosbattle_recruit_end_{chat_id}_{game_id_int}"
                 for old_job_fix in context.job_queue.get_jobs_by_name(job_name_ext_cb_fix): 
                     old_job_fix.schedule_removal()
@@ -3719,42 +3726,35 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
 
                 if time_until_new_end_seconds_cb_fix > 0:
                     context.job_queue.run_once(
-                        auto_end_recruitment_job, 
-                        time_until_new_end_seconds_cb_fix, 
-                        chat_id=chat_id, 
-                        data={'game_id': game_id_int, 'host_id': battle["host_id"]}, # Используем battle["host_id"] из первоначально загруженного battle
-                        name=job_name_ext_cb_fix
+                        auto_end_recruitment_job, time_until_new_end_seconds_cb_fix, 
+                        chat_id=chat_id, data={'game_id': game_id_int, 'host_id': battle["host_id"]}, name=job_name_ext_cb_fix # battle["host_id"] из первоначально загруженного battle
                     )
                     logger.info(f"Job окончания набора для {game_id_int} перепланирован на {new_recruitment_ends_at_utc_for_update}")
                     
-                    # Конвертируем новое время окончания в MSK для отображения
-                    new_recruitment_ends_at_msk_display = new_recruitment_ends_at_utc_for_update.astimezone(MOSCOW_TZ)
+                    new_recruitment_ends_at_msk_display = new_recruitment_ends_at_utc_for_update.astimezone(MOSCOW_TZ) # MOSCOW_TZ должен быть определен глобально
                     remaining_minutes_display = int(time_until_new_end_seconds_cb_fix // 60)
                     remaining_seconds_part_display = int(time_until_new_end_seconds_cb_fix % 60)
                     time_left_str_display = f"{remaining_minutes_display} мин {remaining_seconds_part_display} сек"
                     
-                    await context.bot.send_message(
+                    new_extension_notice_message = await context.bot.send_message(
                         chat_id, 
                         f"⏳ Хост {user_who_clicked.mention_html()} продлил набор на <b>{TOS_BATTLE_RECRUITMENT_EXTENSION_SECONDS} секунд</b>!\n"
                         f"Новое время окончания набора: <b>{new_recruitment_ends_at_msk_display.strftime('%H:%M:%S MSK')}</b> (осталось ~{time_left_str_display}).",
-                        parse_mode='HTML', 
-                        reply_to_message_id=game_id_int
+                        parse_mode='HTML', reply_to_message_id=game_id_int 
+                    )
+                    await loop.run_in_executor(
+                        None, lambda: tos_battles_collection.update_one(
+                            {"_id": battle_doc_id},
+                            {"$set": {"message_id_last_extension_notice": new_extension_notice_message.message_id}}
+                        )
                     )
                 else: 
-                    # Это условие маловероятно, если мы только что успешно продлили и $set сработал,
-                    # но на всякий случай.
                     await context.bot.send_message(chat_id, "Хост пытался продлить, но время уже истекло или что-то пошло не так. Набор завершается...", reply_to_message_id=game_id_int)
-                    # Принудительно вызываем job, если он еще не сработал
-                    # Создаем "фейковый" job объект для передачи данных в auto_end_recruitment_job
-                    job_data_manual = {'game_id': game_id_int, 'host_id': battle["host_id"], 'chat_id': chat_id} # battle["host_id"]
-                    # Создаем простой объект с атрибутами data и chat_id, имитирующий Job из JobQueue
+                    job_data_manual = {'game_id': game_id_int, 'host_id': battle["host_id"], 'chat_id': chat_id} 
                     fake_job_manual = type('FakeJob', (), {'data': job_data_manual, 'chat_id': chat_id, 'name': f'manual_trigger_rec_end_{game_id_int}_extend_fail'})()
-                    # Передаем context.application в ContextTypes.DEFAULT_TYPE
                     await auto_end_recruitment_job(context=ContextTypes.DEFAULT_TYPE(application=context.application, chat_id=chat_id, job=fake_job_manual))
             else:
-                 # Если modified_count == 0, значит $set не сработал (например, документ не соответствовал фильтру _id и status)
-                 logger.warning(f"Не удалось обновить время продления для баттла {game_id_int}. Возможно, статус изменился.")
-                 await context.bot.send_message(chat_id, "Не удалось продлить набор (возможно, игра уже не в стадии набора или произошла ошибка).", reply_to_message_id=game_id_int)
+                await context.bot.send_message(chat_id, "Не удалось продлить набор (возможно, игра уже не в стадии набора или произошла ошибка).", reply_to_message_id=game_id_int)
         
         elif action == "start" and user_who_clicked.id == battle.get("host_id"):
             if len(battle.get("participants", {})) < TOS_BATTLE_MIN_PARTICIPANTS:
@@ -3857,9 +3857,61 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
 
         if update_ans_q_db.modified_count > 0:
             logger.info(f"User {user_who_clicked.id} ответил '{user_answer_as_bool_ans}' на Q{question_index_cb_ans} баттла {game_id_int}")
-            await query.answer(f"Твой ответ ('{('Правда' if user_answer_as_bool_ans else 'Высер')}') на раунд {question_index_cb_ans + 1} принят!", show_alert=False)
-        else:
-            await query.answer("Не удалось записать ответ.", show_alert=True)
+            
+            # --->>> ИЗМЕНЕНИЕ КНОПОК ПОСЛЕ ОТВЕТА <<<---
+            # Получаем текущую клавиатуру сообщения с вопросом
+            # query.message - это сообщение, к которому прикреплены кнопки
+            original_keyboard_markup = query.message.reply_markup 
+            new_keyboard_buttons = []
+
+            if original_keyboard_markup and original_keyboard_markup.inline_keyboard:
+                for row in original_keyboard_markup.inline_keyboard:
+                    new_row = []
+                    for button in row:
+                        button_text = button.text
+                        button_callback_data = button.callback_data
+                        
+                        # Проверяем, эта ли кнопка была нажата
+                        # Формат callback_data для ответа: tosbattle_ans_GAMEID_QINDEX_CHOICE
+                        # parts уже содержат разобранный query.data
+                        # parts[0]="tosbattle", parts[1]="ans", parts[2]=GAMEID, parts[3]=QINDEX, parts[4]=CHOICE ("true"/"false")
+                        
+                        # Если это кнопка ответа на текущий вопрос
+                        if button_callback_data.startswith(f"tosbattle_ans_{game_id_int}_{question_index_cb_ans}_"):
+                            choice_in_button_data = button_callback_data.split("_")[-1] # "true" или "false"
+                            
+                            # Если это та кнопка, которую нажал пользователь
+                            if (answer_choice_cb_str_ans == choice_in_button_data):
+                                button_text = f"✅ {button_text}" # Добавляем галочку
+                                # Можно сделать кнопку неактивной, изменив callback_data на что-то, что не будет обрабатываться
+                                # button_callback_data = f"tosbattle_answered_{game_id_int}_{question_index_cb_ans}"
+                            # Остальные кнопки ответа на этот вопрос для этого юзера можно не менять или тоже "деактивировать"
+                            # но это сложнее, т.к. мы меняем кнопки для ВСЕХ.
+                            # Проще всего пометить только выбранную.
+                        
+                        new_row.append(InlineKeyboardButton(button_text, callback_data=button_callback_data))
+                    new_keyboard_buttons.append(new_row)
+            
+            if new_keyboard_buttons:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard_buttons))
+                    await query.answer(f"Твой ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» принят!", show_alert=False)
+                except telegram.error.BadRequest as e_edit_kb_ans:
+                     if "message is not modified" in str(e_edit_kb_ans).lower():
+                         await query.answer(f"Твой ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» уже был таким.", show_alert=False)
+                     else:
+                         logger.warning(f"Не удалось отредактировать кнопки после ответа: {e_edit_kb_ans}")
+                         await query.answer(f"Ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» принят (ошибка обновления кнопок).", show_alert=False)
+                except Exception as e_unhandled_edit_kb:
+                    logger.error(f"Непредвиденная ошибка при редактировании кнопок после ответа: {e_unhandled_edit_kb}")
+                    await query.answer(f"Ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» принят (ошибка обновления кнопок).", show_alert=False)
+
+            else: # Если не удалось получить/изменить клавиатуру, просто отвечаем на query
+                await query.answer(f"Твой ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» на раунд {question_index_cb_ans + 1} принят!", show_alert=False)
+
+        else: # modified_count == 0
+            logger.warning(f"Не удалось записать ответ для user {user_who_clicked.id} на Q{question_index_cb_ans} баттла {game_id_int}. Modified_count: {update_ans_q_db.modified_count}")
+            await query.answer("Не удалось записать твой ответ. Возможно, время вышло или ты уже отвечал.", show_alert=True)
 
     # --- Обработка ВЫБОРА ПРИЗА ("finished" status) ---
     elif battle.get("status") == "finished" and action == "prize":
@@ -4379,26 +4431,38 @@ async def _process_battle_question_reveal(context: ContextTypes.DEFAULT_TYPE, ba
     result_text_q_human = "✅ ЭТО БЫЛА ПРАВДА!" if correct_answer_is_truth else "❌ КОНЕЧНО ЖЕ, ЭТО ВЫСЕР ЕБАНЫЙ!"
     
     # Формируем информацию для промпта ИИ
-    num_participants_in_round = len(updated_participants_data) # Общее число тех, кто в игре
-    num_answered_in_round = len(user_answers_for_this_q)
-    num_correct_in_round = sum(1 for uid, ans_rec in user_answers_for_this_q.items() if ans_rec["answer_bool"] == correct_answer_is_truth)
+    num_participants_in_game = len(updated_participants_data) # Общее число тех, кто ЗАПИСАН в игру
+    answered_user_ids_this_round = set(user_answers_for_this_q.keys()) # ID тех, кто ответил в этом раунде
+    num_answered_in_round = len(answered_user_ids_this_round)
+    num_correct_in_round = sum(1 for uid_str, ans_rec in user_answers_for_this_q.items() if ans_rec["answer_bool"] == correct_answer_is_truth)
     num_wrong_in_round = num_answered_in_round - num_correct_in_round
-    num_not_answered = num_participants_in_round - num_answered_in_round
+    
+    num_not_answered_this_round = 0
+    if num_participants_in_game > 0:
+        for p_id_str_active in updated_participants_data.keys():
+            if p_id_str_active not in answered_user_ids_this_round:
+                num_not_answered_this_round += 1
 
     round_summary_for_ai = ""
-    if num_answered_in_round == 0 and num_participants_in_round > 0:
-        round_summary_for_ai = "Ни одна тупая башка не удосужилась ответить в этом раунде. Стадо."
+    if num_participants_in_game == 0:
+        round_summary_for_ai = "В баттле нет участников. Я что, сам с собой играю, как шизофреник?"
+    elif num_answered_in_round == 0: # Никто из записавшихся не ответил
+        round_summary_for_ai = f"Ни одна из {num_participants_in_game} записавшихся душ не удосужилась ответить в этом раунде. Похоже, все слишком тупы или заняты дрочкой."
     elif num_answered_in_round > 0:
-        if num_correct_in_round == num_answered_in_round: # Все ответившие угадали
-            round_summary_for_ai = f"Удивительно, но все {num_correct_in_round} ответивших долбоеба угадали! Либо вы все гении, либо вопрос был слишком легким для таких интеллектуалов."
-            if num_not_answered > 0:
-                round_summary_for_ai += f" А {num_not_answered} ссыкунов так и не ответили."
-        else:
-            round_summary_for_ai = f"Из тех, кто рискнул своим очком (то есть, репутацией): {num_correct_in_round} угадали, {num_wrong_in_round} жидко обосрались."
-            if num_not_answered > 0:
-                round_summary_for_ai += f" Еще {num_not_answered} просто зассали отвечать."
-    else: # Нет участников в игре (маловероятно на этом этапе, но на всякий)
-        round_summary_for_ai = "Играю сам с собой, похоже. Никто не ответил."
+        if num_correct_in_round == num_answered_in_round: 
+            summary_verb = "угадал" if num_correct_in_round == 1 else "угадали"
+            round_summary_for_ai = f"Невероятно, но факт! Все {num_correct_in_round} ответивших {summary_verb}! Либо вы все тут Ванги недоделанные, либо вопрос был для детского сада."
+            if num_not_answered_this_round > 0:
+                round_summary_for_ai += f" А вот {num_not_answered_this_round} ссыкунов так и не рискнули своей репутацией (которой и так нет)."
+        elif num_wrong_in_round == num_answered_in_round: 
+             summary_verb_wrong = "обосрался" if num_wrong_in_round == 1 else "обосрались"
+             round_summary_for_ai = f"Это фиаско, братаны! Все {num_wrong_in_round} ответивших синхронно {summary_verb_wrong}! Поздравляю, вы достигли дна коллективной тупости!"
+             if num_not_answered_this_round > 0:
+                round_summary_for_ai += f" {num_not_answered_this_round} проебали момент и правильно сделали, а то бы тоже вляпались в это дерьмо."
+        else: # Есть и те, и другие
+            round_summary_for_ai = f"Из тех, кто не зассал: {num_correct_in_round} оказались правы (или им повезло), а {num_wrong_in_round} жидко пёрнули в лужу."
+            if num_not_answered_this_round > 0:
+                round_summary_for_ai += f" И еще {num_not_answered_this_round} тормозов просто промолчали, видимо, обдумывая смысл бытия."
 
 
     round_comment_prompt = (
@@ -4568,30 +4632,55 @@ async def _end_tos_battle(context: ContextTypes.DEFAULT_TYPE, battle_data: dict,
         f"Максимальный счет: {max_score if winners else '0 (позорище)'}\n"
         f"Главный обосрамс (если есть): {loser_names_wrong_final if loser_names_wrong_final else (loser_names_score_final if loser_names_score_final else 'Все были одинаково тупы или гениальны, хуй разберешь')}\n\n"
         f"Напиши зажигательный, саркастичный и матерный комментарий по итогам всего Баттла. "
+        f"Твой комментарий должен быть **ОЧЕНЬ КОРОТКИМ И ЕМКИМ (СТРОГО 1-2 предложения, примерно 150-250 символов)**, чтобы он точно влез в итоговое сообщение. " # <<<--- ИЗМЕНЕНО
         f"Поздравь победителей так, чтобы они почувствовали себя королями говна. Разъеби проигравших. "
         f"Начинай с `🗿 Ну что, конченные, вот и итоги вашего интеллектуального высера:`"
     )
     ai_final_comment = await _call_ionet_api(
         messages=[{"role": "user", "content": final_comment_prompt}],
-        model_id=IONET_TEXT_MODEL_ID, max_tokens=250, temperature=0.85
+        model_id=IONET_TEXT_MODEL_ID, 
+        max_tokens=80, # <<<--- УМЕНЬШЕНО (150-250 символов это примерно 40-70 токенов)
+        temperature=0.85
     ) or "🗿 Игра окончена. Кто выиграл - молодец. Кто проиграл - соси хуй. Все просто."
     if not ai_final_comment.startswith("🗿"): ai_final_comment = "🗿 " + ai_final_comment
 
     full_final_message_text = f"🏁 <b>Баттл 'Правда или Высер' (ID: {game_id}) ОКОНЧЕН!</b> 🏁\n\n{results_message}\n\n{ai_final_comment}"
     
-    message_parts_final = []
-    # Логика разбиения на части, если сообщение слишком длинное (оставлена как есть)
-    if len(full_final_message_text) > 4096:
-        cutoff = full_final_message_text.rfind("\n\n", 0, 4000)
-        if cutoff == -1: cutoff = 4000
-        message_parts_final.append(full_final_message_text[:cutoff])
-        message_parts_final.append(full_final_message_text[cutoff:])
-    else:
-        message_parts_final.append(full_final_message_text)
+    # Сначала формируем часть с результатами
+    results_part_text = f"🏁 <b>Баттл 'Правда или Высер' (ID: {game_id}) ОКОНЧЕН!</b> 🏁\n\n{results_message}"
+    # Комментарий ИИ
+    ai_comment_part_text = ai_final_comment if ai_final_comment.strip() else ""
 
-    for part_msg_final_send in message_parts_final:
-        await context.bot.send_message(chat_id, text=part_msg_final_send, parse_mode='HTML', reply_to_message_id=game_id)
-        await asyncio.sleep(0.3)
+    message_parts_final_to_send = []
+
+    # Пробуем отправить все вместе, если не слишком длинно
+    if len(results_part_text + "\n\n" + ai_comment_part_text) <= MAX_TELEGRAM_MESSAGE_LENGTH:
+        message_parts_final_to_send.append(results_part_text + ("\n\n" + ai_comment_part_text if ai_comment_part_text else ""))
+    else:
+        # Если слишком длинно, отправляем по частям
+        if results_part_text.strip():
+            # Если сама таблица результатов слишком длинная, ее тоже надо бить
+            if len(results_part_text) > MAX_TELEGRAM_MESSAGE_LENGTH:
+                logger.warning(f"Таблица результатов для баттла {game_id} слишком длинная ({len(results_part_text)}), будет обрезана или отправлена частями грубо.")
+                # Примитивная разбивка для таблицы, если очень надо
+                temp_results_parts = split_long_message_primitive(results_part_text, MAX_TELEGRAM_MESSAGE_LENGTH - 50) # MAX_TELEGRAM_MESSAGE_LENGTH определена глобально
+                message_parts_final_to_send.extend(temp_results_parts)
+            else:
+                message_parts_final_to_send.append(results_part_text)
+        
+        if ai_comment_part_text.strip():
+            # Если комментарий ИИ слишком длинный, его тоже надо бить
+            if len(ai_comment_part_text) > MAX_TELEGRAM_MESSAGE_LENGTH:
+                logger.warning(f"Комментарий ИИ для баттла {game_id} слишком длинный ({len(ai_comment_part_text)}), будет обрезан или отправлен частями грубо.")
+                temp_ai_parts = split_long_message_primitive(ai_comment_part_text, MAX_TELEGRAM_MESSAGE_LENGTH - 50)
+                message_parts_final_to_send.extend(temp_ai_parts)
+            else:
+                message_parts_final_to_send.append(ai_comment_part_text)
+
+    for part_msg_final_send_val in message_parts_final_to_send:
+        if part_msg_final_send_val.strip():
+            await context.bot.send_message(chat_id, text=part_msg_final_send_val, parse_mode='HTML', reply_to_message_id=game_id)
+            await asyncio.sleep(0.3)
 
     # --- НОВАЯ ЛОГИКА НАЧИСЛЕНИЯ ПРИЗА ---
     prizes_awarded_info_dict = {} # Для записи в БД информации о выданных призах
@@ -4747,6 +4836,36 @@ async def cancel_tos_battle_command(update: Update, context: ContextTypes.DEFAUL
             upsert=True
         )
     )
+
+def split_long_message_primitive(text: str, max_len: int) -> list[str]:
+    """Примитивно разбивает длинный текст на части по max_len, стараясь резать по строкам или пробелам."""
+    parts = []
+    current_pos = 0
+    while current_pos < len(text):
+        if len(text) - current_pos <= max_len:
+            parts.append(text[current_pos:])
+            break
+        
+        cut_at = -1
+        # Ищем с конца блока длиной max_len
+        # Сначала двойной перенос, потом одинарный, потом пробел
+        possible_cut_n2 = text.rfind("\n\n", current_pos, current_pos + max_len)
+        if possible_cut_n2 != -1 and possible_cut_n2 > current_pos:
+            cut_at = possible_cut_n2 + 2 # Включаем перенос в предыдущую часть
+        else:
+            possible_cut_n1 = text.rfind("\n", current_pos, current_pos + max_len)
+            if possible_cut_n1 != -1 and possible_cut_n1 > current_pos:
+                cut_at = possible_cut_n1 + 1
+            else:
+                possible_cut_space = text.rfind(" ", current_pos, current_pos + max_len)
+                if possible_cut_space != -1 and possible_cut_space > current_pos:
+                    cut_at = possible_cut_space + 1
+                else: # Крайний случай - режем по длине
+                    cut_at = current_pos + max_len
+        
+        parts.append(text[current_pos:cut_at].strip())
+        current_pos = cut_at
+    return [p for p in parts if p.strip()]
 
 # Дальше идет async def main() или другие функции...
 
