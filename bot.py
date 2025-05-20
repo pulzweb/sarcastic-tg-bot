@@ -3811,14 +3811,15 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
 
     # --- Обработка ОТВЕТОВ НА ВОПРОСЫ ("playing" status) ---
     elif battle.get("status") == "playing" and action == "ans":
-        if len(parts) < 5: 
+        if len(parts) < 5: # tosbattle_ans_GAMEID_QINDEX_CHOICE
             logger.error(f"Некорректный CB для ответа на вопрос (playing): {query.data}")
             await query.answer("Ошибка формата кнопки ответа.", show_alert=True)
             return
         
         try:
+            # game_id_from_ans_cb (game_id_int) должен быть определен ранее
             question_index_cb_ans = int(parts[3])
-            answer_choice_cb_str_ans = parts[4]
+            answer_choice_cb_str_ans = parts[4] # "true" или "false"
         except (ValueError, IndexError) as e_parse_ans_cb_p:
             logger.error(f"Ошибка парсинга CB ответа на вопрос (playing): {query.data}, {e_parse_ans_cb_p}")
             await query.answer("Ошибка данных кнопки.", show_alert=True)
@@ -3826,92 +3827,61 @@ async def tos_battle_button_callback(update: Update, context: ContextTypes.DEFAU
 
         user_answer_as_bool_ans = (answer_choice_cb_str_ans == "true")
 
+        # Проверяем, является ли кликнувший участником баттла
         if str(user_who_clicked.id) not in battle.get("participants", {}):
-            await query.answer("Ты не в игре, пошел нахуй!", show_alert=True)
+            await query.answer("Ты не участвуешь в этом баттле, самозванец хуев!", show_alert=True)
             return
 
         current_q_idx_from_db_ans = battle.get("current_question_index", -1)
         if current_q_idx_from_db_ans != question_index_cb_ans:
-            await query.answer("Это не текущий вопрос или ты опоздал!", show_alert=True)
+            await query.answer("Это уже не текущий вопрос или ты проебал все полимеры!", show_alert=True)
             return
         
         questions_list_db_ans = battle.get("questions", [])
-        if question_index_cb_ans >= len(questions_list_db_ans) or questions_list_db_ans[question_index_cb_ans].get("revealed_to_users"):
-            await query.answer("Вопрос уже раскрыт или ошибка номера.", show_alert=True)
+        if question_index_cb_ans >= len(questions_list_db_ans) or \
+           questions_list_db_ans[question_index_cb_ans].get("revealed_to_users"):
+            await query.answer("Этот вопрос уже был раскрыт или что-то пошло не так с его номером.", show_alert=True)
             return
 
-        user_answers_this_q_db_ans = questions_list_db_ans[question_index_cb_ans].get("user_answers_to_this_q", {})
-        if str(user_who_clicked.id) in user_answers_this_q_db_ans:
-            await query.answer("Ты уже отвечал на этот раунд!", show_alert=True)
+        # Получаем актуальные ответы на этот вопрос из БД, чтобы проверить, не голосовал ли юзер уже
+        battle_reloaded_for_ans_check_cb = await loop.run_in_executor(None, lambda: tos_battles_collection.find_one({"_id": battle_doc_id}))
+        if not battle_reloaded_for_ans_check_cb:
+            await query.answer("Ошибка: не могу проверить твой предыдущий ответ.", show_alert=True)
             return
-
-        user_name_ans_rec_db = user_who_clicked.first_name or user_who_clicked.username or f"Анон-{user_who_clicked.id}"
-        answer_record_to_db_ans = {"name": user_name_ans_rec_db, "answer_bool": user_answer_as_bool_ans, "answered_at": datetime.datetime.now(datetime.timezone.utc)}
         
-        update_ans_q_db = await loop.run_in_executor(
+        # Убедимся, что структура questions существует и содержит нужный индекс
+        if "questions" not in battle_reloaded_for_ans_check_cb or \
+           question_index_cb_ans >= len(battle_reloaded_for_ans_check_cb["questions"]):
+            logger.error(f"Структура вопросов нарушена или неверный индекс {question_index_cb_ans} для баттла {game_id_int}")
+            await query.answer("Внутренняя ошибка игры: структура вопросов нарушена.", show_alert=True)
+            return
+            
+        user_answers_this_q_db_ans_updated_cb = battle_reloaded_for_ans_check_cb["questions"][question_index_cb_ans].get("user_answers_to_this_q", {})
+        
+        if str(user_who_clicked.id) in user_answers_this_q_db_ans_updated_cb:
+            previous_vote_bool_cb = user_answers_this_q_db_ans_updated_cb[str(user_who_clicked.id)]["answer_bool"]
+            previous_vote_text_cb = 'Правду' if previous_vote_bool_cb else 'Высер'
+            await query.answer(f"Ты уже отвечал на этот раунд! Твой выбор был: «{previous_vote_text_cb}». Не суетись.", show_alert=True)
+            return
+
+        user_name_ans_rec_db_cb = user_who_clicked.first_name or user_who_clicked.username or f"Анон-{user_who_clicked.id}"
+        answer_record_to_db_ans_cb = {"name": user_name_ans_rec_db_cb, "answer_bool": user_answer_as_bool_ans, "answered_at": datetime.datetime.now(datetime.timezone.utc)}
+        
+        update_ans_q_db_cb = await loop.run_in_executor(
             None, lambda: tos_battles_collection.update_one(
-                {"_id": battle_doc_id},
-                {"$set": {f"questions.{question_index_cb_ans}.user_answers_to_this_q.{user_who_clicked.id}": answer_record_to_db_ans}}
+                {"_id": battle_doc_id, f"questions.{question_index_cb_ans}.revealed_to_users": False}, 
+                {"$set": {f"questions.{question_index_cb_ans}.user_answers_to_this_q.{user_who_clicked.id}": answer_record_to_db_ans_cb}}
             )
         )
 
-        if update_ans_q_db.modified_count > 0:
+        if update_ans_q_db_cb.modified_count > 0:
             logger.info(f"User {user_who_clicked.id} ответил '{user_answer_as_bool_ans}' на Q{question_index_cb_ans} баттла {game_id_int}")
-            
-            # --->>> ИЗМЕНЕНИЕ КНОПОК ПОСЛЕ ОТВЕТА <<<---
-            # Получаем текущую клавиатуру сообщения с вопросом
-            # query.message - это сообщение, к которому прикреплены кнопки
-            original_keyboard_markup = query.message.reply_markup 
-            new_keyboard_buttons = []
-
-            if original_keyboard_markup and original_keyboard_markup.inline_keyboard:
-                for row in original_keyboard_markup.inline_keyboard:
-                    new_row = []
-                    for button in row:
-                        button_text = button.text
-                        button_callback_data = button.callback_data
-                        
-                        # Проверяем, эта ли кнопка была нажата
-                        # Формат callback_data для ответа: tosbattle_ans_GAMEID_QINDEX_CHOICE
-                        # parts уже содержат разобранный query.data
-                        # parts[0]="tosbattle", parts[1]="ans", parts[2]=GAMEID, parts[3]=QINDEX, parts[4]=CHOICE ("true"/"false")
-                        
-                        # Если это кнопка ответа на текущий вопрос
-                        if button_callback_data.startswith(f"tosbattle_ans_{game_id_int}_{question_index_cb_ans}_"):
-                            choice_in_button_data = button_callback_data.split("_")[-1] # "true" или "false"
-                            
-                            # Если это та кнопка, которую нажал пользователь
-                            if (answer_choice_cb_str_ans == choice_in_button_data):
-                                button_text = f"✅ {button_text}" # Добавляем галочку
-                                # Можно сделать кнопку неактивной, изменив callback_data на что-то, что не будет обрабатываться
-                                # button_callback_data = f"tosbattle_answered_{game_id_int}_{question_index_cb_ans}"
-                            # Остальные кнопки ответа на этот вопрос для этого юзера можно не менять или тоже "деактивировать"
-                            # но это сложнее, т.к. мы меняем кнопки для ВСЕХ.
-                            # Проще всего пометить только выбранную.
-                        
-                        new_row.append(InlineKeyboardButton(button_text, callback_data=button_callback_data))
-                    new_keyboard_buttons.append(new_row)
-            
-            if new_keyboard_buttons:
-                try:
-                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard_buttons))
-                    await query.answer(f"Твой ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» принят!", show_alert=False)
-                except telegram.error.BadRequest as e_edit_kb_ans:
-                     if "message is not modified" in str(e_edit_kb_ans).lower():
-                         await query.answer(f"Твой ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» уже был таким.", show_alert=False)
-                     else:
-                         logger.warning(f"Не удалось отредактировать кнопки после ответа: {e_edit_kb_ans}")
-                         await query.answer(f"Ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» принят (ошибка обновления кнопок).", show_alert=False)
-                except Exception as e_unhandled_edit_kb:
-                    logger.error(f"Непредвиденная ошибка при редактировании кнопок после ответа: {e_unhandled_edit_kb}")
-                    await query.answer(f"Ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» принят (ошибка обновления кнопок).", show_alert=False)
-
-            else: # Если не удалось получить/изменить клавиатуру, просто отвечаем на query
-                await query.answer(f"Твой ответ «{('Правда' if user_answer_as_bool_ans else 'Высер')}» на раунд {question_index_cb_ans + 1} принят!", show_alert=False)
-
-        else: # modified_count == 0
-            logger.warning(f"Не удалось записать ответ для user {user_who_clicked.id} на Q{question_index_cb_ans} баттла {game_id_int}. Modified_count: {update_ans_q_db.modified_count}")
-            await query.answer("Не удалось записать твой ответ. Возможно, время вышло или ты уже отвечал.", show_alert=True)
+            feedback_text_cb = 'Правда' if user_answer_as_bool_ans else 'Высер'
+            await query.answer(f"Твой ответ «{feedback_text_cb}» на раунд {question_index_cb_ans + 1} принят! Жди результатов, ссыкло.", show_alert=False) 
+        else:
+            logger.warning(f"Не удалось записать ответ для user {user_who_clicked.id} на Q{question_index_cb_ans} баттла {game_id_int}. Modified_count: {update_ans_q_db_cb.modified_count}")
+            await query.answer("Не удалось записать твой ответ. Возможно, время вышло, ты уже отвечал или произошла ошибка.", show_alert=True)
+    # ... (остальной код callback_handler'а)
 
     # --- Обработка ВЫБОРА ПРИЗА ("finished" status) ---
     elif battle.get("status") == "finished" and action == "prize":
