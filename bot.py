@@ -10,7 +10,7 @@ import json # Для обработки ответа
 import random
 import base64
 from collections import deque
-from flask import Flask
+from flask import Flask, Response
 import hypercorn.config
 from hypercorn.asyncio import serve as hypercorn_async_serve
 import signal
@@ -1458,6 +1458,24 @@ async def reply_to_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception: pass
 # --- КОНЕЦ НОВОЙ reply_to_bot_handler ---
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ HEARTBEAT ---
+async def update_heartbeat(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Просто обновляет временную метку в БД, чтобы показать, что бот жив."""
+    try:
+        # Используем существующую коллекцию bot_status
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: bot_status_collection.update_one(
+                {"_id": "heartbeat_status"},
+                {"$set": {"last_heartbeat_utc": datetime.datetime.now(datetime.timezone.utc)}},
+                upsert=True
+            )
+        )
+        # logger.debug("Heartbeat updated.") # Можно раскомментировать для отладки
+    except Exception as e:
+        logger.error(f"CRITICAL: Не удалось обновить Heartbeat в MongoDB: {e}")
+# --- КОНЕЦ НОВОЙ ФУНКЦИИ ---
+
 # --- ПОЛНАЯ ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ ФОНОВОЙ ЗАДАЧИ (ГЕНЕРАЦИЯ ФАКТОВ) ---
 async def check_inactivity_and_shitpost(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Проверяет неактивные чаты и постит рандомный ебанутый факт от ИИ."""
@@ -1686,11 +1704,51 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # --- АСИНХРОННАЯ ЧАСТЬ И ТОЧКА ВХОДА ---
+from flask import Flask, Response # <<<--- ЭТА СТРОКА ВАЖНА
+
 app = Flask(__name__)
+
 @app.route('/')
 def index():
-    logger.info("GET / -> OK")
-    return "Popizdyaka is alive (probably)."
+    """Простая страница, чтобы видеть, что веб-сервер работает."""
+    return "Popizdyaka web server is running. Use /healthz for bot status.", 200
+
+@app.route('/healthz')
+def health_check():
+    """
+    Умная проверка состояния.
+    Возвращает 200 OK, если бот "бьет сердцем".
+    Возвращает 503 Service Unavailable, если "сердце" остановилось.
+    """
+    HEARTBEAT_TOLERANCE_SECONDS = 90  # Допуск (3 интервала по 30 сек)
+
+    try:
+        # Напрямую обращаемся к коллекции, т.к. Flask работает синхронно
+        status_doc = bot_status_collection.find_one({"_id": "heartbeat_status"})
+        if not status_doc or "last_heartbeat_utc" not in status_doc:
+            logger.warning("HEALTH CHECK FAILED: Документ heartbeat не найден в БД.")
+            return Response("Bot status unknown (no heartbeat record).", status=503, mimetype='text/plain')
+
+        last_heartbeat = status_doc["last_heartbeat_utc"]
+        if last_heartbeat.tzinfo is None:
+            # pytz.utc.localize(last_heartbeat) может не сработать в синхронном коде flask
+            # поэтому используем datetime.timezone.utc
+            last_heartbeat = last_heartbeat.replace(tzinfo=datetime.timezone.utc)
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        time_diff = (now_utc - last_heartbeat).total_seconds()
+
+        if time_diff > HEARTBEAT_TOLERANCE_SECONDS:
+            logger.critical(f"HEALTH CHECK FAILED: Heartbeat устарел на {time_diff:.1f} секунд!")
+            return Response(f"Bot is unhealthy! Heartbeat is stale by {time_diff:.1f} seconds.", status=503, mimetype='text/plain')
+        else:
+            # logger.info("HEALTH CHECK PASSED: Bot is alive.") # Закомментируем, чтобы не спамить в логах
+            return Response(f"Bot is healthy. Heartbeat fresh ({time_diff:.1f}s ago).", status=200, mimetype='text/plain')
+
+    except Exception as e:
+        logger.critical(f"HEALTH CHECK FAILED: Ошибка при проверке статуса в БД: {e}", exc_info=True)
+        return Response(f"Error during health check: {e}", status=500, mimetype='text/plain')
+
 
 async def run_bot_async(application: Application) -> None: # Запускает и корректно останавливает бота
     try:
@@ -4887,6 +4945,11 @@ async def main() -> None:
 
     # Запуск фоновой задачи
     if application.job_queue:
+        # --->>> ДОБАВЛЯЕМ ЗАДАЧУ HEARTBEAT <<<---
+        application.job_queue.run_repeating(update_heartbeat, interval=30, first=10)
+        logger.info("Фоновая задача Heartbeat запущена (каждые 30 сек).")
+        # --->>> КОНЕЦ ДОБАВЛЕНИЯ <<<---
+
         # Задача для рандомных высеров в тишине
         application.job_queue.run_repeating(check_inactivity_and_shitpost, interval=900, first=60)
         logger.info("Фоновая задача проверки неактивности запущена.")
