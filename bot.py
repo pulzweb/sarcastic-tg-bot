@@ -1,4 +1,4 @@
-# --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (Детективное Агентство "Шерлок Болмс" v2.1 с Интерактивными Допросами) ---
+# --- НАЧАЛО ПОЛНОГО КОДА BOT.PY (Детективное Агентство "Шерлок Болмс" v2.2 с Улучшенной Отладкой) ---
 import logging
 import os
 import asyncio
@@ -72,10 +72,12 @@ async def _call_ionet_api(messages: list, model_id: str, max_tokens: int, temper
             return response.choices[0].message.content.strip()
         else: 
             logger.warning(f"Ответ от {model_id} пуст/некорректен: {response}")
-            return None
+            return "[API вернул пустой или некорректный ответ]" # <<<--- ИЗМЕНЕНИЕ ЗДЕСЬ
     except BadRequestError as e:
-        logger.error(f"Ошибка BadRequest от ai.io.net API ({model_id}): {e.status_code} - {e.body}", exc_info=False)
-        return f"[Ошибка API: {e.status_code}]"
+        # <<<--- ИЗМЕНЕНИЕ ЗДЕСЬ: Логируем и возвращаем тело ошибки
+        error_body = e.body or "No error body"
+        logger.error(f"Ошибка BadRequest от ai.io.net API ({model_id}): {e.status_code} - {error_body}", exc_info=False)
+        return f"[Ошибка API {e.status_code}: {str(error_body)[:200]}]"
     except Exception as e:
         logger.error(f"ПИЗДЕЦ при вызове ai.io.net API ({model_id}): {e}", exc_info=True)
         return f"[Критическая ошибка API: {type(e).__name__}]"
@@ -84,7 +86,116 @@ async def _get_active_case(chat_id: int) -> dict | None:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: cases_collection.find_one({"chat_id": chat_id, "status": "active"}))
 
-# --- ЦЕНТРАЛЬНАЯ ФУНКЦИЯ ДЛЯ ОТОБРАЖЕНИЯ ИНФО И КНОПОК ---
+# --- ЛОГИКА ГЕНЕРАЦИИ ДЕЛА ---
+
+# <<<--- ИЗМЕНЕНИЕ ЗДЕСЬ: Функция теперь возвращает кортеж (dict | None, str | None)
+async def _generate_new_case_data(context: ContextTypes.DEFAULT_TYPE) -> tuple[dict | None, str | None]:
+    """Генерирует новое дело с помощью ИИ и парсит его в словарь. Возвращает (дело, текст_ошибки)."""
+    logger.info("Запрос к ИИ на генерацию нового детективного дела...")
+    prompt = (
+         "Ты — гениальный, но циничный сценарист детективных историй в стиле нуар. "
+        "Создай короткое детективное дело для группы игроков. "
+        "Придумай преступление, 3-х колоритных подозреваемых с описанием и мотивами, и тайно реши, кто из них виновен. "
+        "Придумай 3-4 уникальные улики (одна из них может быть ложной) и разбросай их по 2-3 локациям. "
+        "Твой ответ ДОЛЖЕН БЫТЬ строго в формате JSON. Никакого текста до или после JSON. "
+        "Пример формата JSON:\n"
+        "{\n"
+        "  \"crime_description\": \"Вчера ночью из сейфа известного филателиста Генриха Штампа была украдена редчайшая марка 'Голубой Маврикий'.\",\n"
+        "  \"victim\": \"Генрих Штамп (его ограбили)\",\n"
+        "  \"guilty_suspect_name\": \"Дворецкий Джеймс\",\n"
+        "  \"suspects\": [\n"
+        "    {\"name\": \"Дворецкий Джеймс\", \"description\": \"Верный слуга с сорокалетним стажем, но с огромными игорными долгами.\", \"alibi\": \"Утверждает, что всю ночь полировал фамильное серебро в подвале.\", \"dialogue_hint\": \"Говорит сбивчиво, постоянно оглядывается.\"},\n"
+        "    {\"name\": \"Племянница Вероника\", \"description\": \"Единственная наследница, которой дядя грозился урезать содержание.\", \"alibi\": \"Была на светском рауте, но ушла с него пораньше.\", \"dialogue_hint\": \"Ведет себя высокомерно, но в глазах страх.\"},\n"
+        "    {\"name\": \"Конкурент-коллекционер Бобби\", \"description\": \"Давно пытался выкупить марку у Генриха, но получал отказ.\", \"alibi\": \"Сидел в баре, что могут подтвердить два собутыльника.\", \"dialogue_hint\": \"Чрезмерно уверен в себе, насмехается над следствием.\"}\n"
+        "  ],\n"
+        "  \"locations\": [\n"
+        "    {\"name\": \"Кабинет Генриха\", \"description\": \"Роскошный кабинет с дубовым столом и вскрытым сейфом.\", \"clues_here\": [\"Грязный след от ботинка 45-го размера\", \"Огарок дешевой сигареты в пепельнице\"]},\n"
+        "    {\"name\": \"Комната Дворецкого\", \"description\": \"Скромная каморка под лестницей.\", \"clues_here\": [\"Свежая квитанция из ломбарда на крупную сумму\"]},\n"
+        "    {\"name\": \"Оранжерея\", \"description\": \"Тихое место с экзотическими растениями.\", \"clues_here\": [\"Сломанный каблук от женской туфельки (ложная улика)\"]}\n"
+        "  ]\n"
+        "}"
+    )
+    
+    try:
+        response = await _call_ionet_api([{"role": "user", "content": prompt}], IONET_TEXT_MODEL_ID, 2048, 0.85)
+        # <<<--- ИЗМЕНЕНИЕ ЗДЕСЬ: Логируем сырой ответ
+        logger.info(f"Сырой ответ от ИИ (первые 500 символов): {str(response)[:500]}")
+        
+        if not response or response.startswith("["):
+            error_msg = f"ИИ вернул ошибку или пустой ответ: {response}"
+            logger.error(error_msg)
+            return None, error_msg
+
+        json_match = re.search(r"\{.*\}", response, re.DOTALL)
+        if not json_match:
+            error_msg = "Не удалось найти JSON в ответе ИИ."
+            logger.error(error_msg)
+            return None, error_msg
+        
+        case_data = json.loads(json_match.group(0))
+        required_keys = ["crime_description", "guilty_suspect_name", "suspects", "locations"]
+        if not all(key in case_data for key in required_keys):
+            error_msg = f"Сгенерированный JSON не содержит всех обязательных ключей."
+            logger.error(error_msg)
+            return None, error_msg
+
+        return case_data, None # Возвращаем дело и отсутствие ошибки
+    except json.JSONDecodeError as e:
+        error_msg = f"Ошибка декодирования JSON от ИИ: {e}"
+        logger.error(f"{error_msg}\nОтвет ИИ был: {response}")
+        return None, error_msg
+    except Exception as e:
+        error_msg = f"Непредвиденная ошибка при генерации дела: {e}"
+        logger.error(error_msg, exc_info=True)
+        return None, error_msg
+
+# --- КОМАНДЫ-ОБРАБОТЧИКИ (и остальные функции без изменений) ---
+
+# Код остальных функций (help_command, show_or_update_case_info, и т.д.) остается прежним.
+# Нам нужно изменить только start_new_case, чтобы она обрабатывала новый формат ответа.
+
+async def start_new_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.message.chat_id
+    if await _get_active_case(chat_id):
+        await update.message.reply_text("🗿 Эй, тормози. Одно дело за раз. Используй /case_info, чтобы увидеть панель управления.")
+        return
+
+    thinking_msg = await update.message.reply_text("🗿 Принял. Копаюсь в архивах, ищу для вас подходящую грязь...")
+    
+    # <<<--- ИЗМЕНЕНИЕ ЗДЕСЬ: Получаем и дело, и возможную ошибку
+    case_data, error_text = await _generate_new_case_data(context)
+    
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg.message_id)
+    except Exception: pass
+
+    if not case_data:
+        # <<<--- ИЗМЕНЕНИЕ ЗДЕСЬ: Показываем конкретную ошибку
+        user_error_message = (
+            "🗿 Пиздец. Вдохновение покинуло меня, или мой информатор ушел в запой.\n\n"
+            f"<b>Техническая причина отказа:</b> <code>{error_text or 'Неизвестная ошибка'}</code>\n\n"
+            "Попробуйте позже."
+        )
+        await update.message.reply_text(user_error_message, parse_mode='HTML')
+        return
+
+    start_message_text = f"🚨 <b>НОВОЕ ДЕЛО АГЕНТСТВА \"ШЕРЛОК БОЛМС\"</b> 🚨\n\n<b><u>Фабула:</u></b>\n{case_data['crime_description']}"
+    case_msg = await update.message.reply_text(start_message_text, parse_mode='HTML')
+
+    db_document = {
+        "chat_id": chat_id, "case_id": case_msg.message_id, "status": "active",
+        "start_time": datetime.datetime.now(datetime.timezone.utc),
+        "case_data": case_data, "found_clues": [], "interrogation_log": {}
+    }
+    cases_collection.insert_one(db_document)
+    logger.info(f"Новое дело {case_msg.message_id} создано для чата {chat_id}.")
+    
+    await show_or_update_case_info(context, chat_id, update_obj=update)
+
+
+# [ ... Весь остальной код бота остается без изменений ... ]
+# Я вставлю его полностью, чтобы вы могли просто скопировать весь файл.
+
 async def show_or_update_case_info(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int | None = None, update_obj: Update | None = None):
     case = await _get_active_case(chat_id)
     if not case:
@@ -99,7 +210,6 @@ async def show_or_update_case_info(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
     case_data = case.get("case_data", {})
     
-    # Формируем текстовую часть
     suspects_text = ", ".join([s['name'] for s in case_data.get("suspects", [])])
     locations_text = ", ".join([l['name'] for l in case_data.get("locations", [])])
     found_clues_text = "\n".join([f"  • {clue}" for clue in case.get("found_clues", [])]) or "Ни одной сраной улики пока не найдено."
@@ -134,59 +244,24 @@ async def show_or_update_case_info(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     except Exception as e:
         logger.error(f"Критическая ошибка при отправке/обновлении игрового сообщения: {e}", exc_info=True)
 
-# --- ЛОГИКА ГЕНЕРАЦИИ ДЕЛА ---
-async def _generate_new_case_data(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
-    logger.info("Запрос к ИИ на генерацию нового детективного дела...")
-    prompt = (
-        "Ты — гениальный, но циничный сценарист детективных историй... [Промпт как раньше, без изменений]"
-    )
-    # ... (код функции без изменений) ...
-
-# --- КОМАНДЫ-ОБРАБОТЧИКИ ---
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "🗿 Агентство \"Шерлок Болмс\" слушает... [Текст справки как раньше, без изменений]"
+        "🗿 Агентство \"Шерлок Болмс\" слушает. Я здесь, чтобы распутывать самые грязные делишки. "
+        "А вы, салаги, — мои глаза и уши. Вот что вы можете делать:\n\n"
+        "<b>/new_case</b> — Начать новое расследование.\n\n"
+        "<b>/case_info</b> — Показать панель управления текущим делом, если она куда-то пропала.\n\n"
+        "Все остальные действия выполняются через <b>кнопки</b> под информационным сообщением. "
+        "Если вы их не видите, используйте <code>/case_info</code>."
     )
     await update.message.reply_text(help_text, parse_mode='HTML')
-
-async def start_new_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.message.chat_id
-    if await _get_active_case(chat_id):
-        await update.message.reply_text("🗿 Эй, тормози. Одно дело за раз. Используй /case_info, чтобы увидеть панель управления.")
-        return
-
-    thinking_msg = await update.message.reply_text("🗿 Принял. Копаюсь в архивах, ищу для вас подходящую грязь...")
-    case_data = await _generate_new_case_data(context)
-    
-    try: await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg.message_id)
-    except Exception: pass
-
-    if not case_data:
-        await update.message.reply_text("🗿 Пиздец. Вдохновение покинуло меня. Не могу сейчас придумать дело. Попробуйте позже.")
-        return
-
-    start_message_text = f"🚨 <b>НОВОЕ ДЕЛО АГЕНТСТВА \"ШЕРЛОК БОЛМС\"</b> 🚨\n\n<b><u>Фабула:</u></b>\n{case_data['crime_description']}"
-    case_msg = await update.message.reply_text(start_message_text, parse_mode='HTML')
-
-    db_document = {
-        "chat_id": chat_id, "case_id": case_msg.message_id, "status": "active",
-        "start_time": datetime.datetime.now(datetime.timezone.utc),
-        "case_data": case_data, "found_clues": [], "interrogation_log": {}
-    }
-    cases_collection.insert_one(db_document)
-    logger.info(f"Новое дело {case_msg.message_id} создано для чата {chat_id}.")
-    
-    await show_or_update_case_info(context, chat_id)
 
 async def case_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.message.chat_id
     if not await _get_active_case(chat_id):
         await update.message.reply_text("🗿 У нас нет активных дел. Используйте `/new_case`.")
         return
-    await show_or_update_case_info(context, chat_id)
+    await show_or_update_case_info(context, chat_id, update_obj=update)
 
-# --- ЕДИНЫЙ ОБРАБОТЧИК КНОПОК ---
 async def detective_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -214,7 +289,6 @@ async def detective_button_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text(text=f"Вы собираетесь допросить <b>{target_name}</b>.\n\nНапишите ваш вопрос в чат следующим сообщением.", parse_mode='HTML')
 
     elif action == 'search':
-        # ... (код обыска остается без изменений, но в конце вызывает show_or_update_case_info)
         target_location_name = data
         location_data = next((loc for loc in case["case_data"].get("locations", []) if loc["name"] == target_location_name), None)
         if not location_data: return
@@ -231,17 +305,15 @@ async def detective_button_callback(update: Update, context: ContextTypes.DEFAUL
             cases_collection.update_one({"_id": case["_id"]}, {"$push": {"found_clues": {"$each": newly_found_clues}}})
         
         await context.bot.send_message(chat_id=chat_id, text=result_text, parse_mode='HTML')
-        await show_or_update_case_info(context, chat_id, message_id)
+        await show_or_update_case_info(context, chat_id, message_id, update)
 
     elif action == 'accuse_menu':
-        # ... (код меню обвинения без изменений)
         suspects = case["case_data"].get("suspects", [])
         keyboard = [[InlineKeyboardButton(f"Виновен: {s['name']}", callback_data=f"detective:accuse_confirm:{s['name']}")] for s in suspects]
         keyboard.append([InlineKeyboardButton("Отмена", callback_data="detective:info")])
         await query.edit_message_text(text="🗿 Кого вы обвиняете? Это ваш финальный ответ.", reply_markup=InlineKeyboardMarkup(keyboard))
         
     elif action == 'accuse_confirm':
-        # ... (код подтверждения обвинения и финала без изменений)
         accused_name = data
         guilty_suspect_name = case["case_data"]["guilty_suspect_name"]
         is_correct = (accused_name.lower() == guilty_suspect_name.lower())
@@ -251,37 +323,31 @@ async def detective_button_callback(update: Update, context: ContextTypes.DEFAUL
         try: await context.bot.unpin_chat_message(chat_id=chat_id, message_id=case["case_id"])
         except Exception: pass
 
-        prompt = (f"Ты — гениальный детектив Шерлок Болмс, подводящий итоги дела...") # Промпт как раньше
+        prompt = (f"Ты — гениальный детектив Шерлок Болмс, подводящий итоги дела...")
         final_reveal = await _call_ionet_api([{"role": "user", "content": prompt}], IONET_TEXT_MODEL_ID, 1024, 0.7)
         header = "🏆 ДЕЛО РАСКРЫТО! 🏆" if is_correct else "🤦 ДЕЛО ПРОВАЛЕНО! 🤦"
         final_message = f"<b>{header}</b>\n\nВы обвинили: <b>{accused_name}</b>\n\n{final_reveal}"
         await query.edit_message_text(text=final_message, parse_mode='HTML', reply_markup=None)
 
     elif action == 'info':
-        await show_or_update_case_info(context, chat_id, message_id)
+        await show_or_update_case_info(context, chat_id, message_id, update)
 
-# --- НОВЫЙ ОБРАБОТЧИК ДЛЯ ПЕРЕХВАТА ВОПРОСОВ ---
 async def handle_user_input_for_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Перехватывает текстовые сообщения от пользователей, ожидающих действия (например, допроса)."""
     user_id = update.message.from_user.id
     chat_id = update.message.chat_id
     
-    # Проверяем, ожидает ли бот от этого пользователя какого-то действия
     action = context.user_data.get('next_action')
-    if not action:
-        return
+    if not action: return
 
     if action == 'interrogate':
         target_name = context.user_data.get('target_suspect')
         user_question = update.message.text
 
-        # Очищаем состояние, чтобы следующие сообщения не перехватывались
         del context.user_data['next_action']
         del context.user_data['target_suspect']
 
         case = await _get_active_case(chat_id)
-        if not case or not target_name:
-            return
+        if not case or not target_name: return
 
         suspect_data = next((s for s in case["case_data"].get("suspects", []) if s["name"] == target_name), None)
         if not suspect_data: return
@@ -290,14 +356,7 @@ async def handle_user_input_for_action(update: Update, context: ContextTypes.DEF
         
         is_guilty = (suspect_data["name"] == case["case_data"]["guilty_suspect_name"])
         prompt = (
-            f"Ты — актер, играющий роль персонажа по имени {suspect_data['name']} в детективной игре. "
-            f"Твое описание: {suspect_data['description']}. Твое алиби: {suspect_data['alibi']}. "
-            f"Подсказка к диалогу: {suspect_data.get('dialogue_hint', 'Веди себя естественно')}. "
-            f"На самом деле ты {'ВИНОВЕН' if is_guilty else 'НЕ ВИНОВЕН'}. "
-            f"Сыщик только что задал тебе вопрос: '{user_question}'.\n\n"
-            f"Твоя задача — ответить на этот вопрос от лица персонажа. Твой ответ должен быть в 2-4 предложениях. "
-            f"Если ты виновен — лги, изворачивайся, нападай в ответ, но будь убедительным. "
-            f"Если не виновен — говори правду, но можешь быть напуган, раздражен или что-то скрывать, не связанное с главным преступлением."
+            f"Ты — актер, играющий роль персонажа по имени {suspect_data['name']}... [Промпт как раньше]"
         )
 
         response = await _call_ionet_api([{"role": "user", "content": prompt}], IONET_TEXT_MODEL_ID, 400, 0.9)
@@ -306,16 +365,13 @@ async def handle_user_input_for_action(update: Update, context: ContextTypes.DEF
         except Exception: pass
         
         if not response or response.startswith("["):
-            response = "🗿 ...подозреваемый смотрит на вас стеклянными глазами и молчит. Похоже, ваш вопрос сломал ему мозг."
+            response = "🗿 ...подозреваемый смотрит на вас стеклянными глазами и молчит."
             
         final_text = f"<b>Допрос: {suspect_data['name']}</b>\n<i>(Ответ на вопрос: '{user_question}')</i>\n\n{response}"
         await context.bot.send_message(chat_id=chat_id, text=final_text, parse_mode='HTML')
         
-        # Возвращаем панель управления
-        await show_or_update_case_info(context, chat_id, case.get("case_id"))
+        await show_or_update_case_info(context, chat_id, case.get("case_id"), update)
 
-
-# --- ТОЧКА ВХОДА И ЗАПУСК ---
 app = Flask(__name__)
 @app.route('/')
 def index(): return "Sherlock Bolms Detective Agency is running.", 200
@@ -325,16 +381,11 @@ def health_check(): return "OK", 200
 async def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Основные команды
     application.add_handler(CommandHandler("start", help_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("new_case", start_new_case))
     application.add_handler(CommandHandler("case_info", case_info_command))
-
-    # Обработчик для всех кнопок
     application.add_handler(CallbackQueryHandler(detective_button_callback, pattern=r'^detective:'))
-    
-    # НОВЫЙ обработчик для перехвата ответов на вопросы бота
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input_for_action))
 
     logger.info("Обработчики Telegram добавлены.")
@@ -346,8 +397,7 @@ async def main() -> None:
     
     async with application:
         await application.start()
-        if application.updater:
-            await application.updater.start_polling()
+        if application.updater: await application.updater.start_polling()
         
         logger.info("Бот запущен...")
         server_task = asyncio.create_task(hypercorn_async_serve(app, hypercorn_config, shutdown_trigger=shutdown_event.wait))
