@@ -79,8 +79,10 @@ async def _call_ionet_api(messages: list, model_id: str, max_tokens: int, temper
         response = await ionet_client.chat.completions.create(
             model=model_id, messages=messages, max_tokens=max_tokens, temperature=temperature
         )
-        if response.choices and response.choices.message and response.choices.message.content:
-            return response.choices.message.content.strip()
+        # <<<--- ИСПРАВЛЕННАЯ СТРОКА ---
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            # <<<--- ИСПРАВЛЕННАЯ СТРОКА ---
+            return response.choices[0].message.content.strip()
         else: 
             logger.warning(f"Ответ от {model_id} пуст/некорректен: {response}")
             return None
@@ -136,7 +138,7 @@ async def _generate_new_case_data(context: ContextTypes.DEFAULT_TYPE) -> dict | 
         # Ищем JSON в ответе, т.к. ИИ иногда добавляет лишний текст
         json_match = re.search(r"\{.*\}", response, re.DOTALL)
         if not json_match:
-            logger.error("Не удалось найти JSON в ответе ИИ.")
+            logger.error(f"Не удалось найти JSON в ответе ИИ. Ответ был: {response}")
             return None
         
         case_data = json.loads(json_match.group(0))
@@ -190,7 +192,10 @@ async def start_new_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Генерируем данные для дела
     case_data = await _generate_new_case_data(context)
 
-    await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg.message_id)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg.message_id)
+    except Exception:
+        pass
 
     if not case_data:
         await update.message.reply_text("🗿 Пиздец. Вдохновение покинуло меня, или мой информатор ушел в запой. Не могу сейчас придумать дело. Попробуйте позже.")
@@ -294,7 +299,10 @@ async def interrogate_suspect(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     response = await _call_ionet_api([{"role": "user", "content": prompt}], IONET_TEXT_MODEL_ID, 300, 0.9)
-    await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg.message_id)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=thinking_msg.message_id)
+    except Exception:
+        pass
 
     if not response or response.startswith("["):
         response = f"🗿 {suspect_data['name']} молчит. Видимо, впал в ступор от вашей тупости."
